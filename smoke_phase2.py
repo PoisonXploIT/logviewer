@@ -38,9 +38,19 @@ def multipart(files):
     return body, "multipart/form-data; boundary=" + boundary
 
 
+CSRF = {"token": ""}
+
+
+def csrf_token():
+    if not CSRF["token"]:
+        CSRF["token"] = get("/api/csrf")["token"]
+    return CSRF["token"]
+
+
 def post(path, body, ctype):
     req = urllib.request.Request(BASE + path, data=body,
-                                 headers={"Content-Type": ctype},
+                                 headers={"Content-Type": ctype,
+                                          "X-CSRF-Token": csrf_token()},
                                  method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as r:

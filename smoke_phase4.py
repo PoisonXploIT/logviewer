@@ -44,9 +44,19 @@ def multipart(files):
     return body, "multipart/form-data; boundary=" + boundary
 
 
+CSRF = {"token": ""}
+
+
+def csrf_token():
+    if not CSRF["token"]:
+        CSRF["token"] = get("/api/csrf")["token"]
+    return CSRF["token"]
+
+
 def post(path, body, ctype):
     req = urllib.request.Request(BASE + path, data=body,
-                                 headers={"Content-Type": ctype},
+                                 headers={"Content-Type": ctype,
+                                          "X-CSRF-Token": csrf_token()},
                                  method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -152,7 +162,9 @@ def main():
                          json.dumps({"name": "big.log", "enabled": True}).encode(),
                          "application/json")
         assert code == 200 and res["enabled"], (code, res)
-        tmp = os.path.join(tempfile.gettempdir(), "logviewer", "sessions", "big.log")
+        # Carpeta por usuario: sin header Cf-Access-Login-User es "local"
+        tmp = os.path.join(tempfile.gettempdir(), "logviewer", "sessions",
+                           "local", "big.log")
         assert os.path.isfile(tmp), tmp
         with open(tmp, "ab") as f:
             f.write(b"2023-10-10 15:00:00 error fallo nuevo en vivo\n")
@@ -182,7 +194,8 @@ def main():
                          json.dumps({"name": "big.log"}).encode(),
                          "application/json")
         assert code == 200, (code, res)
-        db = os.path.join(tempfile.gettempdir(), "logviewer", "sqlite", "big.log.db")
+        db = os.path.join(tempfile.gettempdir(), "logviewer", "sqlite",
+                          "local", "big.log.db")
         assert not os.path.exists(db), "la BD deberia borrarse: " + db
         print("OK quitar dataset: BD de SQLite borrada")
 

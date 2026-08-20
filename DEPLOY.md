@@ -13,6 +13,42 @@ Sin esa capa NO se sube: el servidor no tiene autenticacion propia.
   a la auditoria (Fase 5): quedaria "quien subio/exporto/activo/quito".
   Sin el header (acceso local) se registra como "local".
 
+## Modelo de confianza (leelo antes de operar el deploy)
+
+- El header `Cf-Access-Login-User` es **spoofeable**: cualquier cliente
+  puede enviarlo. El servidor solo lo usa para (a) atribuir la auditoria
+  y (b) aislar los datasets por usuario. NO autoriza nada: la
+  autenticacion la hace Access en el borde.
+- Por eso el paso 3 (cerrar la URL publica de Railway) es innegociable:
+  si el origen es alcanzable directamente, un atacante puede subirse el
+  header de quien sea y, peor, usar el visor sin autenticacion.
+- `LOGVIEWER_REQUIRE_CF=1` (variable de entorno en Railway) endurece
+  esto: el servidor rechaza con 403 cualquier peticion sin el header.
+  No cierra el acceso directo (un atacante con la URL abierta puede
+  enviar el header el mismo), pero elimina el uso anonimo y deja cada
+  accion rastroable: la auditoria guarda la IP remota, asi que si el
+  header esta falseado se ve de que IP sale. La unica defensa real contra
+  la URL abierta sigue siendo el paso 3.
+  (No se valida el JWT `Cf_Authorization` en el origen: firmatura
+  Ed25519 de Cloudflare, y el proyecto es solo stdlib; la validacion la
+  hace Access en el borde.)
+- La auditoria guarda ademas la IP remota de cada peticion: si el header
+  esta falseado, la IP ayuda a rastrear de donde sale.
+- Anti-CSRF: `GET /api/csrf` sirve un token por proceso y todos los POST
+  lo exigen en el header `X-CSRF-Token` (403 si falta). Un sitio ajeno no
+  puede leer el token (CORS) ni anadir el header sin preflight.
+- Aislamiento por usuario: cada usuario solo ve, exporta y borra sus
+  propios datasets; las copias van en `sessions/<usuario>/` y las BD
+  SQLite en `sqlite/<usuario>/` (dos usuarios con el mismo nombre de
+  archivo ya no se pisan).
+- Cabeceras: `X-Content-Type-Options: nosniff` en todo; CSP estricta +
+  `X-Frame-Options: DENY` en la pagina HTML.
+- CSV: las celdas que empiezan por `=`, `+`, `-`, `@` se prefijan con `'`
+  (anti inyeccion de formulas en Excel).
+- Uploads: maximo 2 subidas concurrentes (503 si el servidor esta
+  ocupado); las excepciones de carga se loguean y al cliente se le dice
+  poco (sin rutas internas).
+
 ## Cambios de codigo que ya hay (Fase 6)
 
 - `main()` lee `$PORT` (la que inyecta Railway) y escucha en `0.0.0.0`.
@@ -77,3 +113,4 @@ se apunta `LOGVIEWER_DATA_DIR` (hoy no existe; seria una fase aparte).
 - [ ] Politica de Access activa (GET + POST) con la insignia de equipo.
 - [ ] Subida de prueba: la auditoria muestra el correo de Access.
 - [ ] Sin sesion de Access: el dominio pide login, no carga el visor.
+- [ ] `LOGVIEWER_REQUIRE_CF=1` puesta en las variables de Railway.

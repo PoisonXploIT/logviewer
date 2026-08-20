@@ -29,6 +29,7 @@ import json
 import lzma
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import sys
@@ -53,6 +54,27 @@ PROGRESS_STEP = 10000              # cada N lineas se actualiza el progreso
 TAIL_POLL = 0.5                    # s: intervalo del watcher
 TAIL_BUFFER_MAX = 10000            # lineas nuevas max. en el buffer
 TAIL_MAX = 5000                    # tope de last por peticion a /api/tail
+
+# Token anti-CSRF por proceso: lo sirve GET /api/csrf y lo exige en todo
+# POST (header X-CSRF-Token). No es un secreto: demuestra que la peticion
+# sale de una pagina que este proceso sirvio (un sitio ajeno no puede leerlo
+# por CORS ni anadir el header sin preflight).
+CSRF_TOKEN = secrets.token_hex(16)
+
+# Tope de subidas concurrentes (cada una puede leer hasta 1 GB del cuerpo):
+# sin este limite, unas pocas peticiones a la vez agotan la memoria.
+UPLOAD_SEM = threading.BoundedSemaphore(2)
+
+# Cabecera CSP de la pagina HTML (sin inline: todo el JS esta en app.js).
+CSP_HTML = ("default-src 'self'; script-src 'self'; style-src 'self'; "
+            "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+            "base-uri 'self'; frame-ancestors 'none'")
+
+# Con LOGVIEWER_REQUIRE_CF=1 se rechaza el acceso directo al origen
+# (peticiones sin el header de Cloudflare Access). Mitiga el caso "el
+# origen Railway es alcanzable sin pasar por Access"; no valida el JWT
+# (eso lo hace Access en el borde).
+REQUIRE_CF = os.environ.get("LOGVIEWER_REQUIRE_CF") == "1"
 def _valid_sqlite_threshold():
     try:
         v = int(os.environ.get("LOGVIEWER_SQLITE_THRESHOLD", "200000"))
@@ -148,15 +170,25 @@ IP_KEYS = ("ip", "client_ip", "ip_addr", "src_ip", "remote_addr", "source_ip")
 # ---------------------------------------------------------------------------
 # Estado global: sesion con varios datasets
 # ---------------------------------------------------------------------------
-SESSIONS = {}   # name -> dataset (dict)
-ACTIVE = ""     # nombre del dataset activo
+# Aislamiento por usuario (Fase 6): todo el estado se clavea por usuario
+# (el header Cf-Access-Login-User o "local"). Un usuario solo ve, exporta
+# y borra sus propios datasets; las copias temporales van en
+# sessions/<usuario>/ para que dos usuarios con el mismo nombre de archivo
+# no se pisen.
+SESSIONS = {}   # user -> {name -> dataset (dict)}
+ACTIVE = {}     # user -> nombre del dataset activo
 LOCK = threading.Lock()
 
-# Progreso de carga por archivo: name -> {phase, pct, message, error}
+# Progreso de carga por archivo: user -> {name -> {phase, pct, ...}}
 PROGRESS = {}
 
-# Watchers de tail en vivo: name -> Watcher
+# Watchers de tail en vivo: user -> {name -> Watcher}
 WATCHERS = {}
+
+
+def _user_state(user, state):
+    """Devuelve (y crea si hace falta) el dict de estado de un usuario."""
+    return state.setdefault(user, {})
 
 
 def _norm_level(lv):
@@ -191,6 +223,10 @@ def open_log_file(path):
     La deteccion es por magico (primera linea de bytes) y el nombre
     interno solo se usa en .zip (el fichero elegido dentro del zip).
     """
+    # Previa: sin esto un archivo enorme ya agota la memoria antes de
+    # llegar a la comprobacion post-descompresion (zip bomb).
+    if os.path.getsize(path) > MAX_DECOMP_SIZE:
+        raise ValueError("archivo demasiado grande (max 2 GB)")
     with open(path, "rb") as f:
         raw = f.read()
     if len(raw) > MAX_DECOMP_SIZE:
@@ -864,11 +900,12 @@ def detect_format(lines):
 # ---------------------------------------------------------------------------
 # Carga y parseo de un archivo (devuelve un dataset, sin mutar globales)
 # ---------------------------------------------------------------------------
-def load_file(path, progress=None):
+def load_file(path, progress=None, user="local"):
     """Lee, detecta formato y encoding, parsea. Devuelve el dataset.
 
     Lee en streaming (no carga el archivo entero en memoria). Si el numero
-    de filas supera SQLITE_THRESHOLD, migra a un backend SQLite."""
+    de filas supera SQLITE_THRESHOLD, migra a un backend SQLite (en la
+    carpeta sqlite/<usuario>/ para no pisar la BD de otro usuario)."""
     t0 = time.time()
 
     def _report(phase, pct, msg=""):
@@ -885,7 +922,8 @@ def load_file(path, progress=None):
     _report("reading", 30, "decodificando (%s)" % encoding)
 
     name = os.path.basename(path)
-    db_dir = os.path.join(tempfile.gettempdir(), "logviewer", "sqlite")
+    db_dir = os.path.join(tempfile.gettempdir(), "logviewer", "sqlite",
+                         safe_session_name(user))
     store = MemStore()
     try:
         line_iter = iter_lines(stream, encoding)
@@ -994,11 +1032,13 @@ def summary(ds):
     return s
 
 
-def sessions_list():
-    """Lista de datasets de la sesion (para la UI)."""
+def sessions_list(user):
+    """Lista de datasets de la sesion del usuario (para la UI)."""
+    mine = _user_state(user, SESSIONS)
+    watchers = _user_state(user, WATCHERS)
     out = []
-    for name, ds in SESSIONS.items():
-        w = WATCHERS.get(name)
+    for name, ds in mine.items():
+        w = watchers.get(name)
         out.append({
             "name": name,
             "format": ds["format"],
@@ -1006,17 +1046,20 @@ def sessions_list():
             "total": ds["total"],
             "encoding": ds.get("encoding", ""),
             "compressed": ds.get("compressed", ""),
-            "active": name == ACTIVE,
+            "active": name == ACTIVE.get(user, ""),
             "watching": bool(w and w.enabled),
         })
     return out
 
 
-def dataset(name):
-    """Devuelve el dataset indicado o el activo. None si no existe."""
+def dataset(user, name):
+    """Devuelve el dataset del usuario indicado o su activo. None si no
+    existe o no es suyo (aislamiento por usuario)."""
+    mine = _user_state(user, SESSIONS)
     if name:
-        return SESSIONS.get(name)
-    return SESSIONS.get(ACTIVE) if ACTIVE else None
+        return mine.get(name)
+    active = ACTIVE.get(user, "")
+    return mine.get(active) if active else None
 
 
 def top_n(ds, field, limit):
@@ -1175,28 +1218,31 @@ def tail_parse(ds, lines):
 # ---------------------------------------------------------------------------
 # Carga en segundo plano (progreso por polling)
 # ---------------------------------------------------------------------------
-def _load_worker(name, path, user="local"):
-    """Hilo: carga un archivo y lo registra en la sesion."""
+def _load_worker(name, path, user="local", ip=None):
+    """Hilo: carga un archivo y lo registra en la sesion del usuario."""
     def _progress(phase, pct, msg=""):
-        PROGRESS[name] = {"phase": phase, "pct": pct, "message": msg}
+        _user_state(user, PROGRESS)[name] = {"phase": phase, "pct": pct,
+                                             "message": msg}
 
     try:
-        ds = load_file(path, _progress)
+        ds = load_file(path, _progress, user=user)
         with LOCK:
-            old = SESSIONS.get(name)
+            mine = _user_state(user, SESSIONS)
+            old = mine.get(name)
             if old is not None:
                 old["store"].close()
-            SESSIONS[name] = ds
-            global ACTIVE
-            if not ACTIVE:
-                ACTIVE = name
-        audit("loaded", user=user, file=name,
+            mine[name] = ds
+            if not ACTIVE.get(user, ""):
+                ACTIVE[user] = name
+        audit("loaded", user=user, ip=ip, file=name,
               format=ds["format"], total=ds["total"],
               backend="sqlite" if isinstance(ds["store"], SqlStore) else "mem")
-        PROGRESS[name] = {"phase": "done", "pct": 100, "message": "completado"}
+        _user_state(user, PROGRESS)[name] = {"phase": "done", "pct": 100,
+                                             "message": "completado"}
     except Exception as e:
-        PROGRESS[name] = {"phase": "error", "pct": 0,
-                          "message": str(e), "error": str(e)}
+        _user_state(user, PROGRESS)[name] = {"phase": "error", "pct": 0,
+                                             "message": str(e),
+                                             "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -1224,13 +1270,18 @@ AUDIT = []  # lista de entradas (la mas reciente al final)
 AUDIT_LOCK = threading.Lock()
 
 
-def audit(action, user="local", **details):
+def audit(action, user="local", ip=None, **details):
     """Registra una accion en la auditoria (memoria + archivo JSON Lines).
 
     user: quien la hizo. Detras de Cloudflare Access llega en el header
-    Cf-Access-Login-User; en local (o sin ese header) es "local"."""
+    Cf-Access-Login-User (spoofeable: solo atribucion, no autenticacion);
+    en local (o sin ese header) es "local".
+    ip: direccion remota de la peticion (forensica: si el header esta
+    falseado, la IP ayuda a rastrear de donde sale)."""
     entry = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "action": action,
              "user": user or "local"}
+    if ip:
+        entry["ip"] = ip
     entry.update(details)
     with AUDIT_LOCK:
         AUDIT.append(entry)
@@ -1275,6 +1326,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1309,14 +1361,32 @@ class Handler(BaseHTTPRequestHandler):
             body = f.read()
         self.send_response(200)
         self.send_header("Content-Type", ctype)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if fp.endswith(".html"):
+            self.send_header("Content-Security-Policy", CSP_HTML)
+            self.send_header("X-Frame-Options", "DENY")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def _user(self):
         """Usuario de la peticion: el header que inyecta Cloudflare Access
-        (Cf-Access-Login-User) o "local" si no esta (acceso directo)."""
+        (Cf-Access-Login-User) o "local" si no esta (acceso directo).
+
+        AVISO: el header es spoofeable (cualquier cliente puede enviarlo).
+        Solo se usa para atribuir la auditoria y aislar los datasets;
+        la autenticacion real la hace Cloudflare Access en el borde."""
         return self.headers.get("Cf-Access-Login-User") or "local"
+
+    def _cf_ok(self):
+        """Con LOGVIEWER_REQUIRE_CF=1 se rechaza el acceso anonimo al
+        origen (peticiones sin el header de Cloudflare Access). No cierra
+        la URL abierta (un atacante puede enviar el header el mismo),
+        pero elimina el uso anonimo y deja cada accion rastroable por IP.
+        La defensa real contra la URL abierta es cerrarla en Railway."""
+        if not REQUIRE_CF:
+            return True
+        return bool(self.headers.get("Cf-Access-Login-User"))
 
     def _read_json_body(self):
         """Lee un cuerpo JSON pequeno (para /api/activate, /api/remove,
@@ -1334,111 +1404,125 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def do_GET(self):
+        if not self._cf_ok():
+            self._error("acceso directo no permitido (requiere Cloudflare Access)", 403)
+            return
         u = urlparse(self.path)
         q = parse_qs(u.query)
+        user = self._user()
         if u.path == "/":
             self._static("index.html")
         elif u.path.startswith("/static/"):
             self._static(u.path[len("/static/"):])
+        elif u.path == "/api/csrf":
+            # Token anti-CSRF del proceso (lo mete la pagina en los POST).
+            self._json({"token": CSRF_TOKEN})
         elif u.path == "/api/summary":
             name = q.get("name", [""])[0]
             with LOCK:
-                ds = dataset(name)
-                self._json(summary(ds) if ds else None)
+                ds = dataset(user, name)
+            self._json(summary(ds) if ds else None)
         elif u.path == "/api/sessions":
             with LOCK:
-                self._json({"sessions": sessions_list(), "active": ACTIVE})
+                sl = sessions_list(user)
+                act = ACTIVE.get(user, "")
+            self._json({"sessions": sl, "active": act})
         elif u.path == "/api/progress":
             name = q.get("name", [""])[0]
-            self._json(PROGRESS.get(name) or {"phase": "idle", "pct": 0})
+            self._json(_user_state(user, PROGRESS).get(name)
+                       or {"phase": "idle", "pct": 0})
         elif u.path == "/api/tail":
-            self._tail(q)
+            self._tail(q, user)
         elif u.path == "/api/rows":
-            self._rows(q)
+            self._rows(q, user)
         elif u.path == "/api/top":
-            self._top(q)
+            self._top(q, user)
         elif u.path == "/api/export":
-            self._export(q)
+            self._export(q, user)
         elif u.path == "/api/audit":
             # Aislamiento por usuario: cada usuario ve solo sus propias
             # entradas (campo "user" = header Cf-Access-Login-User).
-            self._json({"audit": audit_for_user(self._user())})
+            self._json({"audit": audit_for_user(user)})
         else:
             self._error("ruta no conocida", 404)
 
-    def _rows(self, q):
+    def _rows(self, q, user):
         name = q.get("name", [""])[0]
+        # Solo se toma el dataset bajo LOCK; la consulta (que puede ser
+        # lenta en SQLite) ya no bloquea el resto del servidor.
         with LOCK:
-            ds = dataset(name)
-            if ds is None:
-                self._error("no hay archivo cargado", 404)
-                return
-            store = ds["store"]
-            try:
-                page = max(1, int(q.get("page", ["1"])[0]))
-                size = min(PAGE_MAX, max(1, int(q.get("size", [str(PAGE_SIZE)])[0])))
-            except ValueError:
-                page, size = 1, PAGE_SIZE
-            start = (page - 1) * size
-            total = store.count_filtered(q)
-            chunk = store.page_filtered(q, start, size)
-            self._json({
-                "total": total,
-                "page": page,
-                "size": size,
-                "rows": chunk,
-                "format": ds["format"],
-                "name": ds["name"],
-            })
+            ds = dataset(user, name)
+        if ds is None:
+            self._error("no hay archivo cargado", 404)
+            return
+        store = ds["store"]
+        try:
+            page = max(1, int(q.get("page", ["1"])[0]))
+            size = min(PAGE_MAX, max(1, int(q.get("size", [str(PAGE_SIZE)])[0])))
+        except ValueError:
+            page, size = 1, PAGE_SIZE
+        start = (page - 1) * size
+        total = store.count_filtered(q)
+        chunk = store.page_filtered(q, start, size)
+        self._json({
+            "total": total,
+            "page": page,
+            "size": size,
+            "rows": chunk,
+            "format": ds["format"],
+            "name": ds["name"],
+        })
 
-    def _tail(self, q):
+    def _tail(self, q, user):
         name = q.get("name", [""])[0]
         with LOCK:
-            ds = dataset(name)
-            if ds is None:
-                self._error("no hay archivo cargado", 404)
-                return
-            w = WATCHERS.get(name)
-            if w is None or not w.enabled:
-                self._json({"watching": False, "rows": [], "total_new": 0})
-                return
-            try:
-                last = min(TAIL_MAX, max(1, int(q.get("last", ["500"])[0])))
-            except ValueError:
-                last = 500
-            with w.lock:
-                lines = list(w.buffer)[:last]
-                for _ in range(len(lines)):
-                    w.buffer.popleft()
-                truncated = w.truncated
-                w.truncated = False
-            rows, counters = tail_parse(ds, lines)
-            for r in rows:
-                r["_search"] = _make_search(r)
-            ds["store"].add_rows(rows, counters)
+            ds = dataset(user, name)
+            w = _user_state(user, WATCHERS).get(name)
+        if ds is None:
+            self._error("no hay archivo cargado", 404)
+            return
+        if w is None or not w.enabled:
+            self._json({"watching": False, "rows": [], "total_new": 0})
+            return
+        try:
+            last = min(TAIL_MAX, max(1, int(q.get("last", ["500"])[0])))
+        except ValueError:
+            last = 500
+        with w.lock:
+            lines = list(w.buffer)[:last]
+            for _ in range(len(lines)):
+                w.buffer.popleft()
+            truncated = w.truncated
+            w.truncated = False
+        rows, counters = tail_parse(ds, lines)
+        for r in rows:
+            r["_search"] = _make_search(r)
+        ds["store"].add_rows(rows, counters)
+        with LOCK:
             ds["total"] += len(lines)
-            self._json({
-                "watching": True,
-                "rows": [{k: v for k, v in r.items() if k != "_search"}
-                         for r in rows],
-                "total_new": len(rows),
-                "total": ds["total"],
-                "truncated": truncated,
-            })
+            total = ds["total"]
+        self._json({
+            "watching": True,
+            "rows": [{k: v for k, v in r.items() if k != "_search"}
+                     for r in rows],
+            "total_new": len(rows),
+            "total": total,
+            "truncated": truncated,
+        })
 
-    def _top(self, q):
+    def _top(self, q, user):
         name = q.get("name", [""])[0]
         with LOCK:
-            ds = dataset(name)
-            if ds is None:
-                self._error("no hay archivo cargado", 404)
-                return
-            field = q.get("field", ["ip"])[0]
-            try:
-                limit = min(100, max(1, int(q.get("limit", ["30"])[0])))
-            except ValueError:
-                limit = 30
-            self._json({"field": field, "top": top_n(ds, field, limit)})
+            ds = dataset(user, name)
+        if ds is None:
+            self._error("no hay archivo cargado", 404)
+            return
+        field = q.get("field", ["ip"])[0]
+        try:
+            limit = min(100, max(1, int(q.get("limit", ["30"])[0])))
+        except ValueError:
+            limit = 30
+        self._json({"field": field, "top": top_n(ds, field, limit)})
 
     EXPORT_BATCH = 5000  # filas por lote al exportar en streaming
 
@@ -1448,7 +1532,19 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
         self.wfile.write(b"\r\n")
 
-    def _export(self, q):
+    def _csv_cell(self, v):
+        """Sanea una celda CSV contra inyeccion de formulas en Excel.
+
+        El contenido de los logs lo controla el emisor (paths, user-agents,
+        mensajes): una celda que empieza por =, +, -, @ (o con tab/salto
+        de linea) se interpreta como formula al abrir el CSV en
+        Excel/LibreOffice. Se prefija con ' para forzar texto."""
+        s = "" if v is None else str(v)
+        if s[:1] in ("=", "+", "-", "@", "\t", "\r", "\n"):
+            return "'" + s
+        return s
+
+    def _export(self, q, user):
         """Exporta las filas filtradas en streaming (Transfer-Encoding:
         chunked). Se pagina por lotes de EXPORT_BATCH para no construir
         el cuerpo entero en memoria (un dataset SQLite de millones de
@@ -1459,11 +1555,11 @@ class Handler(BaseHTTPRequestHandler):
             self._error("formato de export no soportado (csv o json)", 400)
             return
         with LOCK:
-            ds = dataset(name)
-            if ds is None:
-                self._error("no hay archivo cargado", 404)
-                return
-            store = ds["store"]
+            ds = dataset(user, name)
+        if ds is None:
+            self._error("no hay archivo cargado", 404)
+            return
+        store = ds["store"]
         cols = ["ts", "level", "ip", "host", "app", "pid",
                 "method", "path", "code", "bytes", "msg"]
         ctype = ("application/x-ndjson; charset=utf-8" if fmt == "json"
@@ -1504,7 +1600,8 @@ class Handler(BaseHTTPRequestHandler):
                         c["raw"] = r.get("raw", "")
                         out.write(json.dumps(c, ensure_ascii=False) + "\n")
                     else:
-                        w.writerow(clean(r))
+                        w.writerow({k: self._csv_cell(v)
+                                    for k, v in clean(r).items()})
                     n += 1
                 if out.tell() > 65536:
                     flush()
@@ -1513,10 +1610,20 @@ class Handler(BaseHTTPRequestHandler):
             self._write_chunk(b"")  # chunk final
         except (ConnectionError, BrokenPipeError):
             return  # el cliente se fue: nada mas que hacer
-        audit("export", user=self._user(),
+        audit("export", user=self._user(), ip=self.client_address[0],
               file=ds["name"], format=fmt, rows=n)
 
     def do_POST(self):
+        if not self._cf_ok():
+            self._error("acceso directo no permitido (requiere Cloudflare Access)", 403)
+            return
+        # Anti-CSRF: la pagina (servida por este proceso) mete el token en
+        # todos los POST. Un fetch cross-origin no puede anadir el header
+        # sin preflight (y el preflight falla: no hay CORS), y un POST
+        # "simple" (text/plain, multipart) sin el header se rechaza.
+        if self.headers.get("X-CSRF-Token", "") != CSRF_TOKEN:
+            self._error("token CSRF invalido", 403)
+            return
         u = urlparse(self.path)
         if u.path == "/upload":
             self._upload()
@@ -1530,145 +1637,178 @@ class Handler(BaseHTTPRequestHandler):
             self._error("ruta no conocida", 404)
 
     def _upload(self):
+        # Tope de subidas concurrentes: cada una puede leer hasta 1 GB del
+        # cuerpo en RAM; sin este limite unas pocas peticiones a la vez
+        # agotan la memoria (ThreadingHTTPServer no limita hilos).
+        if not UPLOAD_SEM.acquire(timeout=15):
+            self._error("servidor ocupado con otras cargas; reintenta en unos segundos",
+                        503)
+            return
         try:
-            ctype = self.headers.get("Content-Type", "")
-            if "multipart/form-data" not in ctype:
-                self._error("se espera multipart/form-data")
-                return
-            # Lee el cuerpo completo: exactamente Content-Length bytes
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                self._error("Content-Length invalido")
-                return
-            if length > TOTAL_MAX:
-                self._error("peticion demasiado grande (max 1 GB por lote)", 413)
-                return
-            data = self.rfile.read(length)
-            # Extrae el boundary y localiza las partes de archivo
-            m = re.search(r'boundary="?([^";]+)"?', ctype)
-            if not m:
-                self._error("multipart sin boundary")
-                return
-            parts = parse_multipart_all(data, m.group(1).encode())
-            if not parts:
-                self._error("no se encontro ninguna parte de archivo")
-                return
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" not in ctype:
+                    self._error("se espera multipart/form-data")
+                    return
+                # Lee el cuerpo completo: exactamente Content-Length bytes
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self._error("Content-Length invalido")
+                    return
+                if length > TOTAL_MAX:
+                    self._error("peticion demasiado grande (max 1 GB por lote)", 413)
+                    return
+                data = self.rfile.read(length)
+                # Extrae el boundary y localiza las partes de archivo
+                m = re.search(r'boundary="?([^";]+)"?', ctype)
+                if not m:
+                    self._error("multipart sin boundary")
+                    return
+                parts = parse_multipart_all(data, m.group(1).encode())
+                if not parts:
+                    self._error("no se encontro ninguna parte de archivo")
+                    return
 
-            # Validaciones previas (antes de guardar nada)
-            bad = []
-            for name, body in parts:
-                if len(body) > MAX_SIZE:
-                    bad.append("%s: supera el maximo de 500 MB" % name)
-                elif not is_supported_name(name):
-                    bad.append("%s: extension no soportada (se aceptan %s)"
-                               % (name, ", ".join(SUPPORTED_EXTS)))
-            if bad:
-                self._error("archivos no validos: " + " | ".join(bad), 400)
-                return
+                # Validaciones previas (antes de guardar nada)
+                bad = []
+                for name, body in parts:
+                    if len(body) > MAX_SIZE:
+                        bad.append("%s: supera el maximo de 500 MB" % name)
+                    elif not is_supported_name(name):
+                        bad.append("%s: extension no soportada (se aceptan %s)"
+                                   % (name, ", ".join(SUPPORTED_EXTS)))
+                if bad:
+                    self._error("archivos no validos: " + " | ".join(bad), 400)
+                    return
 
-            # Guarda en el temp dir de la sesion y lanza los hilos de carga
-            tmpdir = os.path.join(tempfile.gettempdir(), "logviewer", "sessions")
-            os.makedirs(tmpdir, exist_ok=True)
-            started = []
-            existing_names = []
-            for name, body in parts:
-                safe_name = safe_session_name(name, existing_names)
-                existing_names.append(safe_name)
-                dest = os.path.join(tmpdir, safe_name)
-                with open(dest, "wb") as f:
-                    f.write(body)
-                # Si hay watcher activo, reiniciarlo sobre la nueva copia
-                w = WATCHERS.get(safe_name)
-                if w is not None:
-                    w.reset(seek_end=True)
-                PROGRESS[safe_name] = {"phase": "queued", "pct": 0,
-                                       "message": "en cola"}
-                started.append(safe_name)
-                audit("upload", user=self._user(),
-                  file=safe_name, size=len(body))
-                threading.Thread(target=_load_worker,
-                                 args=(safe_name, dest, self._user()),
-                                 daemon=True).start()
-            self._json({
-                "started": started,
-                "sessions": sessions_list(),
-                "active": ACTIVE,
-            })
-        except Exception as e:
-            self._error("error al cargar: %s" % e, 500)
+                # Guarda en el temp dir de la sesion (carpeta por usuario:
+                # dos usuarios con el mismo nombre de archivo no se pisan)
+                # y lanza los hilos de carga
+                user = self._user()
+                tmpdir = os.path.join(tempfile.gettempdir(), "logviewer",
+                                      "sessions", safe_session_name(user))
+                os.makedirs(tmpdir, exist_ok=True)
+                started = []
+                existing_names = []
+                for name, body in parts:
+                    safe_name = safe_session_name(name, existing_names)
+                    existing_names.append(safe_name)
+                    dest = os.path.join(tmpdir, safe_name)
+                    with open(dest, "wb") as f:
+                        f.write(body)
+                    # Si hay watcher activo, reiniciarlo sobre la nueva copia
+                    w = _user_state(user, WATCHERS).get(safe_name)
+                    if w is not None:
+                        w.reset(seek_end=True)
+                    _user_state(user, PROGRESS)[safe_name] = {
+                        "phase": "queued", "pct": 0, "message": "en cola"}
+                    started.append(safe_name)
+                    audit("upload", user=user, ip=self.client_address[0],
+                          file=safe_name, size=len(body))
+                    threading.Thread(target=_load_worker,
+                                     args=(safe_name, dest, user,
+                                           self.client_address[0]),
+                                     daemon=True).start()
+                with LOCK:
+                    sl = sessions_list(user)
+                    act = ACTIVE.get(user, "")
+                self._json({
+                    "started": started,
+                    "sessions": sl,
+                    "active": act,
+                })
+            except Exception as e:
+                # La excepcion cruda puede llevar rutas internas del
+                # servidor: se loguea y al cliente se le dice poco.
+                self.log_message("upload error: %r" % (e,))
+                self._error("error al cargar", 500)
+        finally:
+            UPLOAD_SEM.release()
+
 
     def _activate(self):
         body = self._read_json_body()
         if body is None:
             self._error("cuerpo JSON invalido", 400)
             return
+        user = self._user()
         name = safe_session_name(body.get("name", ""))
         with LOCK:
-            if name not in SESSIONS:
+            mine = _user_state(user, SESSIONS)
+            if name not in mine:
                 self._error("dataset no encontrado: %s" % name, 404)
                 return
-            global ACTIVE
-            ACTIVE = name
-            audit("activate", user=self._user(), file=name)
-            self._json({"active": ACTIVE, "sessions": sessions_list()})
+            ACTIVE[user] = name
+            sl = sessions_list(user)
+            act = ACTIVE[user]
+        audit("activate", user=user, ip=self.client_address[0], file=name)
+        self._json({"active": act, "sessions": sl})
 
     def _watch(self):
         body = self._read_json_body()
         if body is None:
             self._error("cuerpo JSON invalido", 400)
             return
+        user = self._user()
         name = safe_session_name(body.get("name", ""))
         enabled = bool(body.get("enabled", False))
         with LOCK:
-            ds = SESSIONS.get(name)
+            ds = _user_state(user, SESSIONS).get(name)
             if ds is None:
                 self._error("dataset no encontrado: %s" % name, 404)
                 return
             path = os.path.join(
-                tempfile.gettempdir(), "logviewer", "sessions", name)
-            w = WATCHERS.get(name)
+                tempfile.gettempdir(), "logviewer", "sessions",
+                safe_session_name(user), name)
+            watchers = _user_state(user, WATCHERS)
+            w = watchers.get(name)
             if w is None:
                 w = Watcher(name, path, ds.get("encoding") or "utf-8")
-                WATCHERS[name] = w
+                watchers[name] = w
             if enabled:
                 w.reset(seek_end=True)
                 w.enabled = True
                 w.start()
             else:
                 w.stop()
-            self._json({"name": name, "enabled": w.enabled})
+            now_enabled = w.enabled
+        self._json({"name": name, "enabled": now_enabled})
 
     def _remove(self):
         body = self._read_json_body()
         if body is None:
             self._error("cuerpo JSON invalido", 400)
             return
+        user = self._user()
         name = safe_session_name(body.get("name", ""))
         with LOCK:
-            if name not in SESSIONS:
+            mine = _user_state(user, SESSIONS)
+            if name not in mine:
+                # 404 generico: no se filtra el dataset de otro usuario
                 self._error("dataset no encontrado: %s" % name, 404)
                 return
-            SESSIONS[name]["store"].close()
-            del SESSIONS[name]
-            PROGRESS.pop(name, None)
+            mine[name]["store"].close()
+            del mine[name]
+            _user_state(user, PROGRESS).pop(name, None)
             # Para y borra su watcher
-            w = WATCHERS.pop(name, None)
+            w = _user_state(user, WATCHERS).pop(name, None)
             if w is not None:
                 w.stop()
-            global ACTIVE
-            if ACTIVE == name:
+            if ACTIVE.get(user, "") == name:
                 # Pasa a otro dataset o queda vacio
-                ACTIVE = next(iter(SESSIONS), "")
-            # Borra la copia temporal
-            try:
-                os.remove(os.path.join(
-                    tempfile.gettempdir(), "logviewer", "sessions", name))
-            except OSError:
-                pass
-            audit("remove", user=self._user(), file=name)
-            self._json({"removed": name, "active": ACTIVE,
-                        "sessions": sessions_list()})
+                ACTIVE[user] = next(iter(mine), "")
+            sl = sessions_list(user)
+            act = ACTIVE.get(user, "")
+        # Borra la copia temporal (carpeta del usuario)
+        try:
+            os.remove(os.path.join(
+                tempfile.gettempdir(), "logviewer", "sessions",
+                safe_session_name(user), name))
+        except OSError:
+            pass
+        audit("remove", user=user, ip=self.client_address[0], file=name)
+        self._json({"removed": name, "active": act, "sessions": sl})
 
 
 # ---------------------------------------------------------------------------

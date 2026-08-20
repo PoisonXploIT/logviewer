@@ -169,6 +169,35 @@ logviewer-phase1/
 - **ARIA**: roles y `aria-label` en presets, drawer y auditoria; el estado
   y los toasts usan `role="status"` / `aria-live`.
 
+## Seguridad
+
+- **Autenticacion**: la hace Cloudflare Access en el borde (el servidor no
+  autentica). El header `Cf-Access-Login-User` es *spoofeable*: solo se usa
+  para atribuir la auditoria y aislar los datasets por usuario, no para
+  autorizar. Con `LOGVIEWER_REQUIRE_CF=1` se rechaza con 403 el acceso
+  anonimo al origen (peticiones sin el header); la auditoria guarda la IP
+  remota de cada accion para poder rastrear un header falseado. La defensa
+  real contra la URL de Railway abierta sigue siendo cerrarla (DEPLOY.md).
+- **Aislamiento por usuario**: cada usuario solo ve, exporta y borra sus
+  propios datasets. Las copias temporales van en
+  `%TEMP%\logviewer\sessions\<usuario>\` y las BD SQLite en
+  `%TEMP%\logviewer\sqlite\<usuario>\` (dos usuarios con el mismo nombre
+  de archivo ya no se pisan).
+- **Anti-CSRF**: `GET /api/csrf` devuelve un token por proceso; todos los
+  POST lo exigen en el header `X-CSRF-Token` (403 si falta). Un sitio
+  ajeno no puede leer el token (CORS) ni anadir el header sin preflight.
+- **Cabeceras**: `X-Content-Type-Options: nosniff` en todas las respuestas;
+  CSP estricta + `X-Frame-Options: DENY` en la pagina HTML (sin JS inline).
+- **XSS**: todo el contenido de los logs se escapa al renderizar, incluidos
+  los niveles desconocidos en los chips de nivel.
+- **CSV**: las celdas que empiezan por `=`, `+`, `-`, `@` (o con tab/salto
+  de linea) se prefijan con `'` para evitar inyeccion de formulas en
+  Excel/LibreOffice.
+- **Uploads**: maximo 2 subidas concurrentes (cada una puede leer hasta
+  1 GB del cuerpo en RAM); 503 si el servidor esta ocupado.
+- **Errores**: las excepciones de carga se loguean a `requests.log` y al
+  cliente se le devuelve un mensaje generico (sin rutas internas).
+
 ## Roadmap
 
 - Fase 2 (hecho): compresion (.gz/.bz2/.xz/.zip), deteccion de encoding,

@@ -7,7 +7,13 @@
 "use strict";
 
 /* ---------- api ---------- */
+// Token anti-CSRF por proceso: lo pide el servidor en /api/csrf y viaja
+// en el header X-CSRF-Token de todos los POST (sin el header, 403).
+let csrfToken = "";
+const csrfHeaders = () => ({ "X-CSRF-Token": csrfToken });
+
 const api = {
+  csrf: () => fetch("/api/csrf").then((r) => r.json()),
   summary: (name) =>
     fetch("/api/summary" + (name ? "?name=" + encodeURIComponent(name) : ""))
       .then((r) => r.json()),
@@ -17,13 +23,13 @@ const api = {
   activate: (name) =>
     fetch("/api/activate", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
       body: JSON.stringify({ name }),
     }).then((r) => r.json()),
   remove: (name) =>
     fetch("/api/remove", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
       body: JSON.stringify({ name }),
     }).then((r) => r.json()),
   rows: (params) => fetch("/api/rows?" + new URLSearchParams(params)).then((r) => r.json()),
@@ -35,7 +41,7 @@ const api = {
   watch: (name, enabled) =>
     fetch("/api/watch", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
       body: JSON.stringify({ name, enabled }),
     }).then((r) => r.json()),
   tail: (name, last) =>
@@ -44,7 +50,11 @@ const api = {
   upload: (files) => {
     const fd = new FormData();
     files.forEach((f) => fd.append("file", f));
-    return fetch("/upload", { method: "POST", body: fd }).then((r) => r.json());
+    return fetch("/upload", {
+      method: "POST",
+      headers: csrfHeaders(),
+      body: fd,
+    }).then((r) => r.json());
   },
 };
 
@@ -475,7 +485,7 @@ function renderLevelChips(top) {
     chipHtml("level", "", "Todos") +
     present.map((l) =>
       chipHtml("level", l,
-        '<span class="badge lv-' + l + '">' + ui.esc(l) + "</span>" +
+        '<span class="badge lv-' + ui.esc(l) + '">' + ui.esc(l) + "</span>" +
         '<span class="cnt">x' + ui.fmtNum(counts[l] || 0) + "</span>")
     ).join("");
   bindChips(el);
@@ -1029,6 +1039,11 @@ function togglePresent() {
 function wire() {
   const fileInput = document.getElementById("file");
 
+  // Si el logo no carga, se oculta (sin handler inline: CSP estricta)
+  const logo = document.querySelector("img.logo");
+  if (logo)
+    logo.addEventListener("error", () => { logo.style.display = "none"; });
+
   document.getElementById("btn-theme").addEventListener("click", () => {
     theme.toggle();
     if (app.fmt) renderSeg();
@@ -1158,6 +1173,12 @@ function wire() {
 
 /* ---------- init ---------- */
 async function init() {
+  try {
+    const c = await api.csrf();
+    csrfToken = c.token;
+  } catch (e) {
+    /* sin servidor: los POST fallaran con 403, como el resto */
+  }
   theme.apply(theme.get());
   wire();
   renderPresets();
