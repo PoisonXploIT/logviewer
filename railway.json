@@ -1,0 +1,13 @@
+{
+  "$schema": "https://railway.com/schema/railway.json",
+  "name": "logviewer",
+  "engine": "nixpacks",
+  "startCommand": "python server.py",
+  "env": [
+    {
+      "name": "PYTHONDONTWRITEBYTECODE",
+      "value": "1",
+      "kind": "PLAINTEXT"
+    }
+  ]
+}

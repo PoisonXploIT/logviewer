@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visor de Logs Unificado</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<!-- Sprite de iconos SVG (set reducido, sin dependencias de red) -->
+<svg hidden xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <symbol id="i-upload" viewBox="0 0 16 16">
+    <path d="M8 11V3.5M8 3.5 5.5 6M8 3.5 10.5 6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M2.5 10.5v2a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="i-tail" viewBox="0 0 16 16">
+    <path d="M2 8h3l1.5-4 3 8L10 6h4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-download" viewBox="0 0 16 16">
+    <path d="M8 2.5v8M8 10.5 5.5 8M8 10.5 10.5 8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M2.5 11.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="i-trash" viewBox="0 0 16 16">
+    <path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.7 9.5h6.6L12 4M6.5 7v4M9.5 7v4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-filter" viewBox="0 0 16 16">
+    <path d="M2 3.5h12L10 8.5v4L6 14V8.5L2 3.5Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-copy" viewBox="0 0 16 16">
+    <rect x="5" y="5" width="8" height="8.5" rx="1" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <path d="M3 10.5V3.5a.5.5 0 0 1 .5-.5h6" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="i-sun" viewBox="0 0 16 16">
+    <circle cx="8" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1 1M11.6 11.6l1 1M12.6 3.4l-1 1M4.4 11.6l-1 1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="i-moon" viewBox="0 0 16 16">
+    <path d="M13.5 9.5A6 6 0 0 1 6.5 2.5 6 6 0 1 0 13.5 9.5Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-inbox" viewBox="0 0 16 16">
+    <path d="M2 9.5 4 4h8l2 5.5v4a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-4Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+    <path d="M2 9.5h4l1 1.5h2l1-1.5h4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-lines" viewBox="0 0 16 16">
+    <path d="M2.5 4h11M2.5 8h11M2.5 12h7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="i-globe" viewBox="0 0 16 16">
+    <circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M1.5 8h13M8 1.5c2.5 2 2.5 11 0 13M8 1.5c-2.5 2-2.5 11 0 13" fill="none" stroke="currentColor" stroke-width="1.2"/>
+  </symbol>
+  <symbol id="i-path" viewBox="0 0 16 16">
+    <circle cx="3.5" cy="3.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    <circle cx="12.5" cy="12.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M4.5 4.5C7 7 9 9 11.5 11.5" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="i-badge" viewBox="0 0 16 16">
+    <path d="M8 1.5 10 2.6l2.4.3 1.1 2 0 2.2-1.6 1.7-1.6 1.7 0 2.2-2.3 1.1-2.3-1.1 0-2.2L4.1 8.8 2.5 7.1 2.5 4.9l1.1-2 2.4-.3L8 1.5Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-layers" viewBox="0 0 16 16">
+    <path d="M8 1.5 14.5 5 8 8.5 1.5 5 8 1.5Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+    <path d="M1.5 8 8 11.5 14.5 8M1.5 10.5 8 14l6.5-3.5" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-search" viewBox="0 0 16 16">
+    <circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="i-x" viewBox="0 0 16 16">
+    <path d="M3.5 3.5l9 9M12.5 3.5l-9 9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="i-check" viewBox="0 0 16 16">
+    <path d="M2.5 8.5 6 12 13.5 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-alert" viewBox="0 0 16 16">
+    <path d="M8 2 15 14H1L8 2Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+    <path d="M8 7v3.5M8 12.2v.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="i-chevron" viewBox="0 0 16 16">
+    <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+</svg>
+
+<header class="app-header">
+  <div class="brand">
+    <img src="/static/logo.svg" alt="" class="logo" onerror="this.style.display='none'">
+    <div class="brand-text">
+      <span class="brand-name">Visor de Logs</span>
+      <span class="brand-sub">Unificado</span>
+    </div>
+  </div>
+  <div class="header-right">
+    <span id="status-pill" class="status-pill" role="status">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="status-text">Sin archivo</span>
+    </span>
+    <button id="btn-theme" class="icon-btn" title="Cambiar tema" aria-label="Cambiar tema">
+      <svg class="icon" id="theme-icon"><use href="#i-moon"></use></svg>
+    </button>
+  </div>
+</header>
+
+<div class="app-body">
+  <aside class="sidebar" aria-label="Acciones">
+    <nav class="side-nav">
+      <button id="act-load" class="side-btn">
+        <svg class="icon"><use href="#i-upload"></use></svg>
+        <span>Cargar archivo</span>
+      </button>
+      <button id="act-tail" class="side-btn" disabled
+              title="Seguir las lineas nuevas del archivo activo">
+        <svg class="icon"><use href="#i-tail"></use></svg>
+        <span>Tail en vivo</span>
+      </button>
+      <button id="act-export" class="side-btn" disabled>
+        <svg class="icon"><use href="#i-download"></use></svg>
+        <span>Exportar CSV</span>
+      </button>
+      <button id="act-clear" class="side-btn" disabled>
+        <svg class="icon"><use href="#i-trash"></use></svg>
+        <span>Limpiar</span>
+      </button>
+    </nav>
+
+    <div id="filecard" class="filecard hidden">
+      <div class="filecard-label">Archivo activo</div>
+      <div id="file-name" class="file-name"></div>
+      <div id="file-meta" class="file-meta"></div>
+    </div>
+
+    <div id="progress-list" class="progress-list hidden"></div>
+
+    <div class="sessions-wrap">
+      <div class="sessions-label">Sesiones</div>
+      <div id="sessions" class="sessions"></div>
+    </div>
+
+    <div class="presets-wrap">
+      <div class="presets-label">Presets de filtros</div>
+      <div id="presets" class="presets"></div>
+      <button id="preset-save" class="btn ghost" disabled>
+        <svg class="icon"><use href="#i-check"></use></svg>
+        Guardar preset actual
+      </button>
+    </div>
+
+    <div class="audit-wrap">
+      <button id="audit-toggle" class="filters-toggle" aria-expanded="false" aria-controls="audit-body">
+        <svg class="icon"><use href="#i-lines"></use></svg>
+        <span>Auditoría</span>
+        <span id="audit-count" class="filters-count hidden"></span>
+        <svg class="icon chev" aria-hidden="true"><use href="#i-chevron"></use></svg>
+      </button>
+      <div id="audit-body" class="audit-body hidden"></div>
+    </div>
+
+    <div class="sidebar-foot">
+      <span class="muted">v1.1 · offline · 127.0.0.1</span>
+    </div>
+  </aside>
+
+  <main class="main">
+    <!-- Estado vacio -->
+    <section id="empty" class="empty">
+      <svg class="empty-icon" aria-hidden="true"><use href="#i-inbox"></use></svg>
+      <h2>Ningun archivo cargado</h2>
+      <p class="muted">Arrastra uno o varios archivos de logs a esta zona o
+      elige del equipo. Admite varios a la vez y formatos comprimidos
+      (.gz, .bz2, .xz, .zip).</p>
+      <button id="empty-load" class="btn primary">
+        <svg class="icon"><use href="#i-upload"></use></svg>
+        Cargar archivo
+      </button>
+      <ol class="guide">
+        <li>Carga uno o varios archivos (Apache/NCS, W3C, JSON, syslog,
+          genérico o RAW; plano o comprimido).</li>
+        <li>Cambia entre ellos desde el panel de sesiones.</li>
+        <li>Filtra por nivel, código, IP, path, fecha o texto libre.</li>
+        <li>Exporta las filas filtradas a CSV.</li>
+      </ol>
+    </section>
+
+    <!-- Dashboard -->
+    <section id="dash" class="hidden">
+      <div class="kpi-row" id="kpis"></div>
+
+      <div class="filters-panel" id="filters-panel">
+        <button class="filters-toggle" id="filters-toggle" aria-expanded="true" aria-controls="filters-body">
+          <svg class="icon"><use href="#i-filter"></use></svg>
+          <span>Filtros</span>
+          <span id="filters-count" class="filters-count hidden"></span>
+          <svg class="icon chev" aria-hidden="true"><use href="#i-chevron"></use></svg>
+        </button>
+        <div class="filters-body" id="filters-body">
+          <div class="fgroup" id="fgroup-level">
+            <span class="fgroup-label">Nivel</span>
+            <span id="lvchips" class="chips"></span>
+          </div>
+          <div class="fgroup" id="fgroup-code">
+            <span class="fgroup-label">Código HTTP</span>
+            <span id="codechips" class="chips"></span>
+          </div>
+          <div class="fgroup">
+            <span class="fgroup-label">IP / Path</span>
+            <input id="fip" placeholder="IP (subcadena)" autocomplete="off">
+            <input id="fpath" placeholder="Path (subcadena)" autocomplete="off">
+          </div>
+          <div class="fgroup">
+            <span class="fgroup-label">Fecha / Texto</span>
+            <input id="fdt" placeholder="Fecha/hora (11:07:24, 2026-05-11)" autocomplete="off">
+            <input id="fq" placeholder="Texto libre" autocomplete="off">
+          </div>
+          <button id="filters-reset" class="btn ghost">Limpiar filtros</button>
+        </div>
+      </div>
+
+      <div class="seg-grid" id="seg"></div>
+
+      <div class="table-panel">
+        <div class="table-head">
+          <span id="count" class="muted"></span>
+          <span class="table-actions">
+            <label class="export-fmt">
+              <span class="muted">Formato</span>
+              <select id="export-format" aria-label="Formato de export">
+                <option value="csv">CSV</option>
+                <option value="json">JSON Lines</option>
+              </select>
+            </label>
+            <button id="btn-export" class="btn">
+              <svg class="icon"><use href="#i-download"></use></svg>
+              Exportar
+            </button>
+            <button id="btn-present" class="btn" title="Modo presentacion (P)">
+              <svg class="icon"><use href="#i-badge"></use></svg>
+              Presentación
+            </button>
+          </span>
+        </div>
+        <div id="tblwrap">
+          <table>
+            <thead id="thead"></thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+        <div id="pager">
+          <button id="prev" class="btn">Anterior</button>
+          <span id="pageinfo" class="muted"></span>
+          <button id="next" class="btn">Siguiente</button>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- Drawer de detalle de fila -->
+<div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
+<aside id="drawer" class="drawer" aria-hidden="true" aria-label="Detalle de la línea">
+  <div class="drawer-head">
+    <h2>Detalle de la línea</h2>
+    <button id="drawer-close" class="icon-btn" aria-label="Cerrar detalle">
+      <svg class="icon"><use href="#i-x"></use></svg>
+    </button>
+  </div>
+  <div class="drawer-body">
+    <table class="kv" id="drawer-kv"></table>
+    <div class="drawer-raw">
+      <div class="drawer-raw-head">
+        <span class="fgroup-label">Línea raw</span>
+        <button id="drawer-copy" class="btn ghost">
+          <svg class="icon"><use href="#i-copy"></use></svg>
+          Copiar
+        </button>
+      </div>
+      <pre id="drawer-raw"></pre>
+    </div>
+  </div>
+</aside>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<input type="file" id="file" hidden>
+
+<script src="/static/vendor/chart.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
