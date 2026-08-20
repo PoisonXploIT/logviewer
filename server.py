@@ -1371,12 +1371,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _user(self):
         """Usuario de la peticion: el header que inyecta Cloudflare Access
-        (Cf-Access-Login-User) o "local" si no esta (acceso directo).
+        (Cf-Access-Authenticated-User-Email) o "local" si no esta (acceso
+        directo). Se mantiene Cf-Access-Login-User como fallback por
+        compatibilidad con configuraciones antiguas de Access.
 
         AVISO: el header es spoofeable (cualquier cliente puede enviarlo).
         Solo se usa para atribuir la auditoria y aislar los datasets;
         la autenticacion real la hace Cloudflare Access en el borde."""
-        return self.headers.get("Cf-Access-Login-User") or "local"
+        return (self.headers.get("Cf-Access-Authenticated-User-Email")
+                or self.headers.get("Cf-Access-Login-User") or "local")
 
     def _cf_ok(self):
         """Con LOGVIEWER_REQUIRE_CF=1 se rechaza el acceso anonimo al
@@ -1386,7 +1389,8 @@ class Handler(BaseHTTPRequestHandler):
         La defensa real contra la URL abierta es cerrarla en Railway."""
         if not REQUIRE_CF:
             return True
-        return bool(self.headers.get("Cf-Access-Login-User"))
+        return bool(self.headers.get("Cf-Access-Authenticated-User-Email")
+                    or self.headers.get("Cf-Access-Login-User"))
 
     def _read_json_body(self):
         """Lee un cuerpo JSON pequeno (para /api/activate, /api/remove,

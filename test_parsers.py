@@ -647,5 +647,41 @@ class TestAuditUser(unittest.TestCase):
         self.assertEqual(e["user"], "sammi@example.com")
 
 
+class TestCfHeader(unittest.TestCase):
+    """Fase 6: identifica el usuario por el header que inyecta Cloudflare
+    Access (Cf-Access-Authenticated-User-Email), con fallback al antiguo
+    Cf-Access-Login-User."""
+
+    def _handler(self, headers):
+        h = server.Handler  # referencia de clase
+        handler = object.__new__(h)
+        handler.headers = headers
+        handler.client_address = ("1.2.3.4", 12345)
+        return handler
+
+    def test_reads_correct_header(self):
+        h = self._handler({"Cf-Access-Authenticated-User-Email": "a@b.com"})
+        self.assertEqual(h._user(), "a@b.com")
+
+    def test_fallback_legacy_header(self):
+        h = self._handler({"Cf-Access-Login-User": "legacy@b.com"})
+        self.assertEqual(h._user(), "legacy@b.com")
+
+    def test_no_header_is_local(self):
+        h = self._handler({})
+        self.assertEqual(h._user(), "local")
+
+    def test_cf_ok_requires_header(self):
+        server.REQUIRE_CF = True
+        try:
+            ok = self._handler(
+                {"Cf-Access-Authenticated-User-Email": "a@b.com"})
+            self.assertTrue(ok._cf_ok())
+            bad = self._handler({})
+            self.assertFalse(bad._cf_ok())
+        finally:
+            server.REQUIRE_CF = False
+
+
 if __name__ == "__main__":
     unittest.main()
