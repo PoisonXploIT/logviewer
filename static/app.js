@@ -1015,12 +1015,14 @@ async function refreshAudit() {
 
 function auditDetail(e) {
   const bits = [];
+  if (e.user && e.user !== "local") bits.push(e.user);
   if (e.file) bits.push(e.file);
   if (e.format) bits.push(e.format);
   if (e.total) bits.push(e.total + " lineas");
   if (e.rows) bits.push(e.rows + " filas");
   if (e.size) bits.push(ui.fmtBytes(e.size));
   if (e.backend) bits.push(e.backend);
+  if (e.ip) bits.push(e.ip);
   return bits.join(" · ");
 }
 
