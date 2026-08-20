@@ -597,6 +597,40 @@ class TestResolveBind(unittest.TestCase):
         self.assertEqual(server.resolve_bind(None, "127.0.0.1", "8000"),
                          ("127.0.0.1", 8000))
 
+
+class TestAuditPerUser(unittest.TestCase):
+    """Fase 6: la auditoria aislada por usuario (/api/audit)."""
+
+    def setUp(self):
+        self._orig = server.AUDIT[:]
+        server.AUDIT[:] = []
+
+    def tearDown(self):
+        server.AUDIT[:] = self._orig
+
+    def test_each_user_sees_only_their_entries(self):
+        server.audit("upload", user="sammideblas@gmail.com", file="a.log")
+        server.audit("upload", user="revisor@corp.com", file="b.log")
+        server.audit("activate", user="sammideblas@gmail.com", file="a.log")
+
+        a = server.audit_for_user("sammideblas@gmail.com")
+        b = server.audit_for_user("revisor@corp.com")
+
+        self.assertEqual(len(a), 2)
+        self.assertTrue(all(e["user"] == "sammideblas@gmail.com" for e in a))
+        self.assertEqual(len(b), 1)
+        self.assertTrue(all(e["user"] == "revisor@corp.com" for e in b))
+
+    def test_no_entries_when_no_match(self):
+        server.audit("upload", user="sammideblas@gmail.com")
+        self.assertEqual(server.audit_for_user("otro@corp.com"), [])
+        # "local" no ve las entradas de usuarios autenticados
+        self.assertEqual(server.audit_for_user("local"), [])
+
+    def test_local_entries_visible_to_local(self):
+        server.audit("upload", user="local")
+        self.assertEqual(len(server.audit_for_user("local")), 1)
+
     def test_invalid_port(self):
         self.assertRaises(ValueError, server.resolve_bind, "abc", None, None)
 

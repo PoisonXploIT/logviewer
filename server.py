@@ -1251,6 +1251,16 @@ def audit_list():
         return list(reversed(AUDIT))
 
 
+def audit_for_user(user):
+    """Solo las entradas de auditoria del usuario indicado.
+
+    Aislamiento por usuario (Fase 6): detras de Cloudflare Access cada
+    peticion lleva el header Cf-Access-Login-User, que se guarda en el
+    campo "user" de cada entrada. Este filtro hace que cada usuario vea
+    solo sus propias acciones y no las de los demas."""
+    return [e for e in audit_list() if e.get("user") == user]
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # Log a archivo (no a consola) para poder diagnosticar fallos
@@ -1350,7 +1360,9 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/api/export":
             self._export(q)
         elif u.path == "/api/audit":
-            self._json({"audit": audit_list()})
+            # Aislamiento por usuario: cada usuario ve solo sus propias
+            # entradas (campo "user" = header Cf-Access-Login-User).
+            self._json({"audit": audit_for_user(self._user())})
         else:
             self._error("ruta no conocida", 404)
 
