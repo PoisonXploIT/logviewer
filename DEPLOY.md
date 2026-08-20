@@ -9,13 +9,15 @@ Sin esa capa NO se sube: el servidor no tiene autenticacion propia.
 - La autenticacion (GitHub o codigo de un solo uso al correo) la gestiona
   Cloudflare; el codigo no cambia para autenticar.
 - Detras del Access, cada peticion lleva el header
-  `Cf-Access-Login-User` con el correo del usuario. El servidor lo anade
+  `Cf-Access-Authenticated-User-Email` con el correo del usuario. El servidor lo anade
   a la auditoria (Fase 5): quedaria "quien subio/exporto/activo/quito".
   Sin el header (acceso local) se registra como "local".
+  (Nota: el header real de Cloudflare Access es `Cf-Access-Authenticated-User-Email`;
+  `Cf-Access-Login-User` se mantiene solo como fallback de compatibilidad.)
 
 ## Modelo de confianza (leelo antes de operar el deploy)
 
-- El header `Cf-Access-Login-User` es **spoofeable**: cualquier cliente
+- El header `Cf-Access-Authenticated-User-Email` es **spoofeable**: cualquier cliente
   puede enviarlo. El servidor solo lo usa para (a) atribuir la auditoria
   y (b) aislar los datasets por usuario. NO autoriza nada: la
   autenticacion la hace Access en el borde.

@@ -171,7 +171,8 @@ IP_KEYS = ("ip", "client_ip", "ip_addr", "src_ip", "remote_addr", "source_ip")
 # Estado global: sesion con varios datasets
 # ---------------------------------------------------------------------------
 # Aislamiento por usuario (Fase 6): todo el estado se clavea por usuario
-# (el header Cf-Access-Login-User o "local"). Un usuario solo ve, exporta
+# (el header Cf-Access-Authenticated-User-Email de Cloudflare Access o
+# "local"). Un usuario solo ve, exporta
 # y borra sus propios datasets; las copias temporales van en
 # sessions/<usuario>/ para que dos usuarios con el mismo nombre de archivo
 # no se pisen.
@@ -1274,7 +1275,7 @@ def audit(action, user="local", ip=None, **details):
     """Registra una accion en la auditoria (memoria + archivo JSON Lines).
 
     user: quien la hizo. Detras de Cloudflare Access llega en el header
-    Cf-Access-Login-User (spoofeable: solo atribucion, no autenticacion);
+    Cf-Access-Authenticated-User-Email (spoofeable: solo atribucion, no autenticacion);
     en local (o sin ese header) es "local".
     ip: direccion remota de la peticion (forensica: si el header esta
     falseado, la IP ayuda a rastrear de donde sale)."""
@@ -1306,7 +1307,7 @@ def audit_for_user(user):
     """Solo las entradas de auditoria del usuario indicado.
 
     Aislamiento por usuario (Fase 6): detras de Cloudflare Access cada
-    peticion lleva el header Cf-Access-Login-User, que se guarda en el
+    peticion lleva el header Cf-Access-Authenticated-User-Email, que se guarda en el
     campo "user" de cada entrada. Este filtro hace que cada usuario vea
     solo sus propias acciones y no las de los demas."""
     return [e for e in audit_list() if e.get("user") == user]
@@ -1445,7 +1446,7 @@ class Handler(BaseHTTPRequestHandler):
             self._export(q, user)
         elif u.path == "/api/audit":
             # Aislamiento por usuario: cada usuario ve solo sus propias
-            # entradas (campo "user" = header Cf-Access-Login-User).
+            # entradas (campo "user" = header de Cloudflare Access).
             self._json({"audit": audit_for_user(user)})
         else:
             self._error("ruta no conocida", 404)

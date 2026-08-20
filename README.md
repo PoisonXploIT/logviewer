@@ -172,7 +172,8 @@ logviewer-phase1/
 ## Seguridad
 
 - **Autenticacion**: la hace Cloudflare Access en el borde (el servidor no
-  autentica). El header `Cf-Access-Login-User` es *spoofeable*: solo se usa
+  autentica). El header `Cf-Access-Authenticated-User-Email` (el que inyecta
+  Access; `Cf-Access-Login-User` queda como fallback) es *spoofeable*: solo se usa
   para atribuir la auditoria y aislar los datasets por usuario, no para
   autorizar. Con `LOGVIEWER_REQUIRE_CF=1` se rechaza con 403 el acceso
   anonimo al origen (peticiones sin el header); la auditoria guarda la IP
