@@ -1,264 +1,223 @@
-# Visor de Logs Unificado
+# Unified Log Viewer
 
-Servidor web local (Python, solo stdlib, sin dependencias) para ver y filtrar
-cualquier archivo de logs en el navegador. Resuelve el problema del visor
-estatico anterior: el log NUNCA se embebe en el HTML; todo el filtrado se hace
-en el servidor y el navegador solo recibe la pagina pedida.
+A local web server (Python, stdlib only, zero dependencies) to view and
+filter log files in the browser. The log is **never** embedded in the HTML:
+all filtering happens server-side and the browser only receives the requested
+page. Designed for SOC analysts and security students who want fast triage
+without shipping logs to the cloud.
 
-Fase 1: rediseño visual corporativo, tema claro/oscuro, dashboard con
-sidebar, KPIs con sparklines, graficos vendoreados (Chart.js), drawer de
-detalle de fila y panel de filtros plegable. 100% offline (air-gapped).
+**Version 1.2** — 100% offline by default, with optional local-only LLM
+analysis and local Splunk ingestion.
 
-Fase 2: multi-archivo con sesiones, compresion (.gz/.bz2/.xz/.zip), deteccion
-de encoding, cola de carga con progreso y errores amigables.
+## Features
 
-## Arrancar
+- **Multi-format ingestion**: Apache/NCS (CLF), W3C Extended (IIS), JSON
+  Lines, generic. Auto-detection of format and encoding (utf-8, cp1252,
+  latin-1). Compressed files `.gz`, `.bz2`, `.xz`, `.zip` (magic-byte
+  detection, not extension).
+- **Server-side filtering**: level, HTTP code, IP, path, free text, date
+  range — combinable. Multi-value with commas (`200,301`) and exclusion with
+  `!` (`!10.0.0.5`).
+- **Full-text search**: FTS5 (SQLite) for instant search over millions of
+  lines on large datasets.
+- **Error clustering**: identical errors are grouped into unique templates
+  with their count and a sample line, so you see the forest instead of
+  thousands of identical `ERR` lines.
+- **Line context**: click any row to open a drawer with the parsed fields,
+  the raw line, and a "view context" button showing surrounding lines.
+- **Live tail**: follow lines appended to the active file in real time.
+- **Histogram**: temporal distribution of the filtered rows (per minute /
+  hour); click a bar to apply that time range.
+- **Runbooks**: your own local "known error -> solution" database, with
+  regex/glob pattern matching against each line.
+- **Local LLM analysis (local-only)**: "Analyze this line" and "Quick
+  diagnosis" send content to a local model (LM Studio / Ollama / llama.cpp)
+  on `127.0.0.1`. Nothing leaves your machine.
+- **Local Splunk ingestion (local-only)**: run a SPL query against your own
+  local Splunk and load the result as a dataset.
+- **Export**: filtered rows to CSV or JSON Lines (streamed, chunked).
+- **Dashboard**: KPIs, Chart.js charts, presets, presentation mode,
+  keyboard shortcuts, audit log.
+
+## Requirements
+
+- Python 3.8+ (no pip packages — stdlib only).
+- Optional, for LLM analysis: a local OpenAI-compatible model server on
+  `127.0.0.1` (LM Studio, Ollama, or llama.cpp).
+- Optional, for Splunk: a local Splunk instance with REST API access.
+
+## Getting started
 
 ```bash
-cd "C:\Users\Sammi\Documents\Destino\LOGS RAW\logviewer-phase1"
+cd logviewer-phase1
 python server.py
 ```
 
-Luego abrir en el navegador:
+Then open in your browser:
 
 ```
 http://127.0.0.1:8765/
 ```
 
-- Puerto configurable: `python server.py 9000`
-- El servidor solo escucha en 127.0.0.1 (no se expone a la red).
-- Al arrancar se limpia la carpeta temporal `%TEMP%\logviewer\`.
-- Maximo de archivo: 500 MB; maximo por lote de subida: 1 GB.
-- Extensiones aceptadas: `.log .txt .csv .json .gz .bz2 .xz .zip`
+- Custom port: `python server.py 9000`
+- By default the server only listens on `127.0.0.1` (not exposed to the
+  network). Use `--host 0.0.0.0` or `PORT=<n>` to bind elsewhere (Railway).
+- On startup the temp folder `%TEMP%\logviewer\` is cleaned.
+- File limits: 500 MB per file, 1 GB per upload batch, 2 GB decompressed.
+- Accepted extensions: `.log .txt .csv .json .gz .bz2 .xz .zip`
+- Large datasets (over a threshold) automatically use a SQLite backend, so
+  logs with millions of lines don't exhaust memory.
 
-## Formatos soportados (deteccion automatica)
+## Using the tool
 
-| Formato | Deteccion | Campos extraidos |
+1. Start the server and open `http://127.0.0.1:8765/`.
+2. Drag one or more log files onto the page, or click "Cargar archivo"
+   (Upload). The browser uploads them to the server, which detects format
+   and encoding and parses each file in the background (progress bar per
+   file).
+3. Each loaded file appears in the **Sessions** panel. Click to switch, `x`
+   to remove. The active file drives the dashboard.
+4. **Filters** are combinable and applied server-side: level chips, HTTP
+   code chips, IP, path, free text, date/time. Commas mean OR, `!` means
+   exclude. Clicking a chart segment or a chip applies it as a filter.
+5. **Export** the filtered rows to CSV or JSON Lines via the format selector.
+6. **Runbooks**: manage known errors from the row drawer.
+7. **Diagnosis** (local-only): open a row and click "Analyze", or use
+   "Quick diagnosis" to have the local LLM summarize all error templates.
+8. **Presentation mode**: the "Presentacion" button (or `p`) hides the
+   sidebar/header/filters and shows the table full-screen. `Esc` closes it.
+
+## Local-only features (by security design)
+
+Two features depend on services that live on your own machine and are, by
+design, **not** available from a version deployed to the internet:
+
+### Local LLM (Analyze line and Quick diagnosis)
+
+- Sends one line (or the error templates) to an OpenAI-compatible LLM running
+  on **your** machine (LM Studio, Ollama, llama.cpp). Nothing goes online.
+- The LLM destination is **loopback only** (`localhost` / `127.x`). External
+  servers are rejected (anti-SSRF, enforced in three layers: when saving the
+  URL, when making the request, and against redirects). On a deployed web
+  version there is no model in the container, so the button is hidden and the
+  UI explains it is a local-only feature.
+- **Setup (local):**
+  1. Start your model (e.g. `llama-server` on a port like 8096).
+  2. Open the LLM settings in the UI (gear icon in the header).
+  3. Set the base URL (`http://127.0.0.1:8096/v1`), the model name, a
+     generous timeout (reasoning models are slow), and the response language
+     (Auto / Spanish / English). Save.
+- Environment variables: `LOGVIEWER_LLM_URL`, `LOGVIEWER_LLM_MODEL`
+  (default "local"), `LOGVIEWER_LLM_TIMEOUT` (default 10 s). Values can also
+  be changed from the UI (persisted in `%TEMP%\logviewer\settings.json`).
+
+### Local Splunk (Import from Splunk)
+
+- Runs a SPL query against your own local Splunk and loads the result as a
+  dataset (filter, export, diagnose). The SPL runs on your Splunk (that is
+  where the computational load goes); the viewer only fetches the result
+  (capped row count).
+- The connection is configured by the **operator** of the server via
+  environment variables; the viewer does not connect to third-party Splunks.
+- **Setup (local):** environment variables
+  - `SPLUNK_URL` (default `https://localhost:8089`)
+  - `SPLUNK_USER` (default `admin`)
+  - `SPLUNK_PASS` (required; if missing, the Splunk section is hidden)
+- Note: for Azure AD JSON events (sourcetype `ms:aad:signin`) use `| spath`
+  to extract the fields (`userPrincipalName`, `ipAddress`, `failureReason`)
+  that live inside the `_raw` field.
+
+### Web-version notice
+
+On a deployed instance without local LLM/Splunk, the UI shows clear notices
+instead of just hiding the features: "LLM analysis is a local-only feature,
+download the local version from the repository" (link via
+`LOGVIEWER_REPO_URL`) and "Splunk connectivity is configured by the
+operator".
+
+## Security
+
+- **SQL injection**: all queries are parameterized (`?`), including FTS5.
+- **XSS**: all log content is escaped on render; CSP `default-src 'self'`,
+  `X-Frame-Options: DENY`, no inline scripts.
+- **CSRF**: every mutating request requires an `X-CSRF-Token` (403 if
+  missing).
+- **Path traversal**: `resolve_static()` and `safe_session_name()` prevent
+  escaping the static and session directories.
+- **Zip bombs / DoS**: decompression is capped at 2 GB during streaming;
+  max 2 concurrent uploads (503 when busy).
+- **CSV injection**: cells starting with `=`, `+`, `-`, `@` (or tab/newline)
+  are prefixed with `'`.
+- **SSRF (local LLM)**: the LLM destination is loopback-only, enforced at
+  save time, request time, and against HTTP redirects.
+- **No hardcoded credentials**: Splunk and LLM settings come from
+  environment variables, never from the source.
+- **Audit log**: tracks actions with user and remote IP (attribution; the
+  auth boundary is Cloudflare Access when deployed).
+
+## API
+
+| Method | Route | Purpose |
 |---|---|---|
-| Apache/NCS (CLF) | >70% de lineas matchean el regex CLF | ip, fecha, metodo, path, codigo, bytes |
-| W3C Extended (IIS) | primera linea `#Fields` | columnas mapeadas a ip, fecha, metodo, path, codigo, bytes |
-| JSON Lines | >70% de lineas son JSON | ts/time/timestamp, level/lvl, msg/message, ip/client_ip |
-| Syslog RFC 5424 | >70% de lineas `VERSION ISO-fecha ...` | timestamp, hostname, app, pid, msg |
-| Generico | >70% de lineas `fecha hora NIVEL msg` | fecha, hora, nivel (INF/WRN/ERR/CRIT/DBG), msg |
-| RAW | nada de lo anterior | lineas tal cual |
+| GET | `/` | UI (static/index.html) |
+| GET | `/static/*` | Assets (path-traversal protected) |
+| POST | `/upload` | Multipart upload, multiple files, threaded |
+| GET | `/api/sessions` | List datasets + active |
+| POST | `/api/activate` | Set active dataset |
+| POST | `/api/remove` | Remove a dataset |
+| GET | `/api/progress?name=` | Upload progress |
+| GET | `/api/summary?name=` | KPIs (mem or sqlite backend) |
+| GET | `/api/rows?name=&level=&code=&ip=&path=&q=&dt=&page=&size=` | Filtered rows |
+| GET | `/api/top?name=&field=&limit=` | Top N |
+| GET | `/api/templates?name=&level=` | Error templates (clustering) |
+| GET | `/api/histogram?name=&gran=` | Temporal histogram |
+| GET | `/api/context?name=&row=&n=` | Line context (before/after) |
+| GET | `/api/runbooks` | List runbooks |
+| POST | `/api/runbooks` | Create a runbook |
+| PUT | `/api/runbooks?id=` | Edit a runbook |
+| DELETE | `/api/runbooks?id=` | Delete a runbook |
+| GET | `/api/runbooks/match?msg=` | Runbooks matching a message |
+| GET | `/api/config` | {llm, url, model, timeout, splunk, repo_url} |
+| GET/POST | `/api/settings` | Read/save local LLM settings |
+| POST | `/api/analyze` | Local-only: analyze one line with the local LLM |
+| POST | `/api/diagnose` | Local-only: quick diagnosis over error templates |
+| GET | `/api/splunk/sources` | Local-only: list indexes |
+| POST | `/api/splunk/search` | Local-only: run a SPL query into a dataset |
+| POST | `/api/watch` | Toggle live tail |
+| GET | `/api/tail?name=&last=` | Drain new lines |
+| GET | `/api/audit` | Audit log |
+| GET | `/api/export?name=&format=csv\|json` | Streamed export |
 
-Niveles normalizados: INF/INFO, WRN/WARN/WARNING, ERR/ERROR, CRIT/FATAL,
-DBG/DEBUG/TRACE. Las lineas que no se parsean dentro de un formato aparecen
-como nivel RAW. Cada fila conserva ademas la linea `raw` original (usada en
-el drawer de detalle).
-
-## Interfaz (Fase 1)
-
-- **Header corporativo**: logo, titulo, indicador de estado (sin archivo /
-  cargando / N lineas) y boton de tema claro/oscuro (persistido en
-  localStorage).
-- **Sidebar** con acciones: Cargar archivo, Tail en vivo (Fase 3, desactivado),
-  Exportar CSV, Limpiar. Tarjeta con el archivo cargado (nombre, formato,
-  tamano, lineas).
-- **KPIs en cards** con icono, valor grande y sparkline de la distribucion
-  (top 10 del contador correspondiente).
-- **Segmentacion** con graficos Chart.js vendoreados: top IPs/paths (barras
-  horizontales), codigos HTTP o niveles (donut), top hosts/apps (syslog).
-  Clic en un segmento aplica el filtro.
-- **Panel de filtros plegable** (estado persistido) agrupado por categoria:
-  nivel, codigo HTTP, IP/path, fecha/texto libre. Contador de filtros activos.
-- **Tabla profesional**: cabecera sticky, hover, badges de nivel/codigo,
-  boton de copiar en cada celda, fila clicables que abren el **drawer de
-  detalle** (campos parseados en clave-valor + linea raw con boton copiar).
-  Cerrar con Esc.
-- **Estado vacio** con guia rapida de 3 pasos.
-
-## Como se usa
-
-1. Arranca el servidor y abre `http://127.0.0.1:8765/`.
-2. Arrastra uno o varios archivos de logs a la pagina o haz clic en
-   "Cargar archivo". El navegador los sube al servidor, que los guarda en
-   `%TEMP%\logviewer\sessions\`, detecta el formato y el encoding y parsea
-   cada archivo en segundo plano (se ve la barra de progreso por archivo).
-   Se aceptan archivos comprimidos `.gz`, `.bz2`, `.xz` y `.zip` (la
-   deteccion es por magico, no por extension).
-3. Cada archivo cargado aparece en el panel **Sesiones** del sidebar.
-   Se cambia de archivo con un clic y se quita con la x. El archivo activo
-   es el que se muestra en el dashboard.
-   - **KPIs**: lineas totales, IPs unicas, paths unicos, codigos HTTP, niveles.
-   - **Segmentacion**: graficos de top IPs, paths, codigos, niveles, hosts/apps.
-   - **Tabla**: paginada a 500 filas por pagina, con anterior/siguiente.
-4. **Filtros combinables** (todos se aplican en el servidor):
-   - Nivel: chips clicables (Todos / INF / WRN / ERR / CRIT / DBG / RAW).
-   - Codigo HTTP: chips clicables (Apache/W3C).
-   - IP: texto (subcadena).
-   - Path: texto (subcadena).
-   - Texto libre: busca en todos los campos.
-   - Fecha/hora: acepta `HH:MM:SS`, `YYYY-MM-DD` o `YYYY-MM-DD HH:MM`
-     (busca por subcadena en la marca de tiempo de cada linea).
-   - Tambien puedes hacer clic en un segmento de los graficos o en un chip
-     para aplicarlo como filtro.
-5. **Exportar**: exporta las lineas filtradas a CSV o JSON Lines (el
-   selector "Formato" de la barra de la tabla elige el formato).
-6. **Presets de filtros**: guarda el estado actual de filtros con un
-   nombre ("Guardar preset actual" en el sidebar) y aplicalo con un clic.
-   Se conservan en el navegador (localStorage).
-7. **Auditoria**: el panel "Auditoria" del sidebar muestra las acciones
-   registradas (subidas, cargas, exports, activaciones, borrados).
-8. **Modo presentacion**: el boton "Presentacion" (o la tecla `p`) oculta
-   sidebar, header y filtros y deja la tabla a pantalla completa. Esc lo
-   cierra.
-
-## API del servidor
-
-| Metodo | Ruta | Que hace |
-|---|---|---|
-| GET | `/` | Sirve la interfaz (static/index.html) |
-| GET | `/static/*` | Sirve assets de static/ (incluye subcarpetas, anti path traversal) |
-| POST | `/upload` | Recibe uno o varios archivos (multipart), valida, guarda y lanza la carga en segundo plano |
-| GET | `/api/sessions` | Lista los datasets de la sesion y el activo |
-| POST | `/api/activate` | `{"name": "..."}`: cambia el dataset activo |
-| POST | `/api/remove` | `{"name": "..."}`: quita un dataset de la sesion |
-| GET | `/api/progress?name=` | Progreso de carga de un archivo (phase, pct, message) |
-| GET | `/api/summary?name=` | KPIs del dataset (por defecto el activo) |
-| GET | `/api/rows?name=&level=&code=&ip=&path=&q=&dt=&page=&size=` | Filtra en el servidor y devuelve la pagina (incluye campo `raw`) |
-| GET | `/api/top?name=&field=ip&limit=30` | Top N por campo (ip, path, code, level, method, host, app) |
-| GET | `/api/export?name=&format=csv\|json&level=&code=&ip=&path=&q=&dt=` | Descarga CSV o JSON Lines con las lineas filtradas (format por defecto csv) |
-| GET | `/api/audit` | Entradas de auditoria (upload, loaded, export, activate, remove) |
-
-## Estructura
+## Project structure
 
 ```
-logviewer-phase1/
-├── server.py          # Servidor + parseo + API (todo en un archivo)
-├── static/
-│   ├── index.html     # Estructura HTML + sprite de iconos SVG
-│   ├── styles.css     # Estilos con variables de tema claro/oscuro
-│   ├── app.js         # Logica: modulos api, theme, ui, filters, charts, table
-│   ├── logo.svg       # Logo placeholder
-│   └── vendor/
-│       └── chart.min.js  # Chart.js 4.5.1 vendoreado (offline)
-├── test_parsers.py    # Tests de parsers, filtros y rutas estaticas
-└── README.md
+server.py            Single-file server (Python stdlib)
+static/index.html    UI
+static/app.js        Frontend logic
+static/styles.css    Styles
+static/vendor/       Vendored Chart.js
+test_parsers.py      148 unit tests
+railway.json         Railway deploy config
+DEPLOY.md            Railway + Cloudflare Access deploy guide
+LICENSE
 ```
 
-## Archivos generados
+## Tests
 
-- `%TEMP%\logviewer\` - copia temporal del archivo cargado (se limpia al
-  arrancar el servidor) + `requests.log` (log de peticiones, para diagnosticar).
+```bash
+python test_parsers.py
+```
 
-## Backend hibrido (Fase 4)
+148 tests: parsers, ts normalization, templates/clustering, runbooks,
+LLM settings/cache/language, Splunk ingestion, SSRF checks.
 
-- La carga es en streaming: no carga el archivo entero en memoria, parsea en
-  lotes. Si el numero de filas supera el umbral (SQLITE_THRESHOLD, 200000 por
-  defecto), migra a un backend SQLite; si no, queda en memoria. El filtrado,
-  el top N, los KPIs, el tail y el export funcionan sobre ambos backends.
-- El campo "Fecha/hora" busca por subcadena en la marca de tiempo tal como
-  aparece en el log (cada formato usa su propio formato de fecha).
+## Deploy
 
-## Fase 5: presets, export JSON Lines, auditoria, presentacion, atajos
+See `DEPLOY.md` for deploying to Railway behind Cloudflare Access. Key
+conditions: close the public Railway URL, set `LOGVIEWER_REQUIRE_CF=1`, and
+protect your domain with a Cloudflare Access policy. The web version does
+**not** include the local LLM or local Splunk (they are local-only features).
 
-- **Presets de filtros** (localStorage): guarda el estado actual de filtros
-  con un nombre y aplicalo con un clic. Se conservan en el navegador.
-- **Export JSON Lines**: ademas de CSV, se puede exportar las filas
-  filtradas como JSON Lines (una linea JSON por fila, incluye el campo
-  `raw`). El selector "Formato" de la barra de la tabla elige el formato.
-- **Auditoria**: registro de acciones relevantes (upload, loaded, export,
-  activate, remove) en memoria y en `%TEMP%\logviewer\audit.log`. Se consulta
-  con `GET /api/audit` y se ve en el panel "Auditoria" del sidebar.
-- **Modo presentacion**: oculta sidebar, header y filtros y deja la tabla
-  a pantalla completa. Boton "Presentacion" o tecla `p`; Esc lo cierra.
-- **Atajos de teclado**: `p` presentacion, `t` tail, `e` export, `/` texto
-  libre, `g` IP, `Esc` cierra el drawer o sale de presentacion. No se
-  disparan si el foco esta en un campo de texto.
-- **ARIA**: roles y `aria-label` en presets, drawer y auditoria; el estado
-  y los toasts usan `role="status"` / `aria-live`.
+## License
 
-## Seguridad
-
-- **Autenticacion**: la hace Cloudflare Access en el borde (el servidor no
-  autentica). El header `Cf-Access-Authenticated-User-Email` (el que inyecta
-  Access; `Cf-Access-Login-User` queda como fallback) es *spoofeable*: solo se usa
-  para atribuir la auditoria y aislar los datasets por usuario, no para
-  autorizar. Con `LOGVIEWER_REQUIRE_CF=1` se rechaza con 403 el acceso
-  anonimo al origen (peticiones sin el header); la auditoria guarda la IP
-  remota de cada accion para poder rastrear un header falseado. La defensa
-  real contra la URL de Railway abierta sigue siendo cerrarla (DEPLOY.md).
-- **Aislamiento por usuario**: cada usuario solo ve, exporta y borra sus
-  propios datasets. Las copias temporales van en
-  `%TEMP%\logviewer\sessions\<usuario>\` y las BD SQLite en
-  `%TEMP%\logviewer\sqlite\<usuario>\` (dos usuarios con el mismo nombre
-  de archivo ya no se pisan).
-- **Anti-CSRF**: `GET /api/csrf` devuelve un token por proceso; todos los
-  POST lo exigen en el header `X-CSRF-Token` (403 si falta). Un sitio
-  ajeno no puede leer el token (CORS) ni anadir el header sin preflight.
-- **Cabeceras**: `X-Content-Type-Options: nosniff` en todas las respuestas;
-  CSP estricta + `X-Frame-Options: DENY` en la pagina HTML (sin JS inline).
-- **XSS**: todo el contenido de los logs se escapa al renderizar, incluidos
-  los niveles desconocidos en los chips de nivel.
-- **CSV**: las celdas que empiezan por `=`, `+`, `-`, `@` (o con tab/salto
-  de linea) se prefijan con `'` para evitar inyeccion de formulas en
-  Excel/LibreOffice.
-- **Uploads**: maximo 2 subidas concurrentes (cada una puede leer hasta
-  1 GB del cuerpo en RAM); 503 si el servidor esta ocupado.
-- **Errores**: las excepciones de carga se loguean a `requests.log` y al
-  cliente se le devuelve un mensaje generico (sin rutas internas).
-
-## Funciones SOLO local (por seguridad)
-
-Dos funciones dependen de servicios que viven en la propia maquina y, por
-seguridad, **no** se usan desde una version desplegada en internet:
-
-### LLM local (Analizar linea y Diagnostico rapido)
-
-- **Que es:** el visor manda una linea (o las plantillas de error) a un
-  LLM OpenAI-compatible que corre en TU maquina (LM Studio, Ollama o
-  llama.cpp). Nada sale a internet.
-- **Solo local:** el destino del LLM SOLO puede ser loopback
-  (localhost/127.x). No se permite apuntar a un servidor externo (anti
-  SSRF, verificacion en tres capas: al guardar la URL, al pedir, y contra
-  redirecciones). En una version web desplegada (Railway) no hay modelo
-  en el contenedor, asi que el boton no esta disponible y la UI avisa de
-  que es funcion local.
-- **Configurar (en local):**
-  1. Arranca tu modelo (p. ej. `llama-server` en un puerto, como 8096).
-  2. Abre los ajustes del LLM en la UI (engranaje de la cabecera).
-  3. URL base: `http://127.0.0.1:8096/v1`, nombre del modelo, timeout
-     generoso (los modelos de razonamiento tardan), idioma (Auto/Espanol/
-     Ingles). Guardar.
-  4. El boton "Analizar" aparece al abrir una fila; "Diagnostico rapido"
-     (icono alerta) resume todas las plantillas de error del dataset.
-- Variables de entorno: `LOGVIEWER_LLM_URL` (base), `LOGVIEWER_LLM_MODEL`
-  (defecto "local"), `LOGVIEWER_LLM_TIMEOUT` (defecto 10 s). Tambien se
-  pueden cambiar desde la UI (persisten en `%TEMP%\logviewer\settings.json`).
-
-### Splunk (Importar de Splunk)
-
-- **Que es:** el visor lanza una query SPL contra tu Splunk local y carga
-  el resultado como un dataset mas (filtrar, exportar, diagnosticar).
-- **Solo local:** la conexion la configura el OPERADOR del servidor
-  (variables de entorno), no se conecta a Splunks de terceros. El SPL se
-  ejecuta en tu Splunk (la carga computacional va ahi); el visor solo
-  trae el resultado (tope de filas).
-- **Configurar (en local):** variables de entorno
-  - `SPLUNK_URL` (defecto `https://localhost:8089`)
-  - `SPLUNK_USER` (defecto `Sammi`)
-  - `SPLUNK_PASS` (obligatoria; si falta, la seccion Splunk no aparece)
-  Cuando esta configurado, aparece la seccion "Importar de Splunk" para
-  pegar queries SPL.
-- Nota: para eventos JSON de Azure AD (sourcetype `ms:aad:signin`) usa
-  `| spath` para extraer los campos (userPrincipalName, ipAddress,
-  failureReason) que van dentro del campo `_raw`.
-
-### Aviso en la version web
-
-En una instancia desplegada sin LLM ni Splunk locales, la UI muestra
-avisos claros en lugar de ocultar simplemente las funciones: "el analisis
-con LLM es una funcion SOLO local, descarga la version local desde el
-repositorio" (enlace via `LOGVIEWER_REPO_URL`) y "la conexion a Splunk la
-configura el operador".
-
-## Roadmap
-
-- Fase 2 (hecho): compresion (.gz/.bz2/.xz/.zip), deteccion de encoding,
-  multi-upload con sesiones, progreso de carga, errores amigables.
-- Fase 3 (hecho): tail en vivo (/api/watch, /api/tail, UI con polling).
-- Fase 4 (hecho): backend SQLite hibrido (umbral por tamano) para logs de
-  varios GB; carga en streaming.
-- Fase 5 (hecho): presets de filtros, export JSON Lines, auditoria de
-  acciones, modo presentacion, atajos de teclado y ARIA.
+See `LICENSE`.

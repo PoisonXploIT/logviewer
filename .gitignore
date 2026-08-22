@@ -1,4 +1,23 @@
 __pycache__/
 *.pyc
-p10_ui.log
 *.log
+
+# Documentos internos de desarrollo (no forman parte de la herramienta)
+AUDITORIA_SEGURIDAD_PROMPT.md
+PI_PROMPTS_FASES_7_12.md
+PLAN.md
+ESTADO.md
+
+# Scripts de desarrollo / precarga local
+benchmark_fts.py
+precargar_runbooks.py
+smoke_phase2.py
+smoke_phase3.py
+smoke_phase4.py
+smoke_phase5.py
+smoke_phase7.py
+smoke_phase8.py
+smoke_phase9.py
+smoke_phase10.py
+smoke_phase12.py
+smoke_phase13.py

@@ -871,7 +871,7 @@ def run_diagnose(templates, ask, level="ERR"):
 # de este Splunk 10.4: el SPL debe empezar con un comando explicito
 # ("search index=..."); si falta, se fuerza el prefijo "search ".
 SPLUNK_URL = os.environ.get("SPLUNK_URL", "").strip() or "https://localhost:8089"
-SPLUNK_USER = os.environ.get("SPLUNK_USER", "").strip() or "Sammi"
+SPLUNK_USER = os.environ.get("SPLUNK_USER", "").strip() or "admin"
 SPLUNK_PASS = os.environ.get("SPLUNK_PASS", "").strip()
 try:
     SPLUNK_TIMEOUT = int(os.environ.get("SPLUNK_TIMEOUT", "120").strip() or 120)

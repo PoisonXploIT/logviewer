@@ -1610,7 +1610,7 @@ class TestSplunkQuery(unittest.TestCase):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         old = (server.SPLUNK_URL, server.SPLUNK_USER, server.SPLUNK_PASS)
         server.SPLUNK_URL = "http://127.0.0.1:%d" % port
-        server.SPLUNK_USER = "Sammi"
+        server.SPLUNK_USER = "admin"
         server.SPLUNK_PASS = "testpass"
         return cap, srv, old
 
@@ -1641,7 +1641,7 @@ class TestSplunkQuery(unittest.TestCase):
             # aqui es testpass; en produccion viene de SPLUNK_PASS)
             self.assertEqual(cap["path"], "/services/search/jobs")
             self.assertEqual(cap["auth"], "Basic " + base64.b64encode(
-                b"Sammi:testpass").decode("ascii"))
+                b"admin:testpass").decode("ascii"))
             f = cap["form"]
             self.assertEqual(f["exec_mode"][0], "oneshot")
             self.assertEqual(f["output_mode"][0], "json")
@@ -1680,7 +1680,7 @@ class TestSplunkQuery(unittest.TestCase):
         s.close()
         try:
             server.SPLUNK_URL = "http://127.0.0.1:%d" % port
-            server.SPLUNK_USER = "Sammi"
+            server.SPLUNK_USER = "admin"
             server.SPLUNK_PASS = "testpass"
             server.SPLUNK_TIMEOUT = 3
             with self.assertRaises(ValueError) as ctx:
