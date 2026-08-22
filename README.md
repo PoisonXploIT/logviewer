@@ -61,7 +61,7 @@ http://127.0.0.1:8765/
 
 - Custom port: `python server.py 9000`
 - By default the server only listens on `127.0.0.1` (not exposed to the
-  network). Use `--host 0.0.0.0` or `PORT=<n>` to bind elsewhere (Railway).
+  network). Use `--host 0.0.0.0` or `PORT=<n>` to bind elsewhere.
 - On startup the temp folder `%TEMP%\logviewer\` is cleaned.
 - File limits: 500 MB per file, 1 GB per upload batch, 2 GB decompressed.
 - Accepted extensions: `.log .txt .csv .json .gz .bz2 .xz .zip`
@@ -153,7 +153,8 @@ operator".
 - **No hardcoded credentials**: Splunk and LLM settings come from
   environment variables, never from the source.
 - **Audit log**: tracks actions with user and remote IP (attribution; the
-  auth boundary is Cloudflare Access when deployed).
+  auth boundary is your reverse proxy / identity-aware gateway when
+  deployed).
 
 ## API
 
@@ -197,8 +198,6 @@ static/app.js        Frontend logic
 static/styles.css    Styles
 static/vendor/       Vendored Chart.js
 test_parsers.py      148 unit tests
-railway.json         Railway deploy config
-DEPLOY.md            Railway + Cloudflare Access deploy guide
 LICENSE
 ```
 
@@ -211,12 +210,14 @@ python test_parsers.py
 148 tests: parsers, ts normalization, templates/clustering, runbooks,
 LLM settings/cache/language, Splunk ingestion, SSRF checks.
 
-## Deploy
+## Deployment
 
-See `DEPLOY.md` for deploying to Railway behind Cloudflare Access. Key
-conditions: close the public Railway URL, set `LOGVIEWER_REQUIRE_CF=1`, and
-protect your domain with a Cloudflare Access policy. The web version does
-**not** include the local LLM or local Splunk (they are local-only features).
+The server is a normal Python process: `python server.py` runs it locally,
+or `PORT=<n> python server.py` makes it listen on `0.0.0.0:<n>` for any
+hosting provider you choose. There is no built-in authentication: if you
+expose it beyond localhost, put it behind your own reverse proxy /
+identity-aware gateway. The web version does **not** include the local LLM
+or local Splunk (they are local-only features).
 
 ## License
 

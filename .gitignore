@@ -8,6 +8,10 @@ PI_PROMPTS_FASES_7_12.md
 PLAN.md
 ESTADO.md
 
+# Guia de deploy del autor (cada uno monta su propio backend como quiera)
+DEPLOY.md
+railway.json
+
 # Scripts de desarrollo / precarga local
 benchmark_fts.py
 precargar_runbooks.py
