@@ -1,13 +1,28 @@
 # Unified Log Viewer
 
-A local web server (Python, stdlib only, zero dependencies) to view and
-filter log files in the browser. The log is **never** embedded in the HTML:
-all filtering happens server-side and the browser only receives the requested
-page. Designed for SOC analysts and security students who want fast triage
-without shipping logs to the cloud.
+A **100% local** web tool (Python, stdlib only, zero dependencies) to view
+and filter log files in your browser. Your logs **never** leave your
+machine: all filtering happens server-side on your own computer, and the
+LLM analysis runs against a model on `127.0.0.1`. Built for SOC analysts
+and security students who want fast triage without shipping sensitive logs
+anywhere.
 
-**Version 1.2** — 100% offline by default, with optional local-only LLM
-analysis and local Splunk ingestion.
+**Version 1.2** — local-first, offline-capable, nothing goes to the cloud.
+
+## Why local
+
+Your logs are your most sensitive data. Most "free" log analyzers upload
+your logs to a third party to process them. This tool does the opposite:
+
+- The whole tool runs on your machine (Python stdlib, no installs).
+- The LLM analysis connects only to a model on `127.0.0.1`
+  (LM Studio / Ollama / llama.cpp). No line of a log is ever sent to an
+  external server.
+- Splunk ingestion talks only to your own local Splunk.
+- Run it, analyze, close. No account, no telemetry, no data leaving home.
+
+If you want to deploy it somewhere, that's up to you: fork the repo and
+adapt it to your own setup. Out of the box it is a local tool.
 
 ## Features
 
@@ -30,11 +45,10 @@ analysis and local Splunk ingestion.
   hour); click a bar to apply that time range.
 - **Runbooks**: your own local "known error -> solution" database, with
   regex/glob pattern matching against each line.
-- **Local LLM analysis (local-only)**: "Analyze this line" and "Quick
-  diagnosis" send content to a local model (LM Studio / Ollama / llama.cpp)
-  on `127.0.0.1`. Nothing leaves your machine.
-- **Local Splunk ingestion (local-only)**: run a SPL query against your own
-  local Splunk and load the result as a dataset.
+- **Local LLM analysis**: "Analyze this line" and "Quick diagnosis" send
+  content to a local model on `127.0.0.1`. Nothing leaves your machine.
+- **Local Splunk ingestion**: run a SPL query against your own local Splunk
+  and load the result as a dataset.
 - **Export**: filtered rows to CSV or JSON Lines (streamed, chunked).
 - **Dashboard**: KPIs, Chart.js charts, presets, presentation mode,
   keyboard shortcuts, audit log.
@@ -61,7 +75,8 @@ http://127.0.0.1:8765/
 
 - Custom port: `python server.py 9000`
 - By default the server only listens on `127.0.0.1` (not exposed to the
-  network). Use `--host 0.0.0.0` or `PORT=<n>` to bind elsewhere.
+  network). Use `--host 0.0.0.0` or `PORT=<n>` to bind elsewhere if you
+  really want to.
 - On startup the temp folder `%TEMP%\logviewer\` is cleaned.
 - File limits: 500 MB per file, 1 GB per upload batch, 2 GB decompressed.
 - Accepted extensions: `.log .txt .csv .json .gz .bz2 .xz .zip`
@@ -82,26 +97,19 @@ http://127.0.0.1:8765/
    exclude. Clicking a chart segment or a chip applies it as a filter.
 5. **Export** the filtered rows to CSV or JSON Lines via the format selector.
 6. **Runbooks**: manage known errors from the row drawer.
-7. **Diagnosis** (local-only): open a row and click "Analyze", or use
-   "Quick diagnosis" to have the local LLM summarize all error templates.
+7. **Diagnosis**: open a row and click "Analyze", or use "Quick diagnosis"
+   to have the local LLM summarize all error templates.
 8. **Presentation mode**: the "Presentacion" button (or `p`) hides the
    sidebar/header/filters and shows the table full-screen. `Esc` closes it.
 
-## Local-only features (by security design)
-
-Two features depend on services that live on your own machine and are, by
-design, **not** available from a version deployed to the internet:
-
-### Local LLM (Analyze line and Quick diagnosis)
+## Local LLM (Analyze line and Quick diagnosis)
 
 - Sends one line (or the error templates) to an OpenAI-compatible LLM running
   on **your** machine (LM Studio, Ollama, llama.cpp). Nothing goes online.
 - The LLM destination is **loopback only** (`localhost` / `127.x`). External
   servers are rejected (anti-SSRF, enforced in three layers: when saving the
-  URL, when making the request, and against redirects). On a deployed web
-  version there is no model in the container, so the button is hidden and the
-  UI explains it is a local-only feature.
-- **Setup (local):**
+  URL, when making the request, and against redirects).
+- **Setup:**
   1. Start your model (e.g. `llama-server` on a port like 8096).
   2. Open the LLM settings in the UI (gear icon in the header).
   3. Set the base URL (`http://127.0.0.1:8096/v1`), the model name, a
@@ -111,29 +119,21 @@ design, **not** available from a version deployed to the internet:
   (default "local"), `LOGVIEWER_LLM_TIMEOUT` (default 10 s). Values can also
   be changed from the UI (persisted in `%TEMP%\logviewer\settings.json`).
 
-### Local Splunk (Import from Splunk)
+## Local Splunk (Import from Splunk)
 
 - Runs a SPL query against your own local Splunk and loads the result as a
   dataset (filter, export, diagnose). The SPL runs on your Splunk (that is
   where the computational load goes); the viewer only fetches the result
   (capped row count).
-- The connection is configured by the **operator** of the server via
-  environment variables; the viewer does not connect to third-party Splunks.
-- **Setup (local):** environment variables
+- The connection is configured via environment variables; the viewer does
+  not connect to third-party Splunks.
+- **Setup:** environment variables
   - `SPLUNK_URL` (default `https://localhost:8089`)
   - `SPLUNK_USER` (default `admin`)
   - `SPLUNK_PASS` (required; if missing, the Splunk section is hidden)
 - Note: for Azure AD JSON events (sourcetype `ms:aad:signin`) use `| spath`
   to extract the fields (`userPrincipalName`, `ipAddress`, `failureReason`)
   that live inside the `_raw` field.
-
-### Web-version notice
-
-On a deployed instance without local LLM/Splunk, the UI shows clear notices
-instead of just hiding the features: "LLM analysis is a local-only feature,
-download the local version from the repository" (link via
-`LOGVIEWER_REPO_URL`) and "Splunk connectivity is configured by the
-operator".
 
 ## Security
 
@@ -152,9 +152,7 @@ operator".
   save time, request time, and against HTTP redirects.
 - **No hardcoded credentials**: Splunk and LLM settings come from
   environment variables, never from the source.
-- **Audit log**: tracks actions with user and remote IP (attribution; the
-  auth boundary is your reverse proxy / identity-aware gateway when
-  deployed).
+- **Audit log**: tracks actions with user and remote IP for attribution.
 
 ## API
 
@@ -180,10 +178,10 @@ operator".
 | GET | `/api/runbooks/match?msg=` | Runbooks matching a message |
 | GET | `/api/config` | {llm, url, model, timeout, splunk, repo_url} |
 | GET/POST | `/api/settings` | Read/save local LLM settings |
-| POST | `/api/analyze` | Local-only: analyze one line with the local LLM |
-| POST | `/api/diagnose` | Local-only: quick diagnosis over error templates |
-| GET | `/api/splunk/sources` | Local-only: list indexes |
-| POST | `/api/splunk/search` | Local-only: run a SPL query into a dataset |
+| POST | `/api/analyze` | Local: analyze one line with the local LLM |
+| POST | `/api/diagnose` | Local: quick diagnosis over error templates |
+| GET | `/api/splunk/sources` | Local: list indexes |
+| POST | `/api/splunk/search` | Local: run a SPL query into a dataset |
 | POST | `/api/watch` | Toggle live tail |
 | GET | `/api/tail?name=&last=` | Drain new lines |
 | GET | `/api/audit` | Audit log |
@@ -209,15 +207,6 @@ python test_parsers.py
 
 148 tests: parsers, ts normalization, templates/clustering, runbooks,
 LLM settings/cache/language, Splunk ingestion, SSRF checks.
-
-## Deployment
-
-The server is a normal Python process: `python server.py` runs it locally,
-or `PORT=<n> python server.py` makes it listen on `0.0.0.0:<n>` for any
-hosting provider you choose. There is no built-in authentication: if you
-expose it beyond localhost, put it behind your own reverse proxy /
-identity-aware gateway. The web version does **not** include the local LLM
-or local Splunk (they are local-only features).
 
 ## License
 
