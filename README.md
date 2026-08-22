@@ -199,6 +199,60 @@ logviewer-phase1/
 - **Errores**: las excepciones de carga se loguean a `requests.log` y al
   cliente se le devuelve un mensaje generico (sin rutas internas).
 
+## Funciones SOLO local (por seguridad)
+
+Dos funciones dependen de servicios que viven en la propia maquina y, por
+seguridad, **no** se usan desde una version desplegada en internet:
+
+### LLM local (Analizar linea y Diagnostico rapido)
+
+- **Que es:** el visor manda una linea (o las plantillas de error) a un
+  LLM OpenAI-compatible que corre en TU maquina (LM Studio, Ollama o
+  llama.cpp). Nada sale a internet.
+- **Solo local:** el destino del LLM SOLO puede ser loopback
+  (localhost/127.x). No se permite apuntar a un servidor externo (anti
+  SSRF, verificacion en tres capas: al guardar la URL, al pedir, y contra
+  redirecciones). En una version web desplegada (Railway) no hay modelo
+  en el contenedor, asi que el boton no esta disponible y la UI avisa de
+  que es funcion local.
+- **Configurar (en local):**
+  1. Arranca tu modelo (p. ej. `llama-server` en un puerto, como 8096).
+  2. Abre los ajustes del LLM en la UI (engranaje de la cabecera).
+  3. URL base: `http://127.0.0.1:8096/v1`, nombre del modelo, timeout
+     generoso (los modelos de razonamiento tardan), idioma (Auto/Espanol/
+     Ingles). Guardar.
+  4. El boton "Analizar" aparece al abrir una fila; "Diagnostico rapido"
+     (icono alerta) resume todas las plantillas de error del dataset.
+- Variables de entorno: `LOGVIEWER_LLM_URL` (base), `LOGVIEWER_LLM_MODEL`
+  (defecto "local"), `LOGVIEWER_LLM_TIMEOUT` (defecto 10 s). Tambien se
+  pueden cambiar desde la UI (persisten en `%TEMP%\logviewer\settings.json`).
+
+### Splunk (Importar de Splunk)
+
+- **Que es:** el visor lanza una query SPL contra tu Splunk local y carga
+  el resultado como un dataset mas (filtrar, exportar, diagnosticar).
+- **Solo local:** la conexion la configura el OPERADOR del servidor
+  (variables de entorno), no se conecta a Splunks de terceros. El SPL se
+  ejecuta en tu Splunk (la carga computacional va ahi); el visor solo
+  trae el resultado (tope de filas).
+- **Configurar (en local):** variables de entorno
+  - `SPLUNK_URL` (defecto `https://localhost:8089`)
+  - `SPLUNK_USER` (defecto `Sammi`)
+  - `SPLUNK_PASS` (obligatoria; si falta, la seccion Splunk no aparece)
+  Cuando esta configurado, aparece la seccion "Importar de Splunk" para
+  pegar queries SPL.
+- Nota: para eventos JSON de Azure AD (sourcetype `ms:aad:signin`) usa
+  `| spath` para extraer los campos (userPrincipalName, ipAddress,
+  failureReason) que van dentro del campo `_raw`.
+
+### Aviso en la version web
+
+En una instancia desplegada sin LLM ni Splunk locales, la UI muestra
+avisos claros en lugar de ocultar simplemente las funciones: "el analisis
+con LLM es una funcion SOLO local, descarga la version local desde el
+repositorio" (enlace via `LOGVIEWER_REPO_URL`) y "la conexion a Splunk la
+configura el operador".
+
 ## Roadmap
 
 - Fase 2 (hecho): compresion (.gz/.bz2/.xz/.zip), deteccion de encoding,

@@ -500,31 +500,58 @@
         CSV o JSON Lines, sin pasar por el navegador entero: el servidor
         lo envia en streaming.</p>
       <h3>Analizar con LLM local</h3>
-      <p>Si hay un LLM local configurado, al abrir una fila aparece la
-        seccion "Analizar con LLM local" en el drawer. El boton "Analizar"
-        envia SOLO esa linea al modelo local (nada sale de la maquina) y
-        muestra la respuesta tal cual; si repites la misma pregunta sale
-        de cache, marcada con [cache]. El idioma en que responde se elige
-        en los ajustes del LLM (engranaje de la cabecera): "Auto" responde
-        en el idioma de la linea, o bien Espanol / Ingles fijo.</p>
+      <p>Esta es una funcion <strong>SOLO local</strong> (por seguridad): el
+        LLM corre en tu propia maquina y no envia ningun dato a internet.
+        Solo esta disponible cuando el servidor del visor esta en el mismo
+        equipo que el modelo. En la version web desplegada no aparece (o te
+        avisa de que es funcion local). Al abrir una fila, el boton
+        "Analizar" envia SOLO esa linea al modelo local y muestra la
+        respuesta; si repites la misma pregunta sale de cache, marcada con
+        [cache]. El idioma se elige en los ajustes del LLM (engranaje de la
+        cabecera): "Auto" responde en el idioma de la linea, o Espanol /
+        Ingles fijo.</p>
       <h3>Diagnostico rapido</h3>
-      <p>El boton "Diagnostico rapido" (icono de alerta en la barra
-        lateral) manda las plantillas unicas de error del dataset activo
-        (no las miles de lineas sueltas) al LLM local y devuelve una
-        conclusion con las plantillas mas frecuentes y su linea de ejemplo.
-        Sirve para ver el bosque en vez de 204 errores sueltos: el LLM te
-        da pistas de que esta pasando en el sistema y por donde empezar.
-        La primera vez tarda (el modelo razona); las siguientes salen de
-        cache al instante. Requiere LLM configurado.</p>
+      <p>Igual que "Analizar", es una funcion <strong>SOLO local</strong>.
+        El boton (icono de alerta en la barra lateral) manda las plantillas
+        unicas de error del dataset activo (no las miles de lineas sueltas)
+        al LLM local y devuelve una conclusion con las plantillas mas
+        frecuentes y su linea de ejemplo. Sirve para ver el bosque en vez
+        de 204 errores sueltos. La primera vez tarda (el modelo razona);
+        las siguientes salen de cache. Requiere LLM configurado.</p>
       <h3>Importar de Splunk</h3>
-      <p>Si Splunk esta configurado, la seccion "Importar de Splunk" deja
-        pegar una query SPL y cargar su resultado como un dataset mas del
-        visor (filtrar, exportar y diagnosticar igual que un archivo). El
-        SPL es quien filtra y agrega; el visor solo trae lo que pidas
-        (tope de filas para no saturar). Para eventos JSON de Azure AD
+      <p>Esta seccion es <strong>SOLO local</strong> en la practica (por
+        seguridad y porque tu Splunk suele estar en tu red). Conecta el
+        visor a tu propio Splunk local y deja pegar una query SPL para
+        cargar su resultado como un dataset mas (filtrar, exportar y
+        diagnosticar igual que un archivo). El SPL es quien filtra y
+        agrega; el visor solo trae lo que pidas (tope de filas). La
+        conexion la configura el operador del servidor (SPLUNK_URL): no se
+        conecta a Splunks de terceros. Para eventos JSON de Azure AD
         (sourcetype ms:aad:signin) recuerda usar <code>| spath</code> para
         extraer los campos (userPrincipalName, ipAddress, failureReason)
         que van dentro del campo _raw.</p>
+      <h3>Configurar el LLM local</h3>
+      <p>El visor necesita un modelo que corra en tu maquina (LM Studio,
+        Ollama o llama.cpp) con API OpenAI-compatible en
+        <code>127.0.0.1</code>. Pasos:</p>
+      <ol>
+        <li>Arranca tu modelo local (p. ej. <code>llama-server</code> en un
+          puerto como 8096).</li>
+        <li>En el visor, abre los ajustes del LLM (engranaje de la
+          cabecera).</li>
+        <li>Pon la URL base del modelo (p. ej.
+          <code>http://127.0.0.1:8096/v1</code>), el nombre del modelo y un
+          timeout generoso (los modelos de razonamiento tardan).</li>
+        <li>Elige el idioma de respuesta (Auto / Espanol / Ingles) y guarda.</li>
+      </ol>
+      <p>Por seguridad, el destino del LLM solo puede ser loopback
+        (localhost/127.x): no se permite apuntar a servidores externos.</p>
+      <h3>Configurar Splunk</h3>
+      <p>La conexion a Splunk la define el operador con variables de
+        entorno (SPLUNK_URL, SPLUNK_USER, SPLUNK_PASS), no desde la UI. En
+        local, SPLUNK_URL suele ser <code>https://localhost:8089</code>.
+        Cuando esta configurado, aparece la seccion "Importar de Splunk"
+        para pegar queries SPL.</p>
     </div>
   </div>
 </div>
@@ -534,6 +561,6 @@
 <input type="file" id="file" hidden>
 
 <script src="/static/vendor/chart.min.js?v=4"></script>
-<script src="/static/app.js?v=13"></script>
+<script src="/static/app.js?v=14"></script>
 </body>
 </html>
