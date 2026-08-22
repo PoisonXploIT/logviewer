@@ -20,7 +20,10 @@ Uso:
 Luego abrir en el navegador: http://127.0.0.1:8765/
 """
 import argparse
+import base64
 import bz2
+import fnmatch
+import hashlib
 import codecs
 import csv
 import gzip
@@ -32,14 +35,20 @@ import re
 import secrets
 import shutil
 import sqlite3
+import ssl
 import sys
 import tempfile
 import threading
 import time
 import zipfile
 from collections import Counter, deque
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse
+import socket
+import urllib.request
 
 # ---------------------------------------------------------------------------
 # Constantes
@@ -197,6 +206,67 @@ def _norm_level(lv):
     return LEVEL_MAP.get(lv.upper(), lv)
 
 
+# Fase 7A: normalizacion de timestamps a ISO canónico (campo ts_norm).
+# Se usa para el rango dt_from/dt_to (comparacion lexicografica). Los
+# valores con zona horaria se convierten a UTC; los sin zona se dejan en
+# su hora local. Si no se parsea, norm_ts devuelve "".
+RE_CLF_TS = re.compile(
+    r'(\d{1,2})/([A-Za-z]{3,4})/(\d{4}):(\d{2}):(\d{2}):(\d{2})'
+    r'(?:\s*([+-]\d{2})(\d{2}))?')
+_CLF_MONTHS = {}
+for _i, _m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")):
+    _CLF_MONTHS[_m.lower()] = _i + 1
+
+
+def norm_ts(ts):
+    """Normaliza un timestamp a ISO (Fase 7A).
+
+    Acepta CLF (21/Ago/2026:13:00:00 +0000), ISO 8601 (con T o espacio,
+    fraccion opcional, Z u offset) y epoch (segundos o ms). Devuelve ""
+    si no se parsea. Con zona horaria -> UTC; sin zona -> hora local.
+    """
+    if not ts:
+        return ""
+    s = str(ts).strip()
+    dt = None
+    m = RE_CLF_TS.match(s)
+    if m and m.group(2)[:3].lower() in _CLF_MONTHS:
+        mon = _CLF_MONTHS[m.group(2)[:3].lower()]
+        tz = None
+        if m.group(7):
+            sign = 1 if m.group(7)[0] == "+" else -1
+            tz = timezone(sign * timedelta(hours=int(m.group(7)[1:]),
+                                           minutes=int(m.group(8))))
+        dt = datetime(int(m.group(3)), mon, int(m.group(1)),
+                      int(m.group(4)), int(m.group(5)), int(m.group(6)),
+                      tzinfo=tz)
+    elif s.isdigit():
+        v = int(s)
+        if len(s) >= 13:
+            v /= 1000.0
+        dt = datetime.fromtimestamp(v, timezone.utc)
+    else:
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    out = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    if dt.microsecond:
+        out += ".%06d" % dt.microsecond
+    return out
+
+
+def _dt_bound(v):
+    """Normaliza un extremo de rango dt_from/dt_to (Fase 7A)."""
+    v = v.strip()
+    if not v:
+        return ""
+    return norm_ts(v) or v
+
+
 _SEARCH_KEYS = ["ts", "level", "ip", "host", "app", "pid",
                 "method", "path", "code", "bytes", "msg"]
 
@@ -206,12 +276,738 @@ def _make_search(r):
     return " ".join(str(r.get(k, "")) for k in _SEARCH_KEYS).lower()
 
 
+# Fase 9A: normalizacion a plantilla (en el parseo, no en SQL)
+RE_TPL_IP = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+RE_TPL_HEX = re.compile(r"\b[0-9a-fA-F]{8,}\b")
+RE_TPL_NUM = re.compile(r"\b\d+\b")
+
+
+def make_template(text):
+    """Normaliza una linea a plantilla: IPs, hex largo y numeros -> '*'.
+
+    Se calcula EN EL PARSING (no sobre la marcha en SQL): asi agrupa
+    lineas que solo difieren en valores variables sin coste por consulta.
+    """
+    if text is None:
+        return ""
+    t = RE_TPL_IP.sub("*", str(text))
+    t = RE_TPL_HEX.sub("*", t)
+    t = RE_TPL_NUM.sub("*", t)
+    return t
+
+
 def _trunc(s, n=TRUNC):
     """Trunca cadenas muy largas (las lineas de Zscaler llegan a 4095 chars)."""
     if s is None:
         return ""
     s = str(s)
     return s if len(s) <= n else s[:n] + " ..."
+
+
+# ---------------------------------------------------------------------------
+# Fase 10A: runbooks (patron -> explicacion/causa/solucion/referencia)
+#
+# BD persistente en %TEMP\logviewer\runbooks.db: NO se borra al arrancar
+# el servidor ni al quitar un dataset (a diferencia de los datasets).
+class RunbookStore:
+    """BD local de runbooks (patrones sobre msg y su explicacion)."""
+
+    FIELDS = ("id", "pattern", "kind", "explicacion", "causa",
+              "solucion", "ref", "created_at")
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS runbooks ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " pattern TEXT NOT NULL,"
+            " kind TEXT NOT NULL DEFAULT 'regex',"
+            " explicacion TEXT DEFAULT '',"
+            " causa TEXT DEFAULT '',"
+            " solucion TEXT DEFAULT '',"
+            " ref TEXT DEFAULT '',"
+            " created_at TEXT)")
+        # Idempotencia por patron (Fase 10C: re-ejecutable sin duplicar)
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_rb_pattern"
+            " ON runbooks(pattern)")
+        self.conn.commit()
+
+    def add(self, pattern, kind="regex", explicacion="", causa="",
+            solucion="", ref=""):
+        """Crea un runbook. Devuelve la fila; lanza ValueError si el
+        patron ya existe (indice unico)."""
+        if kind not in ("regex", "glob"):
+            kind = "regex"
+        try:
+            with self.lock:
+                cur = self.conn.execute(
+                    "INSERT INTO runbooks (pattern, kind, explicacion,"
+                    " causa, solucion, ref, created_at) VALUES (?,?,?,?,?,?,?)",
+                    [pattern, kind, explicacion, causa, solucion, ref,
+                     time.strftime("%Y-%m-%d %H:%M:%S")])
+                self.conn.commit()
+                rowid = cur.lastrowid
+        except sqlite3.IntegrityError:
+            raise ValueError("el patron ya existe")
+        return self.get(rowid)
+
+    def get(self, rowid):
+        with self.lock:
+            r = self.conn.execute(
+                "SELECT id, pattern, kind, explicacion, causa, solucion,"
+                " ref, created_at FROM runbooks WHERE id = ?",
+                [rowid]).fetchone()
+        return dict(zip(self.FIELDS, r)) if r else None
+
+    def update(self, rowid, pattern, kind, explicacion, causa,
+               solucion, ref):
+        """Edit los campos de un runbook. Devuelve la fila actualizada;
+        None si no existe; ValueError si el patron choca con otro."""
+        if kind not in ("regex", "glob"):
+            kind = "regex"
+        try:
+            with self.lock:
+                cur = self.conn.execute(
+                    "UPDATE runbooks SET pattern=?, kind=?, explicacion=?,"
+                    " causa=?, solucion=?, ref=? WHERE id=?",
+                    [pattern, kind, explicacion, causa, solucion, ref,
+                     rowid])
+                self.conn.commit()
+        except sqlite3.IntegrityError:
+            raise ValueError("el patron ya existe")
+        if cur.rowcount == 0:
+            return None
+        return self.get(rowid)
+
+    def all(self):
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT id, pattern, kind, explicacion, causa, solucion,"
+                " ref, created_at FROM runbooks ORDER BY id").fetchall()
+        return [dict(zip(self.FIELDS, r)) for r in rows]
+
+    def delete(self, rowid):
+        with self.lock:
+            cur = self.conn.execute(
+                "DELETE FROM runbooks WHERE id = ?", [rowid])
+            self.conn.commit()
+            return cur.rowcount > 0
+
+
+RUNBOOKS = None  # singleton perezoso (no se crea al importar)
+
+
+def runbooks_store():
+    global RUNBOOKS
+    if RUNBOOKS is None:
+        d = os.path.join(tempfile.gettempdir(), "logviewer")
+        os.makedirs(d, exist_ok=True)
+        RUNBOOKS = RunbookStore(os.path.join(d, "runbooks.db"))
+    return RUNBOOKS
+
+
+@lru_cache(maxsize=512)
+def _rb_compile(pattern):
+    """Compila (con cache) un patron regex de runbook; None si invalido."""
+    try:
+        return re.compile(pattern)
+    except re.error:
+        return None
+
+
+def match_runbooks(msg, runbooks):
+    """Devuelve los runbooks cuyo patron coincide con msg.
+
+    kind 'regex': re.search (sin anclas; el patron va donde toque).
+    kind 'glob': fnmatch sobre el msg entero. Un patron invalido
+    (regex mal formada) NUNCA coincide: no rompe la lista."""
+    out = []
+    if msg is None:
+        return out
+    m = str(msg)
+    for rb in runbooks:
+        pat = rb.get("pattern") or ""
+        if not pat:
+            continue
+        if rb.get("kind", "regex") == "glob":
+            ok = fnmatch.fnmatch(m, pat)
+        else:
+            rx = _rb_compile(pat)
+            ok = rx is not None and rx.search(m) is not None
+        if ok:
+            out.append(rb)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Fase 12A: LLM local (API OpenAI-compatible) para el boton "Analizar"
+# ---------------------------------------------------------------------------
+# LOGVIEWER_LLM_URL: base del endpoint (p. ej. http://127.0.0.1:8080/v1 de
+# LM Studio, o http://127.0.0.1:11434/v1 de Ollama). Si no esta definida,
+# el boton "Analizar" NO aparece en la UI y /api/analyze responde 404.
+LLM_URL = os.environ.get("LOGVIEWER_LLM_URL", "").strip()
+LLM_MODEL = os.environ.get("LOGVIEWER_LLM_MODEL", "").strip() or "local"
+LLM_TIMEOUT = int(os.environ.get("LOGVIEWER_LLM_TIMEOUT", "10").strip() or 10)
+LLM_MAX_TOKENS = 4096    # generoso: los modelos de razonamiento gastan
+                        # tokens en reasoning_content antes del content
+LLM_SYSTEM_PROMPT = (
+    "Eres un analista experto de logs de sistemas. Te dan UNA linea de log."
+    " Explica que pasa, indica la causa probable y da pasos concretos de"
+    " solucion. Responde breve y accionable.")
+
+# Fase 12B: idioma de la respuesta del LLM (llm_lang en los ajustes).
+# "auto" -> el idioma de la linea; "es"/"en" -> fijo.
+LLM_LANGS = ("auto", "es", "en")
+LLM_LANG_PROMPTS = {
+    "auto": " Responde en el idioma de la linea.",
+    "es": " Responde SIEMPRE en espanol, aunque la linea este en otro idioma.",
+    "en": " Always respond in English, even if the line is in another language.",
+}
+
+
+def _norm_llm_lang(v):
+    """Valida un idioma de respuesta del LLM: auto/es/en (lo demas -> auto)."""
+    v = str(v or "").strip().lower()
+    return v if v in LLM_LANGS else "auto"
+
+
+def llm_system_prompt(lang):
+    """Prompt del sistema segun el idioma configurado (Fase 12B).
+
+    La instruccion de idioma se anade al prompt base: asi un cambio de
+    idioma en los ajustes cambia el prompt sin tocar codigo."""
+    return LLM_SYSTEM_PROMPT + LLM_LANG_PROMPTS[_norm_llm_lang(lang)]
+
+LLM_CACHE = None  # singleton perezoso (no se crea al importar)
+
+
+class SettingsStore:
+    """Ajustes persistentes del visor (p. ej. config del LLM local).
+
+    Se guardan en %TEMP%\\logviewer\\settings.json para que sobrevivan a
+    reinicios. La primera vez se inicializan desde las variables de
+    entorno (LOGVIEWER_LLM_URL/MODEL/TIMEOUT), que actuan como valor
+    inicial por defecto; despues la UI puede cambiarlos con
+    GET/POST /api/settings sin reiniciar el servidor."""
+
+    KEYS = ("llm_url", "llm_model", "llm_timeout", "llm_lang")
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.data = self._load()
+
+    def _load(self):
+        d = {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            d = {}
+        # Valores por defecto desde env var (solo si aun no hay guardado)
+        defaults = {
+            "llm_url": LLM_URL,
+            "llm_model": LLM_MODEL,
+            "llm_timeout": LLM_TIMEOUT,
+            "llm_lang": "auto",
+        }
+        for k in self.KEYS:
+            if k not in d or d[k] in (None, ""):
+                d[k] = defaults.get(k, "" if k != "llm_timeout" else 10)
+        return d
+
+    def get(self):
+        with self.lock:
+            return dict(self.data)
+
+    def set(self, url=None, model=None, timeout=None, lang=None):
+        with self.lock:
+            if url is not None:
+                self.data["llm_url"] = str(url).strip()
+            if model is not None:
+                self.data["llm_model"] = str(model).strip() or "local"
+            if lang is not None:
+                # Valor invalido cae a "auto" (nunca se guarda un idioma
+                # que el prompt no entiende)
+                self.data["llm_lang"] = _norm_llm_lang(lang)
+            if timeout is not None:
+                try:
+                    self.data["llm_timeout"] = max(1, int(timeout))
+                except (TypeError, ValueError):
+                    self.data["llm_timeout"] = LLM_TIMEOUT
+            try:
+                with open(self.path, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=2)
+            except OSError:
+                pass  # si no se puede escribir, la config sigue en memoria
+            return dict(self.data)
+
+
+SETTINGS = None  # singleton perezoso
+
+
+def settings_store():
+    global SETTINGS
+    if SETTINGS is None:
+        d = os.path.join(tempfile.gettempdir(), "logviewer")
+        os.makedirs(d, exist_ok=True)
+        SETTINGS = SettingsStore(os.path.join(d, "settings.json"))
+    return SETTINGS
+
+
+# URL publica del repo de GitHub (opcional): enlace de descarga de la
+# version local en los avisos de funciones SOLO local (LLM, Splunk).
+# Si no esta definida, el aviso se muestra sin enlace.
+REPO_URL = os.environ.get("LOGVIEWER_REPO_URL", "").strip()
+
+
+def llm_config():
+    """Config actual del LLM desde los ajustes (URL, modelo, timeout, lang)."""
+    s = settings_store().get()
+    return {
+        "url": s.get("llm_url", "") or LLM_URL,
+        "model": s.get("llm_model", "") or LLM_MODEL,
+        "timeout": s.get("llm_timeout", LLM_TIMEOUT),
+        "lang": _norm_llm_lang(s.get("llm_lang")),
+    }
+
+
+def public_config():
+    """Config de solo lectura para la UI (GET /api/config).
+
+    Fase 12A: "llm" decide si aparece el boton Analizar; Fase 13:
+    "splunk" decide si aparece la seccion de Splunk. repo_url (opcional):
+    URL publica del repo para los avisos de funciones SOLO local; si no
+    esta, el aviso se muestra sin enlace."""
+    cfg = llm_config()
+    return {"llm": bool(cfg["url"]), "url": cfg["url"],
+            "model": cfg["model"], "timeout": cfg["timeout"],
+            "splunk": splunk_enabled(), "repo_url": REPO_URL}
+
+
+class LlmCacheStore:
+    """Cache de respuestas del LLM por hash del mensaje (Fase 12A).
+
+    Persistente como la BD de runbooks: sobrevive a cambios de dataset y a
+    reinicios. Solo se cachean los exitos; un fallo NUNCA se guarda, asi
+    el siguiente intento vuelve a preguntar al LLM."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS llm_cache ("
+            "hash TEXT PRIMARY KEY,"
+            " line TEXT NOT NULL,"
+            " answer TEXT NOT NULL,"
+            " created_at TEXT)")
+        self.conn.commit()
+
+    def get(self, key):
+        with self.lock:
+            r = self.conn.execute(
+                "SELECT answer FROM llm_cache WHERE hash = ?", [key]).fetchone()
+        return r[0] if r else None
+
+    def put(self, key, line, answer):
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO llm_cache (hash, line, answer,"
+                " created_at) VALUES (?,?,?,?)",
+                [key, line, answer,
+                 time.strftime("%Y-%m-%d %H:%M:%S")])
+            self.conn.commit()
+
+    def close(self):
+        with self.lock:
+            self.conn.close()
+
+
+def llm_cache():
+    global LLM_CACHE
+    if LLM_CACHE is None:
+        d = os.path.join(tempfile.gettempdir(), "logviewer")
+        os.makedirs(d, exist_ok=True)
+        LLM_CACHE = LlmCacheStore(os.path.join(d, "llm_cache.db"))
+    return LLM_CACHE
+
+
+def llm_key(line, model=None, lang="auto"):
+    """Hash del mensaje (+ modelo + idioma): si cambia el modelo o el
+    idioma, no se sirve una respuesta cacheada de otra config."""
+    m = (model if model is not None else LLM_MODEL) or "local"
+    l = _norm_llm_lang(lang)
+    h = hashlib.sha256()
+    h.update(str(m).encode("utf-8"))
+    h.update(b"\x00")
+    h.update(l.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(str(line).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _llm_url_host(url):
+    """Host (hostname o IP) de una URL de LLM, o None si es invalida.
+
+    Solo se permiten URL http/https. El host se extrae sin resolver DNS
+    (solo el literal de la URL): asi un atacante no puede apuntar a una
+    IP interna via nombre ni a una URL arbitraria."""
+    if not url:
+        return None
+    try:
+        u = urllib.parse.urlparse(url)
+    except ValueError:
+        return None
+    if u.scheme not in ("http", "https"):
+        return None
+    if u.hostname is None:
+        return None
+    return u.hostname.lower()
+
+
+def _is_loopback(host):
+    """True si host es loopback (localhost, 127.0.0.0/8 o ::1).
+
+    Es lo unico permitido como destino del LLM: los modelos locales corren
+    en la propia maquina (LM Studio/Ollama/llama.cpp). Rechazar cualquier
+    otra URL evita que el servidor se use como SSRF hacia la red interna
+    (p. ej. metadata de cloud o servicios internos)."""
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    # 127.0.0.0/8 (cualquier 127.x.y.z) es loopback
+    if host.startswith("127."):
+        return True
+    return False
+
+
+class _LoopbackRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Rechaza redirecciones HTTP cuyo destino no sea loopback.
+
+    urllib sigue redirecciones 3xx por defecto sin revalidar el host; un
+    servicio en loopback que devolviera un 302 a una IP interna haria que
+    el servidor disparara una peticion "ciega" a esa IP (SSRF ciego).
+    Este handler intercepta cada salto y solo deja seguir los que apuntan
+    a loopback (localhost/127.x). No resuelve DNS: compara el literal."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        host = _llm_url_host(newurl)
+        if host is None or not _is_loopback(host):
+            raise urllib.error.HTTPError(
+                newurl, code, "redirect a destino no-loopback no permitido",
+                headers, fp)
+        return super().redirect_request(
+            req, fp, code, msg, headers, newurl)
+
+
+_LLM_OPENER = urllib.request.build_opener(_LoopbackRedirectHandler)
+
+
+def ask_llm(line, url=None, model=None, timeout=LLM_TIMEOUT, lang="auto"):
+    """Pide a un LLM OpenAI-compatible que explique UNA linea.
+
+    Devuelve (ok, texto): ok True con el contenido; ok False con un mensaje
+    amigable. PUNTOS CRITICOS:
+    - Los modelos de RAZONAMIENTO devuelven "reasoning_content" y un
+      "content" que puede quedar VACIO si el presupuesto de tokens se gasta
+      en razonar: eso NUNCA es un exito (max_tokens generoso para evitarlo,
+      pero si aun asi llega vacio, sale como error amigable).
+    - Si el LLM no responde (503, timeout, conexion negada) falla limpio:
+      timeout corto, mensaje amigable, nunca cuelga la peticion."""
+    base = url if url is not None else LLM_URL
+    m = model if model is not None else LLM_MODEL
+    # SSRF: el destino del LLM SOLO puede ser loopback (localhost/127.x).
+    # Si alguien edita settings.json o la env var a mano con una URL
+    # arbitraria, se rechaza aqui antes de hacer la peticion: el servidor
+    # no se usa como proxy hacia la red interna.
+    host = _llm_url_host(base)
+    if host is None or not _is_loopback(host):
+        return False, ("destino del LLM no permitido: solo se acepta"
+                       " localhost/127.0.0.1 (loopback)")
+    payload = json.dumps({
+        "model": m,
+        "max_tokens": LLM_MAX_TOKENS,
+        "messages": [
+            {"role": "system", "content": llm_system_prompt(lang)},
+            {"role": "user", "content": str(line)},
+        ]}).encode("utf-8")
+    req = urllib.request.Request(
+        base.rstrip("/") + "/chat/completions",
+        data=payload, method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        with _LLM_OPENER.open(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                # El codigo queda en el detalle tecnico; el mensaje
+                # principal va en lenguaje humano
+                return False, ("el modelo local respondio con un error"
+                              " (HTTP %d); comprueba la URL y el modelo"
+                              " en Ajustes" % resp.status)
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except HTTPError as e:
+        # 503 y otros codigos de error del LLM: el codigo va en el detalle
+        return False, ("el modelo local respondio con un error"
+                      " (HTTP %d); comprueba la URL y el modelo en"
+                      " Ajustes" % e.code)
+    except (URLError, socket.timeout, TimeoutError, ConnectionError,
+            OSError):
+        # Sin respuesta del LLM: lenguaje humano, sin codigo HTTP a
+        # la vista (el 503 queda como estado tecnico de la peticion)
+        return False, ("no se pudo contactar con el modelo local:"
+                      " comprueba que esta arrancado y que la URL en"
+                      " Ajustes es correcta. Si no funciona, puede que"
+                      " esta version web no tenga acceso a tu modelo"
+                      " local")
+    except ValueError:
+        return False, "el LLM devolvio una respuesta no JSON"
+    try:
+        msg = data["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        return False, ("la respuesta del LLM no tenia el formato OpenAI"
+                      " esperado")
+    content = str(msg.get("content") or "").strip()
+    reasoning = str(msg.get("reasoning_content") or "").strip()
+    if not content:
+        # Prespuesto gastado en razonar (o salida vacia): NUNCA es un exito.
+        return False, ("el LLM no devolvio texto"
+                      + (" (todo el presupuesto se fue en razonar)"
+                         if reasoning else ""))
+    return True, content
+
+
+# ---------------------------------------------------------------------------
+# Fase 12C: diagnostico rapido (el LLM local resume TODAS las lineas de
+# error del dataset activo a traves de sus plantillas unicas)
+# ---------------------------------------------------------------------------
+# NUNCA se mandan miles de lineas al LLM: solo las plantillas unicas (mismo
+# computo que /api/templates, filtrado por nivel) con su count y una linea
+# de ejemplo. Maximo DIAGNOSE_MAX_PER_CALL plantillas por llamada; si hay
+# mas, loteo en pila (fold): llamadas secuenciales de a lotes, cada una
+# lleva el resumen acumulado de los lotes anteriores y la ultima produce la
+# conclusion final (p. ej. 60 plantillas -> 2 llamadas: 50 + [resumen+10]).
+# Todo contra 127.0.0.1 (mismo ask_llm, config LOGVIEWER_LLM_URL): nada
+# sale a internet.
+DIAGNOSE_MAX_PER_CALL = 50   # plantillas por llamada al LLM
+DIAGNOSE_TOTAL_MAX = 200    # tope de plantillas analizadas (como /api/templates)
+
+
+def _diag_item(t):
+    """Una plantilla en texto plano para el prompt."""
+    return ("PLANTILLA (%d ocurrencias):\n%s\nEjemplo: %s"
+            % (t["count"], t["template"], t.get("example", "")))
+
+
+def diagnose_key(name, level, lang, model, templates):
+    """Clave de cache del diagnostico: hash de dataset+level+lang(+modelo)
+    y del contenido exacto de las plantillas analizadas. Reusa llm_key:
+    mismo modelo o idioma que /api/analyze -> si cambia, no se sirve una
+    conclusion cacheada de otra config."""
+    canon = "\x01".join([name, level]
+                        + [_diag_item(t) for t in templates])
+    return llm_key(canon, model=model, lang=lang)
+
+
+def run_diagnose(templates, ask, level="ERR"):
+    """Orquesta las llamadas del diagnostico rapido.
+
+    templates: lista de dicts {template,count,example} ordenadas por count
+      descendente (la que salga de store.templates()).
+    ask: callable(prompt) -> (ok, text); normalmente ask_llm ya configurado
+      con la URL/modelo/timeout/lang del visor.
+    Devuelve (ok, conclusion, analyzed).
+
+    Loteo: si hay mas de DIAGNOSE_MAX_PER_CALL plantillas se hace en
+    llamadas secuenciales; cada una lleva el resumen acumulado de los lotes
+    anteriores y la ultima genera la conclusion final unica. Un fallo de
+    cualquier llamada es (False, mensaje): el llamador NUNCA lo cachea."""
+    n = len(templates)
+    if n == 0:
+        return True, "No hay lineas de este nivel en el dataset.", 0
+    chunks = [templates[i:i + DIAGNOSE_MAX_PER_CALL]
+              for i in range(0, n, DIAGNOSE_MAX_PER_CALL)]
+    acc = None
+    for k, chunk in enumerate(chunks):
+        last = (k == len(chunks) - 1)
+        parts = []
+        if acc:
+            parts.append("RESUMEN de los lotes anteriores:\n" + acc)
+        parts.append(
+            "A continuacion van %d plantillas unicas de lineas de log de"
+            " nivel %s (de un total de %d analizadas). Cada una con su"
+            " numero de ocurrencias y una linea de ejemplo:\n\n%s"
+            % (len(chunk), level, n, "\n\n".join(_diag_item(t) for t in chunk)))
+        if last:
+            parts.append(
+                "Devuelve UNA conclusion final unica, breve y accionable:"
+                " que esta pasando en el sistema, la(s) plantilla(s) mas"
+                " importante(s) (las de MAYOR numero de ocurrencias) citando"
+                " su texto exacto y su linea de ejemplo, la causa probable y"
+                " los proximos pasos concretos.")
+        else:
+            parts.append(
+                "Devuelve un resumen breve y fiel SOLO de este lote (no es"
+                " la ultima llamada): los patrones mas frecuentes, sus"
+                " recuentos y que indican. Sera el contexto de la"
+                " conclusion global.")
+        ok, text = ask("\n\n".join(parts))
+        if not ok:
+            return False, text, 0
+        acc = text
+    return True, acc, n
+
+
+# ---------------------------------------------------------------------------
+# Fase 13: ingesta desde Splunk local (REST API)
+# ---------------------------------------------------------------------------
+# La conexion es SOLO a Splunk local (https://localhost:8089 por defecto):
+# nada sale a internet. El self-signed de Splunk no se verifica (ssl
+# CERT_NONE), igual que el curl -k del script de referencia
+# scripts/splunk_search.sh, pero replicado en stdlib (urllib). Peculiaridad
+# de este Splunk 10.4: el SPL debe empezar con un comando explicito
+# ("search index=..."); si falta, se fuerza el prefijo "search ".
+SPLUNK_URL = os.environ.get("SPLUNK_URL", "").strip() or "https://localhost:8089"
+SPLUNK_USER = os.environ.get("SPLUNK_USER", "").strip() or "Sammi"
+SPLUNK_PASS = os.environ.get("SPLUNK_PASS", "").strip()
+try:
+    SPLUNK_TIMEOUT = int(os.environ.get("SPLUNK_TIMEOUT", "120").strip() or 120)
+except ValueError:
+    SPLUNK_TIMEOUT = 120
+SPLUNK_TIMEOUT = max(5, SPLUNK_TIMEOUT)
+SPLUNK_MAX_ROWS = 5000   # tope duro de filas por dataset (no traer 2M)
+
+
+def splunk_enabled():
+    """Si hay contrasena configurada: aparece la opcion de ingesta Splunk."""
+    return bool(SPLUNK_PASS)
+
+
+def _splunk_ssl():
+    """Contexto TLS sin verificacion (self-signed local, como curl -k)."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _splunk_open(path, data=None, timeout=SPLUNK_TIMEOUT):
+    """Peticion a la REST de Splunk local (basic auth). Devuelve la resp.
+
+    Los fallos salen como ValueError con mensaje amigable (el llamador
+    lo convierte en 502/404 para la UI)."""
+    req = urllib.request.Request(SPLUNK_URL.rstrip("/") + path,
+                                 data=data, method="POST" if data else "GET")
+    req.add_header("Authorization", "Basic " + base64.b64encode(
+        (SPLUNK_USER + ":" + SPLUNK_PASS).encode("utf-8")).decode("ascii"))
+    if data:
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        return urllib.request.urlopen(req, timeout=timeout,
+                                      context=_splunk_ssl())
+    except HTTPError as e:
+        raise ValueError("Splunk devolvio HTTP %d; revisa el SPL o el"
+                         " indice" % e.code)
+    except (URLError, socket.timeout, TimeoutError, ConnectionError,
+            OSError):
+        # Lenguaje humano: el usuario final no gestiona la conexion
+        raise ValueError("El Splunk no responde: contacta con el"
+                         " operador del servidor para que revise la"
+                         " conexion")
+
+
+def splunk_query(spl, count=1000):
+    """Ejecuta un SPL contra Splunk local (POST /services/search/jobs,
+    oneshot, output_mode=json, earliest_time=0) y devuelve la lista de
+    dicts de resultados. Fuerza el prefijo "search " si falta (Splunk 10.4).
+    count acota filas (tope SPLUNK_MAX_ROWS): el SPL filtra y agrega."""
+    q = str(spl or "").strip()
+    if not q:
+        raise ValueError("el SPL esta vacio")
+    if not (q.startswith("search ") or q.startswith("|")):
+        q = "search " + q
+    n = max(1, min(int(count), SPLUNK_MAX_ROWS))
+    body = urlencode({
+        "search": q,
+        "exec_mode": "oneshot",
+        "output_mode": "json",
+        "earliest_time": "0",
+        "count": str(n),
+    }).encode("utf-8")
+    with _splunk_open("/services/search/jobs", data=body) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise ValueError("Splunk devolvio una respuesta no JSON")
+    rows = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("la respuesta de Splunk no traia resultados")
+    return rows
+
+
+def splunk_indexes():
+    """Indices disponibles (GET /services/data/2.0/indexes). Recon ligero:
+    sin lanzar searches sobre el indice de 2M+ eventos. Puede fallar
+    (404) si el usuario no tiene permiso para listar: el llamador lo
+    trata como informativo, no como fallo duro."""
+    with _splunk_open("/services/data/2.0/indexes") as resp:
+        raw = resp.read().decode("utf-8", "replace")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise ValueError("Splunk devolvio una respuesta no JSON")
+    out = []
+    for e in (data.get("entry") or []) if isinstance(data, dict) else []:
+        name = str(e.get("name", "") or "").strip()
+        if name and not name.startswith("_"):
+            out.append(name)
+    return sorted(out)
+
+
+def splunk_rows_to_dataset_rows(results):
+    """Convierte filas de resultado de Splunk (dicts) en filas del visor.
+
+    ts = _time (epoch -> ISO via norm_ts); msg = campo "line" si existe,
+    si no, los campos como k=v; raw = JSON de los campos (para drawer y
+    LLM). level queda vacio: un dataset Splunk no tiene niveles syslog y
+    el diagnostico rapido lo trata aparte (ver _diagnose/_templates)."""
+    out = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        t = str(r.get("_time", "") or "").strip()
+        try:
+            t = str(int(float(t)))   # epoch seg (norm_ts lo parsea)
+        except (TypeError, ValueError):
+            t = ""
+        fields = {k: v for k, v in r.items() if not k.startswith("_")}
+        line = str(fields.get("line", "") or "").strip()
+        msg = line or " ".join("%s=%s" % (k, v)
+                               for k, v in sorted(fields.items()))
+        if not msg:
+            continue
+        ip = ""
+        for key in ("src_ip", "ip", "src", "clientip", "source_ip"):
+            if key in fields:
+                ip = str(fields[key])
+                break
+        raw = json.dumps(fields, ensure_ascii=False) if fields else msg
+        out.append({
+            "ts": t, "ts_norm": norm_ts(t), "level": "",
+            "ip": ip, "host": str(fields.get("host", "") or ""),
+            "app": str(fields.get("sourcetype", "") or ""),
+            "pid": "", "method": "", "path": "", "code": "",
+            "bytes": "", "msg": msg, "raw": raw,
+        })
+    for row in out:
+        row["_search"] = _make_search(row)
+        # Plantilla sobre el msg (leible para el LLM), no sobre el JSON
+        row["template"] = make_template(row["msg"])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -423,9 +1219,18 @@ class MemStore:
         self.rows = rows if rows is not None else []
         self.counters = counters if counters is not None else {}
         self.top_cache = {}
+        self._reindex()
+
+    def _reindex(self):
+        """Fase 7B: posicion de cada fila en la lista (rowid de MemStore)."""
+        for i, r in enumerate(self.rows):
+            r["_idx"] = i
 
     def add_rows(self, rows, counters):
         """Anade filas (usado por el tail en vivo)."""
+        base = len(self.rows)
+        for i, r in enumerate(rows):
+            r["_idx"] = base + i
         self.rows.extend(rows)
         for key, cnt in counters.items():
             if key in self.counters:
@@ -443,6 +1248,8 @@ class MemStore:
         for r in rows[start:start + size]:
             r = dict(r)
             r.pop("_search", None)
+            # Fase 7B: rowid = indice en la lista de filas del dataset
+            r["rowid"] = r.get("_idx", -1)
             out.append(r)
         return out
 
@@ -470,6 +1277,43 @@ class MemStore:
                 out[key] = len(self.counters[key])
         return out
 
+    def templates(self, min_count=1, limit=200, level=None):
+        """Fase 9B: agregacion por plantilla (calculada en el parseo).
+
+        level (opcional): solo filas de ese nivel exacto (Fase 12C)."""
+        agg = {}
+        for r in self.rows:
+            if level is not None and r.get("level", "") != level:
+                continue
+            t = r.get("template", "")
+            if not t:
+                continue
+            e = agg.get(t)
+            ts = r.get("ts_norm", "")
+            if e is None:
+                e = agg[t] = {"count": 0, "first": ts, "last": ts,
+                              "example": r.get("raw", "")}
+            e["count"] += 1
+            if ts:
+                if not e["first"] or ts < e["first"]:
+                    e["first"] = ts
+                if not e["last"] or ts > e["last"]:
+                    e["last"] = ts
+        out = [dict(template=t, **e) for t, e in agg.items()
+              if e["count"] >= min_count]
+        out.sort(key=lambda e: (-e["count"], e["first"]))
+        return out[:limit]
+
+    def histogram(self, q, gran="min"):
+        """Fase 9C: distribucion temporal de las filas filtradas."""
+        n = 16 if gran == "min" else 13
+        out = Counter()
+        for r in apply_filters(self.rows, q):
+            t = (r.get("ts_norm") or "")[:n]
+            if t:
+                out[t] += 1
+        return [{"t": t, "count": c} for t, c in sorted(out.items())]
+
     def total_rows(self):
         return len(self.rows)
 
@@ -483,8 +1327,10 @@ class SqlStore:
     Las filas se guardan en una tabla; el filtrado, el top N y los KPIs
     se hacen con SQL. No se mantiene la lista de filas en memoria."""
 
-    COLUMNS = ("ts", "level", "ip", "host", "app", "pid",
-               "method", "path", "code", "bytes", "msg", "raw")
+    COLUMNS = ("ts", "ts_norm", "level", "ip", "host", "app", "pid",
+               "method", "path", "code", "bytes", "msg", "raw",
+               # Fase 9A: plantilla normalizada, calculada en el parseo
+               "template")
 
     def __init__(self, db_path):
         self.db_path = db_path
@@ -496,19 +1342,45 @@ class SqlStore:
 
     def _create_schema(self):
         cols = ", ".join("%s TEXT" % c for c in self.COLUMNS)
+        # line: numero de linea (0-based) en el archivo original (Fase 7B)
         self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS rows (%s, search TEXT)" % cols)
+            "CREATE TABLE IF NOT EXISTS rows (%s, search TEXT, "
+            "line INTEGER)" % cols)
         # Indices para los filtros mas usados
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_level ON rows(level)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_code ON rows(code)")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ts_norm ON rows(ts_norm)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_ip ON rows(ip)")
+        # Fase 8A: FTS5 external-content sobre la columna search existente
+        # (no duplica datos: el contenido se lee de rows por rowid)
+        self.conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5("
+            "search, content='rows', content_rowid='rowid')")
+        # Si la BD venia de una version anterior sin FTS, reindexa desde
+        # rows (external-content: rebuild solo relée el contenido)
+        n_rows = self.conn.execute("SELECT COUNT(*) FROM rows").fetchone()[0]
+        n_fts = self.conn.execute("SELECT COUNT(*) FROM fts").fetchone()[0]
+        if n_rows != n_fts:
+            self.conn.execute(
+                "INSERT INTO fts(fts) VALUES('rebuild')")
         self.conn.commit()
 
     def _insert_rows(self, rows):
+        cur = self.conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM rows")
+        first = cur.fetchone()[0] + 1
         self.conn.executemany(
-            "INSERT INTO rows (%s, search) VALUES (%s)" % (
-                ", ".join(self.COLUMNS), ", ".join("?" * (len(self.COLUMNS) + 1))),
-            [tuple(r.get(c, "") for c in self.COLUMNS) + (r.get("_search", ""),)
+            "INSERT INTO rows (%s, search, line) VALUES (%s)" % (
+                ", ".join(self.COLUMNS),
+                ", ".join("?" * (len(self.COLUMNS) + 2))),
+            [tuple(r.get(c, "") for c in self.COLUMNS)
+             + (r.get("_search", ""), int(r.get("_line", -1)))
              for r in rows])
+        # Fase 8A: alimentar el indice FTS con los mismos rowids
+        self.conn.executemany(
+            "INSERT INTO fts(rowid, search) VALUES (?, ?)",
+            [(first + i, r.get("_search", ""))
+             for i, r in enumerate(rows)])
         self.conn.commit()
 
     def add_rows(self, rows, counters):
@@ -516,34 +1388,104 @@ class SqlStore:
         with self.lock:
             self._insert_rows(rows)
 
+    def _fts_clause(self, terms):
+        """Fase 8B: traduce el filtro q a FTS5 MATCH sobre search.
+
+        - Positivos (multivalor de la Fase 7D): OR entre frases FTS.
+        - Negativos (prefijo "!"): operador NOT de FTS5.
+        - Sin positivos no hay forma de decir "todo menos X" con MATCH:
+          se cae a clausulas SQL instr(lower(search), lower(?)) = 0.
+        Las frases van entre comas dobles (literal de FTS5); un termino
+        de varios tokens es una frase, aproximacion del antiguo match por
+        subcadena cuando el termino no coincide con token completo.
+        """
+        pos = [t for n, t in terms if not n]
+        neg = [t for n, t in terms if n]
+
+        def fts_phrase(t):
+            return '"%s"' % t.replace('"', '""')
+
+        if not pos:
+            clauses = []
+            params = []
+            for g in neg:
+                clauses.append("instr(lower(search), lower(?)) = 0")
+                params.append(g)
+            return "(" + " AND ".join(clauses) + ")", params
+        query = " OR ".join(fts_phrase(p) for p in pos)
+        for g in neg:
+            query += " NOT " + fts_phrase(g)
+        # MATCH no se puede evaluar directo en el WHERE de rows: se usa
+        # la subconsulta por rowid (FTS5 external-content)
+        return ("rowid IN (SELECT rowid FROM fts WHERE fts MATCH ?)"), [query]
+
+    def _field_clause(self, col, terms, exact=False):
+        """Fase 7D: clausula SQL equivalente a terms_pass()."""
+        pos = [t for n, t in terms if not n]
+        neg = [t for n, t in terms if n]
+        clauses = []
+        params = []
+        if exact:
+            if pos:
+                clauses.append(
+                    "%s IN (%s)" % (col, ", ".join("?" * len(pos))))
+                params.extend(pos)
+            for g in neg:
+                clauses.append("%s != ?" % col)
+                params.append(g)
+        else:
+            if pos:
+                ors = []
+                for p in pos:
+                    ors.append("instr(lower(%s), lower(?)) > 0" % col)
+                    params.append(p)
+                clauses.append("(" + " OR ".join(ors) + ")")
+            for g in neg:
+                clauses.append("instr(lower(%s), lower(?)) = 0" % col)
+                params.append(g)
+        if not clauses:
+            return None, []
+        return "(" + " AND ".join(clauses) + ")", params
+
     def _where(self, q):
         """Construye la clausula WHERE a partir de los filtros."""
         clauses = []
         params = []
-        level = q.get("level", [""])[0].strip()
-        code = q.get("code", [""])[0].strip()
-        ip = q.get("ip", [""])[0].strip().lower()
-        path = q.get("path", [""])[0].strip().lower()
-        txt = q.get("q", [""])[0].strip().lower()
+        level_t = parse_terms(q.get("level", [""]))
+        code_t = parse_terms(q.get("code", [""]))
+        ip_t = parse_terms(q.get("ip", [""]))
+        path_t = parse_terms(q.get("path", [""]))
+        txt_t = parse_terms(q.get("q", [""]))
+        # Fase 9B: filtro exacto por plantilla (vino de la vista agrupada)
+        tpl = q.get("tpl", [""])[0].strip()
         dt = q.get("dt", [""])[0].strip()
-        if level:
-            clauses.append("level = ?")
-            params.append(level)
-        if code:
-            clauses.append("code = ?")
-            params.append(code)
-        if ip:
-            clauses.append("instr(lower(ip), ?) > 0")
-            params.append(ip)
-        if path:
-            clauses.append("instr(lower(path), ?) > 0")
-            params.append(path)
+        dt_from = _dt_bound(q.get("dt_from", [""])[0])
+        dt_to = _dt_bound(q.get("dt_to", [""])[0])
+        for col, terms, exact in (
+                ("level", level_t, True), ("code", code_t, True),
+                ("ip", ip_t, False), ("path", path_t, False)):
+            if terms:
+                c, p = self._field_clause(col, terms, exact)
+                if c:
+                    clauses.append(c)
+                    params.extend(p)
+        # Fase 8B: q usa FTS5 MATCH en SQLite; MemStore sigue por subcadena
+        if txt_t:
+            c, p = self._fts_clause(txt_t)
+            clauses.append(c)
+            params.extend(p)
+        if tpl:
+            clauses.append("template = ?")
+            params.append(tpl)
         if dt:
             clauses.append("instr(ts, ?) > 0")
             params.append(dt)
-        if txt:
-            clauses.append("instr(search, ?) > 0")
-            params.append(txt)
+        if dt_from:
+            clauses.append("ts_norm >= ?")
+            params.append(dt_from)
+        if dt_to:
+            clauses.append("ts_norm <= ?")
+            params.append(dt_to)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         return where, params
 
@@ -558,14 +1500,35 @@ class SqlStore:
         where, params = self._where(q)
         with self.lock:
             cur = self.conn.execute(
-                "SELECT %s FROM rows %s LIMIT ? OFFSET ?" % (
+                "SELECT rowid, %s FROM rows %s LIMIT ? OFFSET ?" % (
                     ", ".join(self.COLUMNS), where),
                 params + [size, start])
             cols = self.COLUMNS
             out = []
             for row in cur.fetchall():
-                out.append(dict(zip(cols, row)))
+                d = dict(zip(cols, row[1:]))
+                # Fase 7B: rowid de SQLite (identificador estable de fila)
+                d["rowid"] = row[0]
+                out.append(d)
             return out
+
+    def histogram(self, q, gran="min"):
+        """Fase 9C: distribucion temporal de las filas filtradas."""
+        n = 16 if gran == "min" else 13
+        where, params = self._where(q)
+        sql = ("SELECT substr(ts_norm, 1, %d) t, COUNT(*) c FROM rows "
+               "WHERE ts_norm != '' %s GROUP BY t ORDER BY t" % (n, where))
+        with self.lock:
+            cur = self.conn.execute(sql, params)
+            return [{"t": t, "count": c} for t, c in cur.fetchall()]
+
+    def line_of(self, rowid):
+        """Fase 7B: numero de linea (0-based) en el archivo de una fila."""
+        with self.lock:
+            cur = self.conn.execute(
+                "SELECT line FROM rows WHERE rowid = ?", [rowid])
+            r = cur.fetchone()
+        return r[0] if r else None
 
     def iter_filtered(self, q):
         where, params = self._where(q)
@@ -598,6 +1561,32 @@ class SqlStore:
                     "SELECT COUNT(DISTINCT %s) FROM rows WHERE %s != ''" % (col, col))
                 out[key] = cur.fetchone()[0]
         return out
+
+    def templates(self, min_count=1, limit=200, level=None):
+        """Fase 9B: GROUP BY sobre la columna template.
+
+        level (opcional): solo filas de ese nivel exacto (Fase 12C)."""
+        with self.lock:
+            sql = ("SELECT template, COUNT(*) c, MIN(ts_norm), MAX(ts_norm), "
+                   "MIN(rowid) FROM rows WHERE template != '' ")
+            params = []
+            if level is not None:
+                sql += "AND level = ? "
+                params.append(level)
+            sql += ("GROUP BY template HAVING c >= ? ORDER BY c DESC LIMIT ?")
+            cur = self.conn.execute(
+                sql, params + [min_count, limit])
+            groups = cur.fetchall()
+            if not groups:
+                return []
+            ids = [g[4] for g in groups]
+            ph = ", ".join("?" * len(ids))
+            cur = self.conn.execute(
+                "SELECT rowid, raw FROM rows WHERE rowid IN (%s)" % ph, ids)
+            ex = {rowid: raw for rowid, raw in cur.fetchall()}
+        return [{"template": g[0], "count": g[1], "first": g[2],
+                 "last": g[3], "example": ex.get(g[4], "")}
+                for g in groups]
 
     def total_rows(self):
         with self.lock:
@@ -665,7 +1654,7 @@ def parse_apache(lines, progress=None):
                 "ts": date, "level": "", "ip": ip, "method": method,
                 "path": path, "code": code, "bytes": byts,
                 "msg": _trunc("%s %s" % (method, path)),
-                "raw": _trunc(l),
+                "raw": _trunc(l), "_line": i,
             })
         if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
             progress(i + 1, n)
@@ -732,7 +1721,7 @@ def parse_w3c(lines, progress=None, fields=None):
             "ts": ts, "level": "", "ip": ip, "method": method,
             "path": path, "code": code, "bytes": byts,
             "msg": _trunc("%s %s" % (method, path)),
-            "raw": _trunc(l),
+            "raw": _trunc(l), "_line": i,
         })
         if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
             progress(i + 1, n)
@@ -783,7 +1772,7 @@ def parse_json(lines, progress=None):
                     "ts": ts, "level": level, "ip": ip, "method": "",
                     "path": "", "code": "", "bytes": "",
                     "msg": _trunc(msg),
-                    "raw": _trunc(l),
+                    "raw": _trunc(l), "_line": i,
                 })
         if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
             progress(i + 1, n)
@@ -810,7 +1799,7 @@ def parse_syslog(lines, progress=None):
                 "path": "", "code": "", "bytes": "",
                 "msg": _trunc(m.group("msg")),
                 "host": host, "app": app, "pid": m.group("pid") or "",
-                "raw": _trunc(l),
+                "raw": _trunc(l), "_line": i,
             })
         if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
             progress(i + 1, n)
@@ -840,7 +1829,7 @@ def parse_generic(lines, progress=None):
             "ts": ts, "level": lv, "ip": ip, "method": "",
             "path": "", "code": "", "bytes": "",
             "msg": _trunc(msg),
-            "raw": _trunc(l),
+            "raw": _trunc(l), "_line": i,
         })
         if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
             progress(i + 1, n)
@@ -849,10 +1838,13 @@ def parse_generic(lines, progress=None):
 
 def parse_raw(lines, progress=None):
     """RAW: lineas tal cual, sin parsear."""
-    rows = [{"ts": "", "level": "RAW", "ip": "", "method": "",
-             "path": "", "code": "", "bytes": "", "msg": _trunc(l),
-             "raw": _trunc(l)}
-            for l in lines]
+    rows = []
+    for i, l in enumerate(lines):
+        rows.append({
+            "ts": "", "level": "RAW", "ip": "", "method": "",
+            "path": "", "code": "", "bytes": "", "msg": _trunc(l),
+            "raw": _trunc(l), "_line": i,
+        })
     return rows, {"levels": Counter({"RAW": len(rows)})}
 
 
@@ -925,6 +1917,14 @@ def load_file(path, progress=None, user="local"):
     name = os.path.basename(path)
     db_dir = os.path.join(tempfile.gettempdir(), "logviewer", "sqlite",
                          safe_session_name(user))
+    # Una carga anterior con el mismo nombre puede haber dejado una BD:
+    # se borra para que la migracion no apile filas sobre la vieja
+    _old_db = os.path.join(db_dir, safe_session_name(name) + ".db")
+    for _suf in ("", "-wal", "-shm"):
+        try:
+            os.remove(_old_db + _suf)
+        except OSError:
+            pass
     store = MemStore()
     try:
         line_iter = iter_lines(stream, encoding)
@@ -959,12 +1959,18 @@ def load_file(path, progress=None, user="local"):
 
         def _flush(chunk):
             nonlocal store, lines_processed
+            base_line = lines_processed
             if fmt == "w3c":
                 rows, counters = parse_w3c(chunk, fields=w3c_f)
             else:
                 rows, counters = parser(chunk)
             for r in rows:
                 r["_search"] = _make_search(r)
+                # Fase 9A: plantilla calculada en el parseo
+                r["template"] = make_template(r.get("raw", ""))
+                r["ts_norm"] = norm_ts(r.get("ts", ""))
+                # Fase 7B: numero de linea (0-based) en el archivo original
+                r["_line"] = base_line + r.pop("_line", 0)
             store.add_rows(rows, counters)
             lines_processed += len(chunk)
             # Migra a SQLite si se supera el umbral
@@ -1071,31 +2077,116 @@ def top_n(ds, field, limit):
 # ---------------------------------------------------------------------------
 # Filtrado en el servidor
 # ---------------------------------------------------------------------------
+def parse_terms(val):
+    """Fase 7D: parser de filtros con exclusion y multivalor.
+
+    Acepta coma para multivalor ("200,301") y prefijo "!" por termino
+    ("!10.0.0.5"). Devuelve una lista de tuplas (negado, termino) o None
+    si no hay terminos validos.
+    """
+    if val is None:
+        return None
+    # Acepta forma CGI (lista) o cadena plana
+    if isinstance(val, (list, tuple)):
+        val = val[0] if val else ""
+    terms = []
+    for part in str(val).split(","):
+        t = part.strip()
+        if not t:
+            continue
+        neg = t.startswith("!")
+        if neg:
+            t = t[1:]
+        if t:
+            terms.append((neg, t))
+    return terms or None
+
+
+def terms_pass(value, terms, exact=False):
+    """Fase 7D: OR de los positivos AND NOT de los negativos.
+
+    Sin positivos, la condicion positiva se cumple siempre (solo
+    aplican las exclusiones). Con exact=True el match es de igualdad
+    (level/code); si no, subcadena sin distinguir mayusculas.
+    """
+    value = value or ""
+    pos = [t for n, t in terms if not n]
+    neg = [t for n, t in terms if n]
+    if pos and not any(
+            (value == p if exact else p.lower() in value.lower())
+            for p in pos):
+        return False
+    for g in neg:
+        if exact:
+            if value == g:
+                return False
+        elif g.lower() in value.lower():
+            return False
+    return True
+
+
 def apply_filters(rows, q):
     """Aplica todos los filtros combinables. Devuelve la lista filtrada."""
-    level = q.get("level", [""])[0].strip()
-    code = q.get("code", [""])[0].strip()
-    ip = q.get("ip", [""])[0].strip().lower()
-    path = q.get("path", [""])[0].strip().lower()
-    txt = q.get("q", [""])[0].strip().lower()
+    level_t = parse_terms(q.get("level", [""]))
+    code_t = parse_terms(q.get("code", [""]))
+    ip_t = parse_terms(q.get("ip", [""]))
+    path_t = parse_terms(q.get("path", [""]))
+    txt_t = parse_terms(q.get("q", [""]))
+    tpl = q.get("tpl", [""])[0].strip()
     dt = q.get("dt", [""])[0].strip()
+    # Rango de fechas real (Fase 7A): comparacion lexicografica sobre
+    # ts_norm. El filtro "dt" por subcadena queda como fallback.
+    dt_from = _dt_bound(q.get("dt_from", [""])[0])
+    dt_to = _dt_bound(q.get("dt_to", [""])[0])
 
     out = []
     for r in rows:
-        if level and r["level"] != level:
+        if level_t and not terms_pass(r["level"], level_t, exact=True):
             continue
-        if code and r["code"] != code:
+        if code_t and not terms_pass(r["code"], code_t, exact=True):
             continue
-        if ip and ip not in r["ip"].lower():
+        if ip_t and not terms_pass(r.get("ip", ""), ip_t):
             continue
-        if path and path not in r["path"].lower():
+        if path_t and not terms_pass(r.get("path", ""), path_t):
             continue
         if dt and dt not in r["ts"]:
             continue
-        if txt and txt not in r.get("_search", ""):
+        if txt_t and not terms_pass(r.get("_search", ""), txt_t):
+            continue
+        # Fase 9B: filtro exacto por plantilla (vino de la vista agrupada)
+        if tpl and r.get("template", "") != tpl:
+            continue
+        ts_n = r.get("ts_norm", "")
+        if dt_from and ts_n < dt_from:
+            continue
+        if dt_to and ts_n > dt_to:
             continue
         out.append(r)
     return out
+
+
+def read_context_lines(path, line, n, encoding="utf-8"):
+    """Fase 7B: contexto tipo grep -C alrededor de una linea (0-based).
+
+    Lee el archivo por streaming y devuelve {"before": [...],
+    "current": str, "after": [...]} con las n lineas anteriores y
+    posteriores de la linea pedida.
+    """
+    lo = max(0, line - n)
+    hi = line + n
+    before, after, current = [], [], ""
+    with open(path, "r", encoding=encoding, errors="replace") as f:
+        for i, l in enumerate(f):
+            if i < lo or i > hi:
+                continue
+            t = l.rstrip("\n")
+            if i < line:
+                before.append(t)
+            elif i == line:
+                current = t
+            else:
+                after.append(t)
+    return {"before": before, "current": current, "after": after}
 
 
 def parse_multipart_all(data, boundary):
@@ -1226,12 +2317,15 @@ def _load_worker(name, path, user="local", ip=None):
                                              "message": msg}
 
     try:
+        # Carga anterior con el mismo nombre: cerrala (su close borra la
+        # BD) antes de parsear para que la migracion no apile filas
+        with LOCK:
+            old = _user_state(user, SESSIONS).get(name)
+        if old is not None:
+            old["store"].close()
         ds = load_file(path, _progress, user=user)
         with LOCK:
             mine = _user_state(user, SESSIONS)
-            old = mine.get(name)
-            if old is not None:
-                old["store"].close()
             mine[name] = ds
             if not ACTIVE.get(user, ""):
                 ACTIVE[user] = name
@@ -1408,6 +2502,44 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return None
 
+    def do_PUT(self):
+        if not self._cf_ok():
+            self._error("acceso directo no permitido (requiere Cloudflare Access)", 403)
+            return
+        if self.headers.get("X-CSRF-Token", "") != CSRF_TOKEN:
+            self._error("token CSRF invalido", 403)
+            return
+        u = urlparse(self.path)
+        if u.path == "/api/runbooks":
+            self._runbooks_update()
+        else:
+            self._error("ruta no conocida", 404)
+
+    def do_DELETE(self):
+        if not self._cf_ok():
+            self._error("acceso directo no permitido (requiere Cloudflare Access)", 403)
+            return
+        if self.headers.get("X-CSRF-Token", "") != CSRF_TOKEN:
+            self._error("token CSRF invalido", 403)
+            return
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        user = self._user()
+        if u.path == "/api/runbooks":
+            try:
+                rid = int(q.get("id", ["0"])[0])
+            except ValueError:
+                self._error("id invalido", 400)
+                return
+            gone = runbooks_store().delete(rid)
+            if not gone:
+                self._error("no existe", 404)
+                return
+            audit("runbook_del", user, id=rid)
+            self._json({"ok": True})
+        else:
+            self._error("ruta no conocida", 404)
+
     def do_GET(self):
         if not self._cf_ok():
             self._error("acceso directo no permitido (requiere Cloudflare Access)", 403)
@@ -1440,6 +2572,27 @@ class Handler(BaseHTTPRequestHandler):
             self._tail(q, user)
         elif u.path == "/api/rows":
             self._rows(q, user)
+        elif u.path == "/api/templates":
+            self._templates(q, user)
+        elif u.path == "/api/histogram":
+            self._histogram(q, user)
+        elif u.path == "/api/config":
+            # Config de solo lectura para la UI (Fase 12A: si hay LLM,
+            # aparece el boton Analizar en el drawer; Fase 13: si hay
+            # Splunk configurado, aparece la seccion "Importar de Splunk";
+            # repo_url: enlace de descarga de la version local)
+            self._json(public_config())
+        elif u.path == "/api/splunk/sources":
+            self._splunk_sources()
+        elif u.path == "/api/settings":
+            # Config editable del LLM desde la UI (persistente)
+            self._settings_get()
+        elif u.path == "/api/runbooks":
+            self._runbooks_list()
+        elif u.path == "/api/runbooks/match":
+            self._runbooks_match(q)
+        elif u.path == "/api/context":
+            self._context(q, user)
         elif u.path == "/api/top":
             self._top(q, user)
         elif u.path == "/api/export":
@@ -1450,6 +2603,32 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"audit": audit_for_user(user)})
         else:
             self._error("ruta no conocida", 404)
+
+    def _splunk_sources(self):
+        """Fase 13: GET /api/splunk/sources -> indices disponibles."""
+        if not splunk_enabled():
+            self._error("Splunk no esta configurado (falta la contrasena)",
+                        404)
+            return
+        # Listar indices es INFORMATIVO: si el usuario no tiene permiso
+        # (REST 404 en este entorno), no bloquea la ingesta
+        try:
+            indexes = splunk_indexes()
+        except ValueError as e:
+            audit("splunk_sources", user=self._user(), error=str(e))
+            self._json({"indexes": [], "primary": "botsv3",
+                        "note": ("Este usuario de Splunk no puede listar"
+                                 " indices; usa index=botsv3."),
+                        "hint": ("El SPL debe empezar con 'search' y"
+                                " acotar filas (tope %d)." % SPLUNK_MAX_ROWS)})
+            return
+        audit("splunk_sources", user=self._user(), count=len(indexes))
+        # El indice principal de este entorno (documentado, no se asume):
+        self._json({"indexes": indexes,
+                    "primary": "botsv3",
+                    "hint": ("El SPL debe empezar con 'search' y acotar"
+                            " filas (el servidor limita a %d)."
+                            % SPLUNK_MAX_ROWS)})
 
     def _rows(self, q, user):
         name = q.get("name", [""])[0]
@@ -1478,6 +2657,348 @@ class Handler(BaseHTTPRequestHandler):
             "name": ds["name"],
         })
 
+    def _templates(self, q, user):
+        """Fase 9B: vista 'Errores agrupados' por plantilla."""
+        name = q.get("name", [""])[0]
+        with LOCK:
+            ds = dataset(user, name)
+        if ds is None:
+            self._error("no hay archivo cargado", 404)
+            return
+        try:
+            min_count = max(1, int(q.get("min", ["1"])[0]))
+        except ValueError:
+            min_count = 1
+        level = q.get("level", [""])[0].strip() or None  # Fase 12C
+        # Fase 13: los datasets Splunk no tienen niveles syslog; el nivel
+        # no filtra (mismo tratamiento que _diagnose)
+        if ds.get("format") == "splunk":
+            level = None
+        store = ds["store"]
+        items = store.templates(min_count=min_count, limit=200,
+                                level=level)
+        self._json({"name": name, "total": len(items), "templates": items})
+
+    def _runbooks_list(self):
+        """Fase 10A: lista de runbooks (BD persistente)."""
+        self._json({"runbooks": runbooks_store().all()})
+
+    def _runbooks_match(self, q):
+        """Fase 10A: runbooks cuyo patron coincide con el msg dado."""
+        msg = q.get("msg", [""])[0]
+        rbs = runbooks_store().all()
+        self._json({"msg": _trunc(msg, 500),
+                    "matches": match_runbooks(msg, rbs)})
+
+    def _runbooks_update(self):
+        """Fase 10B: edicion de runbook (PUT /api/runbooks?id=)."""
+        user = self._user()
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        try:
+            rid = int(q.get("id", ["0"])[0])
+        except ValueError:
+            self._error("id invalido", 400)
+            return
+        body = self._read_json_body()
+        if not isinstance(body, dict):
+            self._error("cuerpo JSON invalido", 400)
+            return
+        pattern = str(body.get("pattern") or "").strip()
+        kind = str(body.get("kind") or "regex").strip() or "regex"
+        if not pattern:
+            self._error("falta el patron", 400)
+            return
+        if kind == "regex" and _rb_compile(pattern) is None:
+            self._error("el regex no compila", 400)
+            return
+        try:
+            rb = runbooks_store().update(
+                rid, pattern, kind,
+                str(body.get("explicacion") or ""),
+                str(body.get("causa") or ""),
+                str(body.get("solucion") or ""),
+                str(body.get("ref") or ""))
+        except ValueError as e:
+            self._error(str(e), 409)
+            return
+        if rb is None:
+            self._error("no existe", 404)
+            return
+        audit("runbook_edit", user, id=rid, pattern=pattern)
+        self._json(rb)
+
+    def _runbooks_create(self):
+        """Fase 10A: alta de runbook desde la UI/CLI."""
+        user = self._user()
+        body = self._read_json_body()
+        if not isinstance(body, dict):
+            self._error("cuerpo JSON invalido", 400)
+            return
+        pattern = str(body.get("pattern") or "").strip()
+        kind = str(body.get("kind") or "regex").strip() or "regex"
+        if not pattern:
+            self._error("falta el patron", 400)
+            return
+        if kind == "regex" and _rb_compile(pattern) is None:
+            self._error("el regex no compila", 400)
+            return
+        try:
+            rb = runbooks_store().add(
+                pattern, kind=kind,
+                explicacion=str(body.get("explicacion") or ""),
+                causa=str(body.get("causa") or ""),
+                solucion=str(body.get("solucion") or ""),
+                ref=str(body.get("ref") or ""))
+        except ValueError as e:
+            self._error(str(e), 409)
+            return
+        audit("runbook_add", user, pattern=pattern, kind=kind,
+              id=rb["id"])
+        self._json(rb)
+
+    def _settings_get(self):
+        """GET /api/settings: config editable del LLM (persistente)."""
+        cfg = llm_config()
+        self._json({"llm": bool(cfg["url"]), "url": cfg["url"],
+                    "model": cfg["model"], "timeout": cfg["timeout"],
+                    "lang": cfg["lang"]})
+
+    def _settings_post(self):
+        """POST /api/settings: guarda la config del LLM desde la UI.
+
+        URL/modelo/timeout; persiste en settings.json (sobrevive a
+        reinicios). Se valida la URL (http/https) y el timeout (>=1 s).
+        La env var actua solo como valor inicial; lo que se guarda aqui
+        manda hasta que se cambie o se borre settings.json."""
+        user = self._user()
+        body = self._read_json_body()
+        if not isinstance(body, dict):
+            self._error("cuerpo JSON invalido", 400)
+            return
+        st = settings_store()
+        url = body.get("url")
+        if url is not None:
+            url = str(url).strip()
+            if url and not url.startswith(("http://", "https://")):
+                self._error("la URL debe empezar por http:// o https://", 400)
+                return
+            if url:
+                # SSRF: el destino del LLM SOLO puede ser loopback. No se
+                # permite apuntar a IPs internas/metadata de cloud, o el
+                # visor desplegado podria usarse como proxy.
+                host = _llm_url_host(url)
+                if host is None or not _is_loopback(host):
+                    self._error(
+                        "destino del LLM no permitido: solo loopback"
+                        " (localhost/127.0.0.1). Los modelos locales corren"
+                        " en tu propia maquina.", 400)
+                    return
+        model = body.get("model")
+        if model is not None:
+            model = str(model).strip()
+        timeout = body.get("timeout")
+        if timeout is not None:
+            try:
+                if int(timeout) < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                self._error("el timeout debe ser un entero >= 1", 400)
+                return
+        lang = body.get("lang")
+        st.set(url=url, model=model, timeout=timeout,
+               lang=(None if lang is None else str(lang)))
+        cfg = llm_config()
+        audit("settings_update", user,
+              llm_url=(cfg["url"] or ""), llm_model=cfg["model"],
+              llm_timeout=cfg["timeout"], llm_lang=cfg["lang"])
+        self._json({"llm": bool(cfg["url"]), "url": cfg["url"],
+                    "model": cfg["model"], "timeout": cfg["timeout"],
+                    "lang": cfg["lang"]})
+
+    def _analyze(self):
+        """Fase 12A: analiza UNA linea con el LLM local (cache por hash)."""
+        user = self._user()
+        body = self._read_json_body()
+        if not isinstance(body, dict):
+            self._error("cuerpo JSON invalido", 400)
+            return
+        line = str(body.get("line") or "").strip()
+        if not line:
+            self._error("falta la linea a analizar", 400)
+            return
+        cfg = llm_config()
+        if not cfg["url"]:
+            self._error("el LLM no esta configurado", 404)
+            return
+        key = llm_key(line, model=cfg["model"], lang=cfg["lang"])
+        cached = llm_cache().get(key)
+        if cached is not None:
+            audit("analyze", user, line=_trunc(line, 200), cached=True)
+            self._json({"cached": True, "answer": cached})
+            return
+        ok, text = ask_llm(line, url=cfg["url"], model=cfg["model"],
+                           timeout=cfg["timeout"], lang=cfg["lang"])
+        if not ok:
+            # NUNCA se cachea un fallo: el proximo intento vuelve a preguntar
+            audit("analyze", user, line=_trunc(line, 200), error=text)
+            self._json({"error": text}, 503)
+            return
+        llm_cache().put(key, line, text)
+        audit("analyze", user, line=_trunc(line, 200))
+        self._json({"cached": False, "answer": text})
+
+    def _diagnose(self):
+        """Fase 12C: POST /api/diagnose {name, level?}.
+
+        El LLM local resume TODAS las lineas del nivel (por defecto ERR)
+        del dataset activo a traves de sus plantillas unicas (mismo
+        computo que /api/templates). Devuelve {cached, conclusion,
+        top:[{template,count,linea}], analyzed}. Cache por hash de
+        dataset+level+lang(+modelo) en llm_cache.db; los fallos NUNCA se
+        cachean. Maximo DIAGNOSE_MAX_PER_CALL plantillas por llamada:
+        si hay mas, loteo en pila (ver run_diagnose)."""
+        user = self._user()
+        body = self._read_json_body()
+        if not isinstance(body, dict):
+            self._error("cuerpo JSON invalido", 400)
+            return
+        name = str(body.get("name") or "").strip()
+        level = str(body.get("level") or "ERR").strip().upper() or "ERR"
+        with LOCK:
+            ds = dataset(user, name)
+        if ds is None:
+            self._error("no hay archivo cargado", 404)
+            return
+        cfg = llm_config()
+        if not cfg["url"]:
+            self._error("el LLM no esta configurado", 404)
+            return
+        items = ds["store"].templates(min_count=1,
+                                      limit=DIAGNOSE_TOTAL_MAX,
+                                      level=level)
+        if not items and ds.get("format") == "splunk":
+            # Fase 13: dataset de Splunk sin niveles syslog: se diagnostica
+            # sobre TODAS las plantillas (las filas son hallazgos del SPL)
+            items = ds["store"].templates(min_count=1,
+                                         limit=DIAGNOSE_TOTAL_MAX)
+        if not items:
+            audit("diagnose", user, name=name, level=level, analyzed=0)
+            self._json({"cached": False,
+                        "conclusion": ("No hay lineas de nivel %s en el"
+                                       " dataset.") % level,
+                        "top": [], "analyzed": 0})
+            return
+        key = diagnose_key(name, level, cfg["lang"], cfg["model"], items)
+        cached = llm_cache().get(key)
+        if cached is not None:
+            audit("diagnose", user, name=name, level=level,
+                  analyzed=len(items), cached=True)
+            self._json({"cached": True, "conclusion": cached,
+                        "top": [{"template": t["template"],
+                                 "count": t["count"],
+                                 "linea": t.get("example", "")}
+                                for t in items[:10]],
+                        "analyzed": len(items)})
+            return
+
+        def ask(prompt):
+            return ask_llm(prompt, url=cfg["url"], model=cfg["model"],
+                           timeout=cfg["timeout"], lang=cfg["lang"])
+
+        ok, conclusion, analyzed = run_diagnose(items, ask, level=level)
+        if not ok:
+            # NUNCA se cachea un fallo: el proximo intento vuelve a preguntar
+            audit("diagnose", user, name=name, level=level, error=conclusion)
+            self._json({"error": conclusion}, 503)
+            return
+        llm_cache().put(key, "diagnose %s/%s (%d plantillas)"
+                        % (name, level, analyzed), conclusion)
+        audit("diagnose", user, name=name, level=level, analyzed=analyzed)
+        self._json({"cached": False, "conclusion": conclusion,
+                    "top": [{"template": t["template"],
+                             "count": t["count"],
+                             "linea": t.get("example", "")}
+                            for t in items[:10]],
+                    "analyzed": analyzed})
+
+    def _splunk_search(self):
+        """Fase 13: POST /api/splunk/search {search, name?, count?}.
+
+        Ejecuta un SPL contra Splunk local y crea un dataset del visor
+        con las filas devueltas (MemStore: el tope de filas lo pone el
+        count; el SPL es quien filtra y agrega). El dataset queda activo:
+        se puede filtrar, exportar y diagnosticar. El contexto de linea
+        no aplica (no hay archivo original). Auditoria: splunk_search."""
+        user = self._user()
+        if not splunk_enabled():
+            self._error("Splunk no esta configurado (falta la contrasena)",
+                        404)
+            return
+        body = self._read_json_body()
+        if not isinstance(body, dict):
+            self._error("cuerpo JSON invalido", 400)
+            return
+        spl = str(body.get("search") or "").strip()
+        if not spl:
+            self._error("falta el SPL (campo 'search')", 400)
+            return
+        try:
+            count = int(body.get("count", 1000))
+        except (TypeError, ValueError):
+            count = 1000
+        count = max(1, min(count, SPLUNK_MAX_ROWS))
+        try:
+            results = splunk_query(spl, count=count)
+        except ValueError as e:
+            audit("splunk_search", user, error=str(e),
+                  spl=_trunc(spl, 200))
+            self._json({"error": str(e)}, 502)
+            return
+        rows = splunk_rows_to_dataset_rows(results)
+        if not rows:
+            audit("splunk_search", user, rows=0, spl=_trunc(spl, 200))
+            self._json({"error": "la query no devolvio filas"}, 404)
+            return
+        with LOCK:
+            mine = _user_state(user, SESSIONS)
+            name = safe_session_name(
+                str(body.get("name") or "").strip()
+                or ("splunk_" + time.strftime("%Y%m%d_%H%M%S")),
+                existing=list(mine))
+            store = MemStore(rows=rows, counters={})
+            ds = {
+                "store": store,
+                "format": "splunk",
+                "name": name,
+                "size": 0,
+                "total": len(rows),
+                "encoding": "",
+                "compressed": "",
+                "meta": ["Splunk: " + spl],
+            }
+            mine[name] = ds
+            ACTIVE[user] = name
+        audit("splunk_search", user, name=name, rows=len(rows),
+              spl=_trunc(spl, 200))
+        self._json({"name": name, "rows": len(rows)})
+
+    def _histogram(self, q, user):
+        """Fase 9C: histograma temporal de las filas filtradas."""
+        name = q.get("name", [""])[0]
+        gran = q.get("gran", ["min"])[0]
+        if gran not in ("min", "h"):
+            gran = "min"
+        with LOCK:
+            ds = dataset(user, name)
+        if ds is None:
+            self._error("no hay archivo cargado", 404)
+            return
+        buckets = ds["store"].histogram(q, gran="h" if gran == "h" else "min")
+        self._json({"name": name, "gran": gran,
+                    "total": sum(b["count"] for b in buckets),
+                    "buckets": buckets})
+
     def _tail(self, q, user):
         name = q.get("name", [""])[0]
         with LOCK:
@@ -1500,8 +3021,13 @@ class Handler(BaseHTTPRequestHandler):
             truncated = w.truncated
             w.truncated = False
         rows, counters = tail_parse(ds, lines)
+        base_line = ds["total"]
         for r in rows:
             r["_search"] = _make_search(r)
+            # Fase 9A: plantilla calculada en el parseo
+            r["template"] = make_template(r.get("raw", ""))
+            r["ts_norm"] = norm_ts(r.get("ts", ""))
+            r["_line"] = base_line + r.pop("_line", 0)
         ds["store"].add_rows(rows, counters)
         with LOCK:
             ds["total"] += len(lines)
@@ -1514,6 +3040,56 @@ class Handler(BaseHTTPRequestHandler):
             "total": total,
             "truncated": truncated,
         })
+
+    def _context(self, q, user):
+        """Fase 7B: lineas del log original alrededor de una fila."""
+        # Fase 13: el contexto necesita el archivo original; un dataset
+        # traido de Splunk no lo tiene
+        with LOCK:
+            ds0 = dataset(user, q.get("name", [""])[0])
+        if ds0 is not None and ds0.get("format") == "splunk":
+            self._error("el contexto no aplica a un dataset de Splunk",
+                        404)
+            return
+        name = q.get("name", [""])[0]
+        with LOCK:
+            ds = dataset(user, name)
+        if ds is None:
+            self._error("no hay archivo cargado", 404)
+            return
+        try:
+            row = int(q.get("row", ["-1"])[0])
+            n = min(50, max(0, int(q.get("n", ["5"])[0])))
+        except ValueError:
+            self._error("parametros invalidos (row, n)", 400)
+            return
+        store = ds["store"]
+        if isinstance(store, SqlStore):
+            line = store.line_of(row)
+            if line is None or line < 0:
+                self._error("fila no encontrada", 404)
+                return
+        else:
+            rows = store.rows
+            if not (0 <= row < len(rows)):
+                self._error("fila no encontrada", 404)
+                return
+            line = rows[row].get("_line", -1)
+            if line is None or line < 0:
+                self._error("la fila no tiene linea de origen", 404)
+                return
+        path = os.path.join(
+            tempfile.gettempdir(), "logviewer", "sessions",
+            safe_session_name(user), name)
+        try:
+            ctx = read_context_lines(path, line, n,
+                                      ds.get("encoding") or "utf-8")
+        except OSError:
+            self._error("no se puede leer el archivo original", 503)
+            return
+        out = {"name": name, "row": row, "line": line + 1}
+        out.update(ctx)
+        self._json(out)
 
     def _top(self, q, user):
         name = q.get("name", [""])[0]
@@ -1638,6 +3214,16 @@ class Handler(BaseHTTPRequestHandler):
             self._remove()
         elif u.path == "/api/watch":
             self._watch()
+        elif u.path == "/api/runbooks":
+            self._runbooks_create()
+        elif u.path == "/api/settings":
+            self._settings_post()
+        elif u.path == "/api/analyze":
+            self._analyze()
+        elif u.path == "/api/diagnose":
+            self._diagnose()
+        elif u.path == "/api/splunk/search":
+            self._splunk_search()
         else:
             self._error("ruta no conocida", 404)
 

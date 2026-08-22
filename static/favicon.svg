@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e293b"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="7" fill="url(#bg)"/>
+  <!-- visor de logs: tres lineas de "texto" -->
+  <g stroke="#38bdf8" stroke-width="2" stroke-linecap="round">
+    <path d="M7 9.5h8" opacity="0.9"/>
+    <path d="M7 16h12" opacity="0.65"/>
+    <path d="M7 22.5h9" opacity="0.45"/>
+  </g>
+  <!-- punto de "error" rojo al final de la primera linea (busca) -->
+  <circle cx="19" cy="9.5" r="2" fill="#f87171"/>
+  <!-- cursor/lupa implicito -->
+  <g stroke="#e2e8f0" stroke-width="2" stroke-linecap="round" opacity="0.9">
+    <path d="M22 22l3 3"/>
+    <circle cx="19.5" cy="19.5" r="3.2" fill="none"/>
+  </g>
+</svg>

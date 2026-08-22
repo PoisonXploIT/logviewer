@@ -64,6 +64,8 @@ body {
   font-size: 14px;
   display: flex;
   flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .hidden { display: none !important; }
@@ -210,9 +212,8 @@ body {
   flex-direction: column;
   padding: 14px 10px;
   gap: 14px;
-  position: sticky;
-  top: 51px;
-  height: calc(100vh - 51px);
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .side-nav { display: flex; flex-direction: column; gap: 4px; }
@@ -277,6 +278,8 @@ body {
 .main {
   padding: 18px 20px 30px;
   min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 /* ---------------- Estado vacio ---------------- */
@@ -949,6 +952,8 @@ body.present .filters-panel,
 body.present .kpi-row,
 body.present .seg-grid { display: none; }
 
+body.present .app-body { grid-template-columns: 1fr; }
+
 body.present .main { padding: 0; }
 
 body.present .table-panel {
@@ -959,13 +964,15 @@ body.present .table-panel {
   flex-direction: column;
 }
 
+body.present #tblwrap { max-height: none; flex: 1; }
+
 body.present table { font-size: 15px; }
 body.present td, body.present th { padding: 10px 14px; }
 
 /* ---------------- Responsive ---------------- */
 
 @media (max-width: 900px) {
-  .app-body { grid-template-columns: 1fr; }
+  .app-body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
   .sidebar {
     position: static;
     height: auto;
@@ -982,4 +989,248 @@ body.present td, body.present th { padding: 10px 14px; }
   .sidebar-foot { display: none; }
   .main { padding: 14px; }
   td.msg .celltext { max-width: 220px; }
+}
+
+/* ---------- Fase 7B: contexto en el drawer ---------- */
+.drawer-ctx { margin-top: 14px; }
+#drawer-ctx-btn { align-self: flex-start; }
+#drawer-ctx {
+  font-family: Consolas, "SF Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 8px 0 0 0;
+  padding: 8px;
+  border-radius: 6px;
+}
+.ctx-line { display: flex; gap: 10px; }
+.ctx-no {
+  min-width: 5ch;
+  text-align: right;
+  opacity: .55;
+  user-select: none;
+}
+.ctx-line.cur { background: rgba(255, 213, 79, .18); border-radius: 3px; }
+
+/* ---------- Fase 7C: resaltado de terminos ---------- */
+mark {
+  background: rgba(250, 204, 21, .3);
+  color: inherit;
+  border-radius: 2px;
+}
+#drawer-raw mark { background: rgba(250, 204, 21, .3); }
+
+/* Fase 9B: Errores agrupados */
+#tpl-body { border-top: 1px solid var(--line-2); }
+#tpl-body table { width: 100%; border-collapse: collapse; font-size: 12px; }
+#tpl-body th, #tpl-body td { text-align: left; padding: 6px 10px; }
+#tpl-body th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+#tpl-body tbody tr { cursor: pointer; }
+#tpl-body tbody tr:hover td { background: var(--panel-2); }
+#tpl-body td.msg { max-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+/* Fase 9C: histograma temporal */
+.hist-wrap {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  margin-bottom: 16px;
+  padding: 8px 12px 12px;
+}
+.hist-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.seg-gran { display: inline-flex; gap: 4px; }
+.btn.tiny { padding: 2px 8px; font-size: 12px; border-radius: 6px; }
+.btn.tiny.on { border-color: var(--acc); color: var(--acc); }
+#hiscanvas { display: block; cursor: pointer; }
+body.present .hist-wrap { display: none; }
+
+/* Fase 10B: runbooks (errores conocidos) en el drawer */
+.drawer-rb { margin-top: 14px; }
+.rb-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.rb-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+.rb-pattern { display: block; margin-bottom: 4px; }
+.rb-kind {
+  float: right;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+.rb-ref { color: var(--muted); }
+.rb-actions { margin-top: 6px; display: flex; gap: 6px; }
+.rb-empty { color: var(--muted); font-size: 13px; }
+
+/* Fase 12A: analisis con LLM local */
+.drawer-an { margin-top: 14px; }
+.an-result {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono, monospace);
+  font-size: 13px;
+  line-height: 1.45;
+  background: var(--panel2, rgba(0, 0, 0, .15));
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-top: 8px;
+}
+/* Avisos de version sin la funcion (llm/splunk false): lenguaje humano,
+   visibles siempre que la seccion lo sea (drawer / sidebar) */
+.env-note {
+  margin-top: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+  line-height: 1.45;
+  background: var(--warn-soft);
+  border-left: 3px solid var(--warn);
+  border-radius: 6px;
+}
+.env-note p { margin: 0 0 6px; }
+.env-note p:last-child { margin-bottom: 0; }
+
+/* Editor de runbooks (modal) */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, .45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+}
+.modal-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  width: min(520px, 92vw);
+  max-height: 90vh;
+  overflow-y: auto;
+  padding: 14px 16px;
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.modal-panel label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.llm-hint {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 0 10px;
+  line-height: 1.4;
+}
+.help-body h3 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin: 12px 0 2px;
+}
+.help-body p {
+  font-size: 13px;
+  line-height: 1.45;
+  margin: 0 0 8px;
+}
+.modal-panel input,
+.modal-panel select {
+  display: block;
+  width: 100%;
+  margin-top: 2px;
+  padding: 4px 6px;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.modal-actions { display: flex; gap: 8px; margin-top: 10px; }
+
+/* ---------- Fase 12C: diagnostico rapido ---------- */
+#diag-status {
+  white-space: pre-wrap;
+  margin: 0 0 10px;
+  min-height: 1em;
+}
+.diag-conclusion {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  margin: 0 0 12px;
+}
+.diag-h { font-size: 13px; margin: 0 0 6px; }
+.diag-top { list-style: none; margin: 0; padding: 0; }
+.diag-top li {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+}
+.diag-count { font-weight: 600; margin-right: 6px; }
+.diag-tpl {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.diag-ex {
+  font-size: 12px;
+  color: var(--mut);
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin-top: 4px;
+}
+
+/* Fase 13: Importar de Splunk (sidebar) */
+.splunk-wrap { margin-top: 10px; }
+.splunk-wrap .side-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--mut);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+#splunk-spl {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: Consolas, "Cascadia Code", monospace;
+  font-size: 12px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--ink);
+  resize: vertical;
+}
+#splunk-go { margin-top: 6px; width: 100%; justify-content: center; }
+#splunk-status {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  min-height: 12px;
 }

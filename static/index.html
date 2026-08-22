@@ -4,12 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Visor de Logs Unificado</title>
-<link rel="stylesheet" href="/static/styles.css?v=2">
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="stylesheet" href="/static/styles.css?v=10">
 </head>
 <body>
 
 <!-- Sprite de iconos SVG (set reducido, sin dependencias de red) -->
-<svg hidden xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+<svg hidden class="hidden" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
   <symbol id="i-upload" viewBox="0 0 16 16">
     <path d="M8 11V3.5M8 3.5 5.5 6M8 3.5 10.5 6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
     <path d="M2.5 10.5v2a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
@@ -37,6 +38,14 @@
   </symbol>
   <symbol id="i-moon" viewBox="0 0 16 16">
     <path d="M13.5 9.5A6 6 0 0 1 6.5 2.5 6 6 0 1 0 13.5 9.5Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-gear" viewBox="0 0 16 16">
+    <rect x="3" y="6" width="10" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <path d="M5 6V4.5a3 3 0 0 1 6 0V6" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <circle cx="5.5" cy="9" r="0.9" fill="currentColor"/>
+    <circle cx="10.5" cy="9" r="0.9" fill="currentColor"/>
+    <path d="M8 11.2v1.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+    <path d="M5.5 3.2V2M10.5 3.2V2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
   </symbol>
   <symbol id="i-inbox" viewBox="0 0 16 16">
     <path d="M2 9.5 4 4h8l2 5.5v4a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-4Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
@@ -78,6 +87,11 @@
   <symbol id="i-chevron" viewBox="0 0 16 16">
     <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
   </symbol>
+  <symbol id="i-help" viewBox="0 0 16 16">
+    <circle cx="8" cy="8" r="6.6" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <path d="M6.2 6.4c.1-1 1-1.7 2-1.6 1 .1 1.7.8 1.7 1.7 0 1.2-1.1 1.5-1.7 2-.3.3-.5.6-.4 1.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+    <path d="M7.8 11.9h.01" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+  </symbol>
 </svg>
 
 <header class="app-header">
@@ -85,7 +99,7 @@
     <img src="/static/logo.svg" alt="" class="logo">
     <div class="brand-text">
       <span class="brand-name">Visor de Logs</span>
-      <span class="brand-sub">Unificado</span>
+      <span class="brand-sub">Unificado · v1.2</span>
     </div>
   </div>
   <div class="header-right">
@@ -95,6 +109,14 @@
     </span>
     <button id="btn-theme" class="icon-btn" title="Cambiar tema" aria-label="Cambiar tema">
       <svg class="icon" id="theme-icon"><use href="#i-moon"></use></svg>
+    </button>
+    <button id="btn-llm-settings" class="icon-btn" title="Ajustes del LLM local"
+            aria-label="Ajustes del LLM local">
+      <svg class="icon"><use href="#i-gear"></use></svg>
+    </button>
+    <button id="btn-help" class="icon-btn" title="Guia de uso"
+            aria-label="Abrir guia de uso">
+      <svg class="icon"><use href="#i-help"></use></svg>
     </button>
   </div>
 </header>
@@ -115,11 +137,30 @@
         <svg class="icon"><use href="#i-download"></use></svg>
         <span>Exportar CSV</span>
       </button>
+      <button id="act-diagnose" class="side-btn hidden" disabled
+              title="Resumen con el LLM local de todas las lineas de error">
+        <svg class="icon"><use href="#i-alert"></use></svg>
+        <span>Diagnostico rapido</span>
+      </button>
       <button id="act-clear" class="side-btn" disabled>
         <svg class="icon"><use href="#i-trash"></use></svg>
         <span>Limpiar</span>
       </button>
     </nav>
+
+    <!-- Fase 13: ingesta desde Splunk local. Con splunk:false se muestra
+         el aviso del operador (sin caja SPL); con splunk:true, la caja -->
+    <div id="splunk-wrap" class="splunk-wrap hidden">
+      <div class="side-label">Importar de Splunk</div>
+      <div id="splunk-local-note" class="env-note hidden">
+        La conexión a Splunk la configura el operador del servidor. En
+        esta versión no hay Splunk conectado.
+      </div>
+      <textarea id="splunk-spl" rows="3" spellcheck="false"
+                placeholder="search index=botsv3 | head 10"></textarea>
+      <button id="splunk-go" class="btn">Buscar y cargar</button>
+      <span id="splunk-status" class="muted" role="status"></span>
+    </div>
 
     <div id="filecard" class="filecard hidden">
       <div class="filecard-label">Archivo activo</div>
@@ -154,7 +195,7 @@
     </div>
 
     <div class="sidebar-foot">
-      <span class="muted">v1.1</span>
+      <span class="muted">v1.2 · SSRF secure</span>
     </div>
   </aside>
 
@@ -207,13 +248,47 @@
           <div class="fgroup">
             <span class="fgroup-label">Fecha / Texto</span>
             <input id="fdt" placeholder="Fecha/hora (11:07:24, 2026-05-11)" autocomplete="off">
+            <input id="fdfrom" placeholder="Desde (ISO, p. ej. 2023-10-10T10:00)" autocomplete="off">
+            <input id="fdto" placeholder="Hasta (ISO, p. ej. 2023-10-10T10:59)" autocomplete="off">
             <input id="fq" placeholder="Texto libre" autocomplete="off">
+            <input id="ftpl" placeholder="Plantilla (exacta, desde Errores agrupados)" autocomplete="off">
           </div>
           <button id="filters-reset" class="btn ghost">Limpiar filtros</button>
         </div>
       </div>
 
       <div class="seg-grid" id="seg"></div>
+
+      <!-- Fase 9B: Errores agrupados por plantilla -->
+      <div class="filters-panel" id="tplwrap">
+        <button class="filters-toggle" id="tpl-toggle" aria-expanded="false" aria-controls="tpl-body">
+          <svg class="icon"><use href="#i-layers"></use></svg>
+          <span>Errores agrupados</span>
+          <span id="tpl-count" class="filters-count hidden"></span>
+          <svg class="icon chev" aria-hidden="true"><use href="#i-chevron"></use></svg>
+        </button>
+        <div id="tpl-body" class="hidden">
+          <table>
+            <thead><tr>
+              <th>Veces</th><th>Plantilla</th><th>Primera vez</th>
+              <th>Ultima vez</th><th>Ejemplo</th>
+            </tr></thead>
+            <tbody id="tpl-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Fase 9C: histograma temporal sobre la tabla -->
+      <div class="hist-wrap" id="histwrap">
+        <div class="hist-head">
+          <span class="fgroup-label">Histograma (filas filtradas)</span>
+          <span class="seg-gran" role="group" aria-label="Granularidad">
+            <button id="gran-min" class="btn tiny on">min</button>
+            <button id="gran-hour" class="btn tiny">hora</button>
+          </span>
+        </div>
+        <canvas id="hiscanvas" height="90"></canvas>
+      </div>
 
       <div class="table-panel">
         <div class="table-head">
@@ -273,14 +348,192 @@
       </div>
       <pre id="drawer-raw"></pre>
     </div>
+    <div class="drawer-ctx">
+      <button id="drawer-ctx-btn" class="btn ghost hidden"
+              aria-label="Ver contexto de la linea en el log original">
+        Ver contexto
+      </button>
+      <pre id="drawer-ctx" hidden></pre>
+    </div>
+    <!-- Fase 10B: runbooks (errores conocidos) -->
+    <div class="drawer-rb">
+      <div class="rb-head">
+        <span id="rb-count" class="fgroup-label">Errores conocidos</span>
+        <button id="rb-new-btn" class="btn ghost"
+                aria-label="Crear runbook desde esta linea">
+          Nuevo runbook desde esta línea
+        </button>
+      </div>
+      <div id="rb-list"></div>
+    </div>
+    <!-- Fase 12A: analisis con LLM local (boton solo si /api/config dice
+         llm:true; con llm:false se muestra el aviso de funcion SOLO local) -->
+    <div class="drawer-an" id="anwrap" hidden>
+      <div class="rb-head">
+        <span class="fgroup-label">Analizar con LLM local</span>
+        <button id="an-btn" class="btn ghost" aria-label="Enviar esta
+                linea al LLM local">Analizar esta línea</button>
+      </div>
+      <!-- Aviso de version sin LLM local (llm:false): visible siempre en
+           el drawer; el enlace solo si /api/config da repo_url -->
+      <div id="an-local-note" class="env-note" hidden>
+        <p>El análisis con LLM es una función SOLO local: no envía ningún
+           dato a internet y requiere un modelo que corra en tu máquina.
+           En esta versión web no está disponible.</p>
+        <p id="an-repo-line" class="hidden">Descarga la versión local
+           desde el repositorio:
+           <a id="an-repo-link" target="_blank" rel="noopener"></a></p>
+      </div>
+      <pre id="an-result" class="an-result" hidden></pre>
+    </div>
   </div>
 </aside>
+
+<!-- Fase 10B: editor de runbooks -->
+<div id="rb-modal" class="modal-backdrop hidden">
+  <div class="modal-panel" role="dialog" aria-label="Editor de runbook">
+    <div class="modal-head">
+      <h2 id="rb-modal-title">Nuevo runbook</h2>
+      <button id="rb-modal-close" class="icon-btn" aria-label="Cerrar editor">
+        <svg class="icon"><use href="#i-x"></use></svg>
+      </button>
+    </div>
+    <label>Patrón
+      <input id="rbf-pattern" autocomplete="off"></label>
+    <label>Tipo
+      <select id="rbf-kind">
+        <option value="regex">regex</option>
+        <option value="glob">glob</option>
+      </select></label>
+    <label>Explicación
+      <input id="rbf-explicacion" autocomplete="off"></label>
+    <label>Causa probable
+      <input id="rbf-causa" autocomplete="off"></label>
+    <label>Solución
+      <input id="rbf-solucion" autocomplete="off"></label>
+    <label>Referencia interna
+      <input id="rbf-ref" autocomplete="off"></label>
+    <div class="modal-actions">
+      <button id="rb-save" class="btn">Guardar</button>
+      <button id="rb-cancel" class="btn ghost">Cancelar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Ajustes del LLM local (config editable desde la UI) -->
+<div id="llm-modal" class="modal-backdrop hidden">
+  <div class="modal-panel" role="dialog" aria-label="Ajustes del LLM local">
+    <div class="modal-head">
+      <h2>Ajustes del LLM local</h2>
+      <button id="llm-modal-close" class="icon-btn" aria-label="Cerrar ajustes">
+        <svg class="icon"><use href="#i-x"></use></svg>
+      </button>
+    </div>
+    <p class="llm-hint">URL del servidor local (LM Studio, Ollama o
+      llama.cpp). El botón "Analizar" aparece solo si hay URL.</p>
+    <label>URL del LLM (base, p. ej. http://127.0.0.1:8081/v1)
+      <input id="llmf-url" type="text" autocomplete="off"
+             placeholder="http://127.0.0.1:8081/v1"></label>
+    <label>Modelo
+      <input id="llmf-model" type="text" autocomplete="off"
+             placeholder="local"></label>
+    <label>Timeout (segundos, >= 1)
+      <input id="llmf-timeout" type="number" min="1" value="45"></label>
+    <label>Idioma de la respuesta
+      <select id="llmf-lang">
+        <option value="auto">Auto (idioma de la linea)</option>
+        <option value="es">Espanol</option>
+        <option value="en">Ingles</option>
+      </select></label>
+    <div class="modal-actions">
+      <button id="llm-save" class="btn">Guardar</button>
+      <button id="llm-cancel" class="btn ghost">Cancelar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Diagnostico rapido (Fase 12C) -->
+<div id="diag-modal" class="modal-backdrop hidden">
+  <div class="modal-panel" role="dialog" aria-label="Diagnostico rapido">
+    <div class="modal-head">
+      <h2>Diagnostico rapido</h2>
+      <button id="diag-close" class="icon-btn" aria-label="Cerrar diagnostico">
+        <svg class="icon"><use href="#i-x"></use></svg>
+      </button>
+    </div>
+    <p id="diag-status" role="status" class="muted">&nbsp;</p>
+    <pre id="diag-conclusion" class="diag-conclusion hidden"></pre>
+    <h3 class="diag-h">Plantillas mas frecuentes</h3>
+    <ol id="diag-top" class="diag-top hidden"></ol>
+  </div>
+</div>
+
+<!-- Guia de uso -->
+<div id="help-modal" class="modal-backdrop hidden">
+  <div class="modal-panel" role="dialog" aria-label="Guia de uso">
+    <div class="modal-head">
+      <h2>Guia de uso</h2>
+      <button id="help-close" class="icon-btn" aria-label="Cerrar ayuda">
+        <svg class="icon"><use href="#i-x"></use></svg>
+      </button>
+    </div>
+    <div class="help-body">
+      <h3>Cargar un log</h3>
+      <p>Usa el boton "Cargar archivo" de la barra lateral para subir uno o
+        varios archivos (acepta .gz, .bz2, .xz y .zip). Cada archivo es una
+        sesion; la activa se cambia en la lista "Sesiones".</p>
+      <h3>Filtrar</h3>
+      <p>La barra de filtros sobre la tabla combina IP, ruta, texto libre,
+        nivel, codigo y rango de fechas. Con coma pones varios valores
+        (OR) y con prefijo "!" excluyes (p. ej. !10.0.0.5). La tecla "/"
+        lleva el foco al texto libre.</p>
+      <h3>Ver contexto de una linea</h3>
+      <p>Clic en cualquier fila abre el drawer de detalle; el boton "Ver
+        contexto" muestra las lineas anteriores y posteriores del archivo
+        original con la actual resaltada.</p>
+      <h3>Tail en vivo</h3>
+      <p>El boton "Tail en vivo" (o la tecla t) sigue las lineas nuevas:
+        el indicador LIVE parpadea mientras entran datos y la tabla se
+        actualiza sola. Vuelve a pulsarlo para apagarlo.</p>
+      <h3>Exportar</h3>
+      <p>El boton "Exportar" (o la tecla e) descarga las filas filtradas en
+        CSV o JSON Lines, sin pasar por el navegador entero: el servidor
+        lo envia en streaming.</p>
+      <h3>Analizar con LLM local</h3>
+      <p>Si hay un LLM local configurado, al abrir una fila aparece la
+        seccion "Analizar con LLM local" en el drawer. El boton "Analizar"
+        envia SOLO esa linea al modelo local (nada sale de la maquina) y
+        muestra la respuesta tal cual; si repites la misma pregunta sale
+        de cache, marcada con [cache]. El idioma en que responde se elige
+        en los ajustes del LLM (engranaje de la cabecera): "Auto" responde
+        en el idioma de la linea, o bien Espanol / Ingles fijo.</p>
+      <h3>Diagnostico rapido</h3>
+      <p>El boton "Diagnostico rapido" (icono de alerta en la barra
+        lateral) manda las plantillas unicas de error del dataset activo
+        (no las miles de lineas sueltas) al LLM local y devuelve una
+        conclusion con las plantillas mas frecuentes y su linea de ejemplo.
+        Sirve para ver el bosque en vez de 204 errores sueltos: el LLM te
+        da pistas de que esta pasando en el sistema y por donde empezar.
+        La primera vez tarda (el modelo razona); las siguientes salen de
+        cache al instante. Requiere LLM configurado.</p>
+      <h3>Importar de Splunk</h3>
+      <p>Si Splunk esta configurado, la seccion "Importar de Splunk" deja
+        pegar una query SPL y cargar su resultado como un dataset mas del
+        visor (filtrar, exportar y diagnosticar igual que un archivo). El
+        SPL es quien filtra y agrega; el visor solo trae lo que pidas
+        (tope de filas para no saturar). Para eventos JSON de Azure AD
+        (sourcetype ms:aad:signin) recuerda usar <code>| spath</code> para
+        extraer los campos (userPrincipalName, ipAddress, failureReason)
+        que van dentro del campo _raw.</p>
+    </div>
+  </div>
+</div>
 
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
 <input type="file" id="file" hidden>
 
-<script src="/static/vendor/chart.min.js?v=2"></script>
-<script src="/static/app.js?v=2"></script>
+<script src="/static/vendor/chart.min.js?v=4"></script>
+<script src="/static/app.js?v=13"></script>
 </body>
 </html>

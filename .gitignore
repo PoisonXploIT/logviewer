@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+p10_ui.log
+*.log

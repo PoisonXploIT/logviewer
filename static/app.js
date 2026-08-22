@@ -33,6 +33,67 @@ const api = {
       body: JSON.stringify({ name }),
     }).then((r) => r.json()),
   rows: (params) => fetch("/api/rows?" + new URLSearchParams(params)).then((r) => r.json()),
+  templates: (name, min, level) =>
+    fetch("/api/templates?name=" + encodeURIComponent(name) +
+      "&min=" + (min || 1)
+      + (level ? "&level=" + encodeURIComponent(level) : ""))
+      .then((r) => r.json()),
+  histogram: (name, gran) =>
+    fetch("/api/histogram?name=" + encodeURIComponent(name) +
+      "&gran=" + (gran || "min"))
+      .then((r) => r.json()),
+  context: (params) =>
+    fetch("/api/context?" + new URLSearchParams(params)).then((r) => r.json()),
+  // Fase 10B: runbooks (errores conocidos)
+  runbookMatch: (msg) =>
+    fetch("/api/runbooks/match?msg=" + encodeURIComponent(msg || ""))
+      .then((r) => r.json()),
+  runbookCreate: (body) =>
+    fetch("/api/runbooks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify(body),
+    }).then((r) => r.json()),
+  runbookUpdate: (id, body) =>
+    fetch("/api/runbooks?id=" + id, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify(body),
+    }).then((r) => r.json()),
+  runbookRemove: (id) =>
+    fetch("/api/runbooks?id=" + id, {
+      method: "DELETE",
+      headers: csrfHeaders(),
+    }).then((r) => r.json()),
+  // Fase 12A: LLM local
+  config: () => fetch("/api/config").then((r) => r.json()),
+  settings: () => fetch("/api/settings").then((r) => r.json()),
+  settingsSave: (data) =>
+    fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify(data),
+    }).then((r) => r.json()),
+  analyze: (line) =>
+    fetch("/api/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify({ line }),
+    }).then((r) => r.json()),
+  // Fase 12C: diagnostico rapido (LLM local resume las plantillas de error)
+  diagnose: (name, level) =>
+    fetch("/api/diagnose", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify({ name, level }),
+    }).then((r) => r.json()),
+  // Fase 13: ingesta desde Splunk local
+  splunkSearch: (search, name, count) =>
+    fetch("/api/splunk/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify({ search, name, count }),
+    }).then((r) => r.json()),
   top: (field, limit, name) =>
     fetch("/api/top?field=" + field + "&limit=" + limit +
       (name ? "&name=" + encodeURIComponent(name) : ""))
@@ -131,6 +192,8 @@ const ui = {
 
 /* ---------- estado de la app ---------- */
 const app = {
+  llmEnabled: false, // Fase 12A: lo pone /api/config al arrancar
+  repoUrl: "",      // URL publica del repo (avisos de funciones SOLO local)
   fmt: "",
   name: "",
   size: 0,
@@ -139,6 +202,9 @@ const app = {
   pageSize: 500,
   pageRows: [],
   filteredTotal: 0,
+  templates: [],
+  gran: "min",
+  hist: [],
   top: {},
   sessions: [],
   active: "",
@@ -157,10 +223,14 @@ function extOf(name) {
 
 /* ---------- filters ---------- */
 const filters = {
-  state: { level: "", code: "", ip: "", path: "", q: "", dt: "" },
+  state: { level: "", code: "", ip: "", path: "", q: "", dt: "",
+           tpl: "", dtFrom: "", dtTo: "" },
   params() {
     const p = {};
     for (const [k, v] of Object.entries(this.state)) if (v) p[k] = v;
+    // Los rangos viajan con nombre de servidor
+    if (p.dtFrom) { p.dt_from = p.dtFrom; delete p.dtFrom; }
+    if (p.dtTo) { p.dt_to = p.dtTo; delete p.dtTo; }
     return p;
   },
   activeCount() {
@@ -171,9 +241,13 @@ const filters = {
     document.getElementById("fpath").value = this.state.path;
     document.getElementById("fq").value = this.state.q;
     document.getElementById("fdt").value = this.state.dt;
+    document.getElementById("ftpl").value = this.state.tpl;
+    document.getElementById("fdfrom").value = this.state.dtFrom;
+    document.getElementById("fdto").value = this.state.dtTo;
   },
   reset() {
-    this.state = { level: "", code: "", ip: "", path: "", q: "", dt: "" };
+    this.state = { level: "", code: "", ip: "", path: "", q: "", dt: "",
+                   tpl: "", dtFrom: "", dtTo: "" };
     this.syncInputs();
     this.paintChips();
   },
@@ -544,6 +618,35 @@ function copyBtn(i, col) {
     '<svg class="icon"><use href="#i-copy"></use></svg></button>';
 }
 
+/* ---------- Fase 7C: resaltado seguro de terminos ---------- */
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function hlTerms() {
+  const p = filters.params();
+  return [p.q, p.ip, p.path].filter((t) => t && String(t).trim());
+}
+
+// Escapa el texto y envuelve las coincidencias de los filtros activos
+// (q/ip/path) en <mark>. El resaltado se hace sobre el texto original y
+// cada trozo se escapa por separado: un "<script>" del log no se inyecta.
+function hlText(s) {
+  s = s == null ? "" : String(s);
+  const terms = hlTerms().map(escapeRe);
+  if (!terms.length) return ui.esc(s);
+  const re = new RegExp("(" + terms.join("|") + ")", "gi");
+  const parts = s.split(re);
+  let out = "";
+  for (let i = 0; i < parts.length; i++) {
+    if (!parts[i]) continue;
+    out += (i % 2 === 1)
+      ? "<mark>" + ui.esc(parts[i]) + "</mark>"
+      : ui.esc(parts[i]);
+  }
+  return out;
+}
+
 function rowHtml(r, i, cols) {
   return "<tr data-idx=\"" + i + "\">" + cols.map((c) => {
     if (c === "code" && r.code)
@@ -553,10 +656,11 @@ function rowHtml(r, i, cols) {
       return '<td><span class="badge lv-' + ui.esc(r.level) + '">' +
         ui.esc(r.level) + "</span>" + copyBtn(i, "level") + "</td>";
     if (c === "msg")
-      return '<td class="msg"><span class="celltext">' + ui.esc(r.msg) +
+      return '<td class="msg"><span class="celltext">' + hlText(r.msg) +
         "</span>" + copyBtn(i, "msg") + "</td>";
     const cls = MONO_COLS.includes(c) ? "lbl" : "";
-    return '<td class="' + cls + '">' + ui.esc(r[c] || "") + copyBtn(i, c) + "</td>";
+    return '<td class="' + cls + '">' + hlText(r[c] || "") + copyBtn(i, c) +
+      "</td>";
   }).join("") + "</tr>";
 }
 
@@ -587,13 +691,149 @@ async function renderRows(opts) {
     document.getElementById("tbody").innerHTML =
       res.rows.map((r, i) => rowHtml(r, i, cols)).join("");
     const pages = Math.max(1, Math.ceil(res.total / res.size));
+    document.getElementById("count").textContent =
+      ui.fmtNum(res.total) + " filas";
     document.getElementById("pageinfo").textContent =
       ui.fmtNum(res.total) + " filas - página " + res.page + " de " + ui.fmtNum(pages);
     document.getElementById("prev").disabled = res.page <= 1;
     document.getElementById("next").disabled = res.page >= pages;
+    renderHistogram();
   } catch (e) {
     document.getElementById("count").textContent = "Error: " + e.message;
   }
+}
+
+function ctxLineHtml(no, text, cur) {
+  return '<div class="ctx-line' + (cur ? " cur" : "") + '">'
+    + '<span class="ctx-no">' + no + "</span><span>"
+    + hlText(text) + "</span></div>";
+}
+
+/* ---------- Fase 9B: Errores agrupados por plantilla ---------- */
+async function renderTemplates() {
+  if (!app.active) return;
+  try {
+    const res = await api.templates(app.active);
+    app.templates = res.templates || [];
+  } catch (e) {
+    app.templates = [];
+  }
+  const badge = document.getElementById("tpl-count");
+  if (!badge) return;
+  badge.textContent = ui.fmtNum(app.templates.length) + " plantillas";
+  badge.classList.remove("hidden");
+  if (!document.getElementById("tpl-body").classList.contains("hidden")) {
+    paintTemplates();
+  }
+}
+
+function tplCell(t, max) {
+  const s = t || "";
+  return '<span class="celltext">' + ui.esc(s.length > max ? s.slice(0, max) : s) +
+    (s.length > max ? "&hellip;" : "") + "</span>";
+}
+
+function paintTemplates() {
+  const tb = document.getElementById("tpl-tbody");
+  if (!tb) return;
+  tb.innerHTML = app.templates.map((t, i) =>
+    '<tr class="tpl-row" data-i="' + i + '" title="' + ui.esc(t.template) + '">'
+    + "<td>" + ui.fmtNum(t.count) + "</td>"
+    + '<td class="msg">' + tplCell(t.template, 120) + "</td>"
+    + '<td class="lbl">' + ui.esc(t.first || "") + "</td>"
+    + '<td class="lbl">' + ui.esc(t.last || "") + "</td>"
+    + '<td class="msg">' + tplCell(t.example, 120) + "</td>"
+    + "</tr>").join("");
+  tb.querySelectorAll(".tpl-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      const t = app.templates[parseInt(row.dataset.i, 10)];
+      if (!t) return;
+      filters.state.tpl = t.template;
+      filters.syncInputs();
+      filters.paintChips();
+      app.page = 1;
+      renderRows();
+    });
+  });
+}
+
+/* ---------- Fase 9C: histograma temporal ---------- */
+async function renderHistogram() {
+  if (!app.active) return;
+  try {
+    const res = await api.histogram(app.active, app.gran);
+    app.hist = res.buckets || [];
+  } catch (e) {
+    app.hist = [];
+  }
+  drawHistogram();
+}
+
+function drawHistogram() {
+  const cv = document.getElementById("hiscanvas");
+  if (!cv) return;
+  const W = Math.max(300, cv.parentElement.clientWidth - 2);
+  const H = 90;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = W * dpr; cv.height = H * dpr;
+  cv.style.width = W + "px"; cv.style.height = H + "px";
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const buckets = app.hist || [];
+  if (!buckets.length) {
+    ctx.fillStyle = getComputedStyle(document.body)
+      .getPropertyValue("--muted") || "#888";
+    ctx.font = "12px sans-serif";
+    ctx.fillText("Sin datos con fecha", 10, H / 2);
+    return;
+  }
+  const max = Math.max(...buckets.map((b) => b.count));
+  const bw = W / buckets.length;
+  ctx.fillStyle = getComputedStyle(document.body)
+    .getPropertyValue("--acc") || "#4f8cff";
+  ctx.globalAlpha = 0.9;
+  buckets.forEach((b, i) => {
+    const h = Math.max(2, (b.count / max) * (H - 8));
+    ctx.fillRect(i * bw + 1, H - h, Math.max(1, bw - 2), h);
+  });
+  ctx.globalAlpha = 1;
+}
+
+function setGran(g) {
+  app.gran = g;
+  document.getElementById("gran-min")
+    .classList.toggle("on", g === "min");
+  document.getElementById("gran-hour")
+    .classList.toggle("on", g === "h");
+  renderHistogram();
+}
+
+// Convierte el inicio de un bucket en su rango cerrado [from, to].
+// El to es el ultimo segundo del bucket para que barras adyacentas
+// no se solapen (el filtro dt_to es inclusivo).
+function histRange(t) {
+  if (!t.match(/^(\d{4}-\d{2}-\d{2})T\d{2}(?::\d{2})?$/)) return null;
+  // Ultimo segundo del bucket (min: HH:MM:59; hora: HH:59:59)
+  const to = t.length === 16 ? t + ":59" : t + ":59:59";
+  return { from: t, to };
+}
+
+function histClick(e) {
+  const cv = e.currentTarget;
+  const n = app.hist.length;
+  if (!n) return;
+  const rect = cv.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const bw = rect.width / n;
+  const i = Math.min(n - 1, Math.max(0, Math.floor(x / bw)));
+  const r = histRange(app.hist[i].t);
+  if (!r) return;
+  filters.state.dtFrom = r.from;
+  filters.state.dtTo = r.to;
+  filters.syncInputs();
+  app.page = 1;
+  renderRows();
 }
 
 /* ---------- drawer ---------- */
@@ -613,7 +853,12 @@ const drawer = {
         .map(([k, label]) =>
           "<tr><th>" + label + "</th><td>" + ui.esc(row[k]) + "</td></tr>")
         .join("");
-    document.getElementById("drawer-raw").textContent = row.raw || "";
+    // Fase 7C: raw con escape + resaltado de los terminos activos
+    document.getElementById("drawer-raw").innerHTML = hlText(row.raw || "");
+    this._setCtxAvailability(row);
+    renderDrawerRunbooks(row); // Fase 10B: errores conocidos
+    this.anRow = row;          // Fase 12A: fila que mandara "Analizar"
+    this._resetAnalyze();     // limpiar el resultado anterior
     const el = document.getElementById("drawer");
     el.classList.add("open");
     el.setAttribute("aria-hidden", "false");
@@ -625,7 +870,361 @@ const drawer = {
     el.setAttribute("aria-hidden", "true");
     document.getElementById("drawer-backdrop").classList.add("hidden");
   },
+  _setCtxAvailability(row) {
+    // Fase 7B: solo se ofrece contexto si la fila expone su rowid
+    // (Fase 13: un dataset de Splunk no tiene archivo original)
+    const btn = document.getElementById("drawer-ctx-btn");
+    const pre = document.getElementById("drawer-ctx");
+    if (app.fmt !== "splunk" &&
+        row && row.rowid !== undefined && row.rowid >= 0) {
+      this.ctxRow = row;
+      btn.classList.remove("hidden");
+    } else {
+      this.ctxRow = null;
+      btn.classList.add("hidden");
+    }
+    pre.hidden = true;
+  },
+  _resetAnalyze() {
+    // Fase 12A: la seccion LLM del drawer. Con llm:true, boton Analizar;
+    // con llm:false, aviso de funcion SOLO local (visible siempre)
+    const wrap = document.getElementById("anwrap");
+    const res = document.getElementById("an-result");
+    wrap.hidden = false;
+    applyAnLocalNote();
+    res.hidden = true;
+    res.textContent = "";
+  },
 };
+
+async function showDrawerContext() {
+  const btn = document.getElementById("drawer-ctx-btn");
+  const pre = document.getElementById("drawer-ctx");
+  if (!drawer.ctxRow) return;
+  btn.disabled = true;
+  pre.textContent = "Cargando contexto...";
+  pre.hidden = false;
+  try {
+    const res = await api.context({
+      name: app.active,
+      row: drawer.ctxRow.rowid,
+      n: 5,
+    });
+    let no = res.line - res.before.length;
+    let html = "";
+    for (const t of res.before) html += ctxLineHtml(no++, t, false);
+    html += ctxLineHtml(no++, res.current, true);
+    for (const t of res.after) html += ctxLineHtml(no++, t, false);
+    pre.innerHTML = html;
+  } catch (e) {
+    pre.textContent = "Error: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------- Fase 10B: runbooks (errores conocidos) ---------- */
+let rbModalId = null; // id del runbook en edicion; null = alta nueva
+
+function rbCardHtml(rb) {
+  const bits = [];
+  if (rb.explicacion) bits.push(
+    "<div><b>Que es:</b> " + ui.esc(rb.explicacion) + "</div>");
+  if (rb.causa) bits.push(
+    "<div><b>Causa probable:</b> " + ui.esc(rb.causa) + "</div>");
+  if (rb.solucion) bits.push(
+    "<div><b>Solucion:</b> " + ui.esc(rb.solucion) + "</div>");
+  if (rb.ref) bits.push(
+    '<div class="rb-ref"><b>Referencia interna:</b> ' +
+    ui.esc(rb.ref) + "</div>");
+  return '<div class="rb-card" data-id="' + rb.id + '">' +
+    '<code class="rb-pattern">' + ui.esc(rb.pattern) + "</code>" +
+    '<span class="rb-kind">' + ui.esc(rb.kind) + "</span>" +
+    bits.join("") +
+    '<div class="rb-actions">' +
+    '<button class="btn tiny rb-edit" data-id="' + rb.id + '">Editar</button> ' +
+    '<button class="btn tiny ghost rb-del" data-id="' + rb.id +
+    '">Borrar</button>' +
+    "</div></div>";
+}
+
+async function renderDrawerRunbooks(row) {
+  const list = document.getElementById("rb-list");
+  const count = document.getElementById("rb-count");
+  if (!row) { drawer.rbRow = null; list.innerHTML = ""; return; }
+  drawer.rbRow = row;
+  count.textContent = "Errores conocidos: cargando...";
+  list.innerHTML = "";
+  try {
+    const res = await api.runbookMatch(row.msg || "");
+    if (res.error) throw new Error(res.error);
+    const ms = res.matches || [];
+    drawer.rbMatches = ms;
+    count.textContent = "Errores conocidos: " + ms.length;
+    list.innerHTML = ms.map(rbCardHtml).join("") ||
+      '<p class="rb-empty">Sin errores conocidos para esta línea.</p>';
+  } catch (e) {
+    count.textContent = "Errores conocidos";
+    list.innerHTML = '<p class="rb-empty">Error: ' + ui.esc(e.message) +
+      "</p>";
+  }
+}
+
+function openRbModal(rb, presetPattern) {
+  const setVal = (id, v) => {
+    document.getElementById(id).value = v || "";
+  };
+  if (rb) {
+    rbModalId = rb.id;
+    document.getElementById("rb-modal-title").textContent =
+      "Editar runbook";
+    setVal("rbf-pattern", rb.pattern);
+    setVal("rbf-kind", rb.kind);
+    setVal("rbf-explicacion", rb.explicacion);
+    setVal("rbf-causa", rb.causa);
+    setVal("rbf-solucion", rb.solucion);
+    setVal("rbf-ref", rb.ref);
+  } else {
+    rbModalId = null;
+    document.getElementById("rb-modal-title").textContent =
+      "Nuevo runbook";
+    // Alta desde la linea: patron prellenado con la plantilla (glob)
+    setVal("rbf-pattern", presetPattern || "");
+    setVal("rbf-kind", presetPattern ? "glob" : "regex");
+    setVal("rbf-explicacion", "");
+    setVal("rbf-causa", "");
+    setVal("rbf-solucion", "");
+    setVal("rbf-ref", "");
+  }
+  document.getElementById("rb-modal").classList.remove("hidden");
+}
+
+function closeRbModal() {
+  document.getElementById("rb-modal").classList.add("hidden");
+}
+
+async function saveRbModal() {
+  const body = {
+    pattern: document.getElementById("rbf-pattern").value.trim(),
+    kind: document.getElementById("rbf-kind").value,
+    explicacion: document.getElementById("rbf-explicacion").value.trim(),
+    causa: document.getElementById("rbf-causa").value.trim(),
+    solucion: document.getElementById("rbf-solucion").value.trim(),
+    ref: document.getElementById("rbf-ref").value.trim(),
+  };
+  if (!body.pattern) { ui.toast("Falta el patron"); return; }
+  const btn = document.getElementById("rb-save");
+  btn.disabled = true;
+  try {
+    const res = rbModalId
+      ? await api.runbookUpdate(rbModalId, body)
+      : await api.runbookCreate(body);
+    if (res && res.error) throw new Error(res.error);
+    closeRbModal();
+    ui.toast("Runbook guardado");
+    renderDrawerRunbooks(drawer.rbRow);
+  } catch (e) {
+    ui.toast("Error: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------- Ajustes del LLM local (config editable desde la UI) ---------- */
+async function openLlmModal() {
+  const setVal = (id, v) => {
+    document.getElementById(id).value = (v === undefined || v === null) ? "" : v;
+  };
+  try {
+    const s = await api.settings();
+    setVal("llmf-url", s.url || "");
+    setVal("llmf-model", s.model || "local");
+    setVal("llmf-timeout", s.timeout || 45);
+    setVal("llmf-lang", s.lang || "auto");
+  } catch (e) {
+    setVal("llmf-url", "");
+    setVal("llmf-model", "local");
+    setVal("llmf-timeout", 45);
+    setVal("llmf-lang", "auto");
+  }
+  document.getElementById("llm-modal").classList.remove("hidden");
+}
+
+function closeLlmModal() {
+  document.getElementById("llm-modal").classList.add("hidden");
+}
+
+async function saveLlmModal() {
+  const btn = document.getElementById("llm-save");
+  btn.disabled = true;
+  try {
+    const body = {
+      url: document.getElementById("llmf-url").value.trim(),
+      model: document.getElementById("llmf-model").value.trim(),
+      timeout: parseInt(document.getElementById("llmf-timeout").value, 10),
+      lang: document.getElementById("llmf-lang").value,
+    };
+    const res = await api.settingsSave(body);
+    if (res && res.error) throw new Error(res.error);
+    app.llmEnabled = !!res.llm;
+    setDiagnoseVisible(app.llmEnabled);
+    drawer._resetAnalyze();
+    closeLlmModal();
+    ui.toast("Ajustes del LLM guardados");
+  } catch (e) {
+    ui.toast("Error: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------- Fase 12A: analisis con LLM local ---------- */
+/* Fase 12A: aviso de version sin LLM local (llm:false) en el drawer.
+   Con llm:true, boton Analizar y sin aviso; con llm:false, aviso
+   legible de funcion SOLO local, siempre visible al abrir una fila,
+   con enlace a la version local si /api/config da repo_url. */
+function applyAnLocalNote() {
+  const note = document.getElementById("an-local-note");
+  const btn = document.getElementById("an-btn");
+  if (app.llmEnabled) {
+    note.hidden = true;
+    btn.hidden = false;
+  } else {
+    note.hidden = false;
+    btn.hidden = true;
+    const line = document.getElementById("an-repo-line");
+    const a = document.getElementById("an-repo-link");
+    if (app.repoUrl) {
+      a.href = app.repoUrl;
+      a.textContent = app.repoUrl;
+      line.classList.remove("hidden");
+    } else {
+      line.classList.add("hidden");
+    }
+  }
+}
+
+async function runAnalyze() {
+  const btn = document.getElementById("an-btn");
+  const res = document.getElementById("an-result");
+  if (!drawer.anRow) return;
+  btn.disabled = true;
+  res.hidden = false;
+  res.textContent = "Preguntando al LLM local...";
+  try {
+    const r = await api.analyze(drawer.anRow.raw || "");
+    if (r.error) throw new Error(r.error);
+    res.textContent = (r.cached ? "[cache] \n\n" : "") + r.answer;
+  } catch (e) {
+    // Nunca se pinta un exito con explicacion vacia: el error se muestra
+    // tal cual (el servidor ya lo envia amigable y sin content vacio)
+    res.textContent = "Error: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------- Fase 13: ingesta desde Splunk local ---------- */
+function setSplunkVisible(v) {
+  // La seccion SIEMPRE es visible: con splunk:true la caja SPL; con
+  // splunk:false el aviso del operador (sin caja de texto ni boton)
+  document.getElementById("splunk-wrap").classList.remove("hidden");
+  document.getElementById("splunk-local-note")
+    .classList.toggle("hidden", !!v);
+  const ta = document.getElementById("splunk-spl");
+  const go = document.getElementById("splunk-go");
+  ta.classList.toggle("hidden", !v);
+  go.classList.toggle("hidden", !v);
+}
+
+async function runSplunkImport() {
+  const spl = document.getElementById("splunk-spl").value.trim();
+  if (!spl) { ui.toast("Pega primero una query SPL"); return; }
+  const btn = document.getElementById("splunk-go");
+  const status = document.getElementById("splunk-status");
+  btn.disabled = true;
+  status.textContent = "Consultando Splunk local...";
+  try {
+    const r = await api.splunkSearch(spl, "", 1000);
+    if (r.error) throw new Error(r.error);
+    status.textContent = ui.fmtNum(r.rows) + " filas cargadas";
+    ui.toast("Splunk: " + ui.fmtNum(r.rows) + " filas en \"" + r.name + "\"");
+    // Deja la sesion activa con la maquinaria normal (filtros, export,
+    // diagnostico rapido)
+    await refreshSessions();
+    await loadDashboard(r.name);
+  } catch (e) {
+    status.textContent = "Error: " + e.message;
+    ui.toast("Error Splunk: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------- Fase 12C: diagnostico rapido (LLM local, plantillas ERR) ---------- */
+function setDiagnoseVisible(v) {
+  document.getElementById("act-diagnose")
+    .classList.toggle("hidden", !v);
+}
+
+async function runDiagnose() {
+  if (!app.name) { ui.toast("No hay dataset activo"); return; }
+  const modal = document.getElementById("diag-modal");
+  const status = document.getElementById("diag-status");
+  const concl = document.getElementById("diag-conclusion");
+  const topEl = document.getElementById("diag-top");
+  // Re-inicio del panel (si se reabre con un analisis anterior pintado)
+  concl.classList.add("hidden");
+  topEl.classList.add("hidden");
+  topEl.innerHTML = "";
+  status.textContent = "Recogiendo plantillas de error...";
+  modal.classList.remove("hidden");
+  const btn = document.getElementById("act-diagnose");
+  btn.disabled = true;
+  let n = 0;
+  try {
+    // Mismo computo que hara el servidor: para poder decir "N plantillas"
+    const t = await api.templates(app.name, 1, "ERR");
+    n = t.total || 0;
+  } catch (e) { /* sin recuento: sigue sin el numero */ }
+  status.textContent = ("Analizando " + ui.fmtNum(n) +
+                        " plantillas... (el LLM local puede tardar)");
+  try {
+    const r = await api.diagnose(app.name, "ERR");
+    if (r.error) throw new Error(r.error);
+    status.textContent = ((r.cached ? "[cache] " : "") +
+                          "Analizadas " + ui.fmtNum(r.analyzed) +
+                          " plantillas. Conclusion:");
+    concl.textContent = r.conclusion || "";
+    concl.classList.remove("hidden");
+    for (const t of r.top || []) {
+      const li = document.createElement("li");
+      li.innerHTML = ("<span class=\"diag-count\">"
+                      + ui.fmtNum(t.count) + "</span>"
+                      + "<code class=\"diag-tpl\">" + ui.esc(t.template)
+                      + "</code><div class=\"diag-ex\">" + ui.esc(t.linea)
+                      + "</div>");
+      topEl.appendChild(li);
+    }
+    topEl.classList.remove("hidden");
+  } catch (e) {
+    status.textContent = "Error: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function delRb(id) {
+  if (!confirm("Borrar este runbook?")) return;
+  try {
+    const res = await api.runbookRemove(id);
+    if (res && res.error) throw new Error(res.error);
+    ui.toast("Runbook borrado");
+    renderDrawerRunbooks(drawer.rbRow);
+  } catch (e) {
+    ui.toast("Error: " + e.message);
+  }
+}
 
 /* ---------- sesiones ---------- */
 async function refreshSessions() {
@@ -827,6 +1426,7 @@ async function loadDashboard(name) {
     renderChipsFromTops();
     renderSeg();
     renderRows();
+    renderTemplates();
     renderPresets();
     ui.status("ok", ui.fmtNum(s.total) + " líneas · " + s.format);
   } catch (e) {
@@ -849,6 +1449,7 @@ function showDash() {
   document.getElementById("act-export").disabled = false;
   document.getElementById("act-clear").disabled = false;
   document.getElementById("act-tail").disabled = false;
+  document.getElementById("act-diagnose").disabled = !app.llmEnabled;
 }
 
 function renderChipsFromTops() {
@@ -887,6 +1488,7 @@ async function clearView() {
   document.getElementById("act-export").disabled = true;
   document.getElementById("act-clear").disabled = true;
   document.getElementById("act-tail").disabled = true;
+  document.getElementById("act-diagnose").disabled = true;
   renderSessions();
   renderPresets();
   ui.status("idle", "Sin archivo");
@@ -975,6 +1577,7 @@ async function refreshLive() {
       renderChipsFromTops();
       renderSeg();
       await renderRows({ follow: true });
+      renderTemplates();
     } while (livePending);
   } catch (e) {
     /* reintentar en el siguiente tick */
@@ -1096,9 +1699,10 @@ function wire() {
 
   // Filtros: inputs con debounce
   let debounce = null;
-  ["fip", "fpath", "fq", "fdt"].forEach((id) => {
+  ["fip", "fpath", "fq", "fdt", "ftpl", "fdfrom", "fdto"].forEach((id) => {
     document.getElementById(id).addEventListener("input", (e) => {
-      const key = { fip: "ip", fpath: "path", fq: "q", fdt: "dt" }[id];
+      const key = { fip: "ip", fpath: "path", fq: "q", fdt: "dt",
+                   ftpl: "tpl", fdfrom: "dtFrom", fdto: "dtTo" }[id];
       clearTimeout(debounce);
       debounce = setTimeout(() => {
         filters.state[key] = e.target.value.trim();
@@ -1129,6 +1733,23 @@ function wire() {
     localStorage.setItem("lv-filters-collapsed", isCollapsed ? "1" : "0");
   });
 
+  // Fase 9B: panel 'Errores agrupados' plegable
+  const tplBody = document.getElementById("tpl-body");
+  document.getElementById("tpl-toggle").addEventListener("click", () => {
+    const hidden = tplBody.classList.toggle("hidden");
+    document.getElementById("tpl-toggle").setAttribute(
+      "aria-expanded", String(!hidden));
+    if (!hidden) paintTemplates();
+  });
+
+  // Fase 9C: granularidad del histograma
+  document.getElementById("gran-min").addEventListener(
+    "click", () => setGran("min"));
+  document.getElementById("gran-hour").addEventListener(
+    "click", () => setGran("h"));
+  document.getElementById("hiscanvas").addEventListener("click",
+    (e) => histClick(e));
+
   // Paginacion
   document.getElementById("prev").addEventListener("click", () => {
     if (app.page > 1) { app.page--; renderRows(); }
@@ -1154,6 +1775,69 @@ function wire() {
   });
   document.getElementById("drawer-close").addEventListener("click", drawer.close);
   document.getElementById("drawer-backdrop").addEventListener("click", drawer.close);
+  // Fase 7B: contexto de la linea en el log original
+  document.getElementById("drawer-ctx-btn")
+    .addEventListener("click", showDrawerContext);
+
+  // Fase 12A: boton "Analizar" del drawer (solo si /api/config dice que si)
+  document.getElementById("an-btn").addEventListener("click", runAnalyze);
+
+  // Fase 13: seccion "Importar de Splunk" (visible solo si esta configurado)
+  document.getElementById("splunk-go")
+    .addEventListener("click", runSplunkImport);
+
+  // Fase 12C: boton "Diagnostico rapido" (solo si /api/config dice llm:true)
+  document.getElementById("act-diagnose")
+    .addEventListener("click", runDiagnose);
+  document.getElementById("diag-close")
+    .addEventListener("click", () => {
+      document.getElementById("diag-modal").classList.add("hidden");
+    });
+
+  // Fase 10B: runbooks (errores conocidos) desde el drawer
+  document.getElementById("rb-new-btn").addEventListener("click", () => {
+    // El matcher prueba el patron contra msg: prellenamos con msg (glob)
+    const row = drawer.rbRow;
+    openRbModal(null, row ? (row.msg || "") : "");
+  });
+  document.getElementById("rb-list").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-id]");
+    if (!btn) return;
+    const id = parseInt(btn.dataset.id, 10);
+    if (btn.classList.contains("rb-edit")) {
+      // Busca el runbook en la lista pintada (solo hay matches)
+      const res = drawer.rbMatches || [];
+      const rb = res.find((x) => x.id === id);
+      if (rb) openRbModal(rb);
+    } else if (btn.classList.contains("rb-del")) {
+      delRb(id);
+    }
+  });
+  document.getElementById("rb-save")
+    .addEventListener("click", saveRbModal);
+  document.getElementById("rb-cancel").addEventListener(
+    "click", closeRbModal);
+  document.getElementById("rb-modal-close").addEventListener(
+    "click", closeRbModal);
+
+  // Ajustes del LLM local (config editable desde la UI)
+  const btnLlm = document.getElementById("btn-llm-settings");
+  if (btnLlm) btnLlm.addEventListener("click", openLlmModal);
+  document.getElementById("llm-save").addEventListener(
+    "click", saveLlmModal);
+  document.getElementById("llm-cancel").addEventListener(
+    "click", closeLlmModal);
+  document.getElementById("llm-modal-close").addEventListener(
+    "click", closeLlmModal);
+
+  // Guia de uso (boton de interrogacion en la cabecera)
+  const btnHelp = document.getElementById("btn-help");
+  if (btnHelp) btnHelp.addEventListener("click", () => {
+    document.getElementById("help-modal").classList.remove("hidden");
+  });
+  document.getElementById("help-close").addEventListener("click", () => {
+    document.getElementById("help-modal").classList.add("hidden");
+  });
 
   // Atajos de teclado (Fase 5). No se disparan si el foco esta en un input.
   document.addEventListener("keydown", (e) => {
@@ -1181,6 +1865,20 @@ async function init() {
   } catch (e) {
     /* sin servidor: los POST fallaran con 403, como el resto */
   }
+  // Fase 12A: si no hay LLM configurado, el boton Analizar NO aparece
+  // (Fase 13: igual para Splunk: sin contrasena no aparece la seccion)
+  try {
+    const cfg = await api.config();
+    app.llmEnabled = !!cfg.llm;
+    app.repoUrl = cfg.repo_url || "";
+    setSplunkVisible(!!cfg.splunk);
+  } catch (e) {
+    app.llmEnabled = false;
+    app.repoUrl = "";
+    setSplunkVisible(false);
+  }
+  // Fase 12C: el boton "Diagnostico rapido" sigue la misma regla
+  setDiagnoseVisible(app.llmEnabled);
   theme.apply(theme.get());
   wire();
   renderPresets();
