@@ -211,3 +211,10 @@ LLM settings/cache/language, Splunk ingestion, SSRF checks.
 ## License
 
 See `LICENSE`.
+
+---
+
+## Contacto
+
+- Pagina: [sammideblas.com](https://sammideblas.com)
+- Email: analista@sammideblas.com
