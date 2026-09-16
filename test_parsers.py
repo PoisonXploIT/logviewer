@@ -1251,20 +1251,20 @@ class TestAuditPerUser(unittest.TestCase):
         server.AUDIT[:] = self._orig
 
     def test_each_user_sees_only_their_entries(self):
-        server.audit("upload", user="sammideblas@gmail.com", file="a.log")
+        server.audit("upload", user="analista@sammideblas.com", file="a.log")
         server.audit("upload", user="revisor@corp.com", file="b.log")
-        server.audit("activate", user="sammideblas@gmail.com", file="a.log")
+        server.audit("activate", user="analista@sammideblas.com", file="a.log")
 
-        a = server.audit_for_user("sammideblas@gmail.com")
+        a = server.audit_for_user("analista@sammideblas.com")
         b = server.audit_for_user("revisor@corp.com")
 
         self.assertEqual(len(a), 2)
-        self.assertTrue(all(e["user"] == "sammideblas@gmail.com" for e in a))
+        self.assertTrue(all(e["user"] == "analista@sammideblas.com" for e in a))
         self.assertEqual(len(b), 1)
         self.assertTrue(all(e["user"] == "revisor@corp.com" for e in b))
 
     def test_no_entries_when_no_match(self):
-        server.audit("upload", user="sammideblas@gmail.com")
+        server.audit("upload", user="analista@sammideblas.com")
         self.assertEqual(server.audit_for_user("otro@corp.com"), [])
         # "local" no ve las entradas de usuarios autenticados
         self.assertEqual(server.audit_for_user("local"), [])
