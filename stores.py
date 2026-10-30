@@ -512,6 +512,28 @@ def llm_key(line, model=None, lang="auto"):
 # ---------------------------------------------------------------------------
 # Backend de datasets (Fase 4): memoria o SQLite segun el tamano
 # ---------------------------------------------------------------------------
+def _line_buckets(rows, gran="min", line_of=None):
+    """U3.2 (2026-10-30): bucketas por numero de linea cuando no hay fecha.
+
+    Un volcado de stack traces (orquestador.log) no tiene ni un timestamp: la
+    histograma temporal queda vacia y la UI muestra 'Sin datos con fecha'. Para
+    que el panel siga siendo util, se agrupa por bloques de lineas.
+    """
+    step = 100 if gran == "min" else 500
+    out = Counter()
+    for i, r in enumerate(rows):
+        line = r.get("_line") if line_of is None else line_of(r, i)
+        try:
+            line = int(line)
+        except (TypeError, ValueError):
+            line = i
+        if line < 0:
+            line = i
+        b = (line // step) * step
+        out["linea %05d-%05d" % (b + 1, b + step)] += 1
+    return out
+
+
 class MemStore:
     """Backend en memoria: lista de filas + contadores (datasets pequenos).
 
@@ -558,6 +580,18 @@ class MemStore:
                     known.add(k)
                     seen.append(k)
         return seen
+
+    def nonempty_columns(self):
+        """U2.1 (2026-10-30): claves con al menos un valor no vacio.
+
+        Sirve para no ofrecer columnas sin datos (el parser auto arranca con
+        method/path/code/bytes vacios). Sin claves internas."""
+        out = set()
+        for r in self.rows:
+            for k, v in r.items():
+                if v and k not in EXPORT_SKIP_KEYS:
+                    out.add(k)
+        return out
 
     def page_filtered(self, q, start, size):
         rows = apply_filters(self.rows, q)
@@ -645,13 +679,21 @@ class MemStore:
         return out[:limit]
 
     def histogram(self, q, gran="min"):
-        """Fase 9C: distribucion temporal de las filas filtradas."""
+        """Fase 9C: distribucion temporal de las filas filtradas.
+
+        U3.2 (2026-10-30): si NINGUNA fila tiene timestamp se bucketea por
+        numero de linea (volcados de stack traces) en vez de devolver vacio.
+        Si al menos una fila tiene fecha, el comportamiento es el de siempre.
+        """
         n = 16 if gran == "min" else 13
         out = Counter()
-        for r in apply_filters(self.rows, q):
+        rows = list(apply_filters(self.rows, q))
+        for r in rows:
             t = (r.get("ts_norm") or "")[:n]
             if t:
                 out[t] += 1
+        if not out:
+            out = _line_buckets(rows, gran)
         return [{"t": t, "count": c} for t, c in sorted(out.items())]
 
     def total_rows(self):
@@ -866,7 +908,19 @@ class SqlStore:
                "WHERE %s GROUP BY t ORDER BY t" % (n, " AND ".join(conds)))
         with self.lock:
             cur = self.conn.execute(sql, params)
-            return [{"t": t, "count": c} for t, c in cur.fetchall()]
+            buckets = [{"t": t, "count": c} for t, c in cur.fetchall()]
+        if buckets:
+            return buckets
+        # U3.2 (2026-10-30): ninguna fila tiene fecha; se bucketea por numero
+        # de linea, igual que MemStore, para que la histograma no quede vacia.
+        step = 100 if gran == "min" else 500
+        fwhere = where[len("WHERE "):] if where else "1=1"
+        sql = ("SELECT (line / %d) * %d AS b, COUNT(*) AS c FROM rows "
+               "WHERE %s GROUP BY b ORDER BY b" % (step, step, fwhere))
+        with self.lock:
+            cur = self.conn.execute(sql, params)
+            return [{"t": "linea %05d-%05d" % (b + 1, b + step), "count": c}
+                    for b, c in cur.fetchall()]
 
     def line_of(self, rowid):
         """Fase 7B: numero de linea (0-based) en el archivo de una fila."""
@@ -895,6 +949,23 @@ class SqlStore:
             cur = self.conn.execute("PRAGMA table_info(rows)")
             return [r[1] for r in cur.fetchall()
                     if r[1] not in EXPORT_SKIP_KEYS]
+
+    def nonempty_columns(self):
+        """U2.1 (2026-10-30): columnas de la tabla con algun valor no vacio.
+
+        Un 'SELECT 1 ... LIMIT 1' por columna: se para a la primera coincidencia.
+        Los nombres salen de PRAGMA table_info, no del usuario."""
+        out = set()
+        with self.lock:
+            for col in self.columns():
+                try:
+                    cur = self.conn.execute(
+                        'SELECT 1 FROM rows WHERE "%s" != \'\' LIMIT 1' % col)
+                    if cur.fetchone():
+                        out.add(col)
+                except Exception:
+                    continue
+        return out
 
     def top(self, field, limit):
         if field not in self.COLUMNS:

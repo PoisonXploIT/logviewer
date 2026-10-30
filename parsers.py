@@ -190,6 +190,41 @@ def norm_sev(v):
     if n >= 1.0:
         return "WRN"
     return "INF"
+# ---------------------------------------------------------------------------
+# U0.1 (2026-10-30): parser universal 'auto' (extraccion best-effort).
+# Sirve para cualquier log que no matchee un formato concreto: saca fecha,
+# nivel, primera IPv4 y pares clave=valor (logfmt) sin exigir estructura.
+# ---------------------------------------------------------------------------
+RE_TS_ISO = re.compile(
+    r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?'
+    r'(?:Z|[+-]\d{2}(?::?\d{2})?)?'
+)
+# Epoch en segundos (10 digitos) o milisegundos (11-13 digitos).
+RE_TS_EPOCH = re.compile(r'(?<![\d.])(1\d{9,12})(?![\d.])')
+RE_TS_YMD_SLASH = re.compile(r'(\d{4})/(\d{1,2})/(\d{1,2})\s+(\d{2}:\d{2}:\d{2})')
+RE_TS_DMY = re.compile(r'(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{2}:\d{2}:\d{2})')
+# RFC 3164 / syslog BSD: 'Oct 30 10:00:00' (sin anio: se pone el anio actual).
+RE_TS_RFC3164 = re.compile(r'\b([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}:\d{2}:\d{2})\b')
+# Hora suelta al inicio de la linea ('10:11:12 mensaje'): no lleva fecha, pero
+# es estructura (parse_triage la completa con la fecha del fichero).
+RE_TS_TIME_ONLY = re.compile(r'^(?:<\d+>)?\s*(\d{2}:\d{2}:\d{2}(?:[.,]\d{1,6})?)(?:\s|$)')
+
+AUTO_LEVEL_WORDS = ("FATAL", "CRITICAL", "CRIT", "ALERT", "ERROR", "WARNING",
+                    "WARN", "NOTICE", "DEBUG", "TRACE", "INFO", "ERR")
+RE_LEVEL_BRACKET = re.compile(r'\[(' + "|".join(AUTO_LEVEL_WORDS) + r')\]',
+                              re.IGNORECASE)
+RE_LEVEL_WORD = re.compile(r'\b(' + "|".join(AUTO_LEVEL_WORDS) + r')\b',
+                           re.IGNORECASE)
+AUTO_LEVEL_MAP = dict(LEVEL_MAP)
+AUTO_LEVEL_MAP["ALERT"] = "CRIT"
+AUTO_LEVEL_MAP["NOTICE"] = "INF"
+
+# Pares clave=valor (logfmt): key=value, key="value" o key='valor'.
+RE_KV = re.compile(r'([A-Za-z_][A-Za-z0-9_]{0,24})='
+                   r'(?:"([^"]*)"|' + "'" + r"([^']*)'" + r'|([^\s,;]+))')
+# Claves que no se copian de logfmt: las pone el propio parser.
+AUTO_RESERVED = ("ts", "ts_norm", "level", "ip", "msg", "raw", "_line")
+
 # Columnas de OperVanta que antes se perdian al parsear JSON Lines.
 # P0.4: 'sev', 'src' y 'dst' se conservan tal cual (ademas de usarse para
 # level e ip) para que el export no pierda la firma ni la severidad original.
@@ -197,6 +232,78 @@ JSON_EXTRA_KEYS = ("fuente", "firma", "tenant", "tarea", "dedupe",
                    "evidencia", "riesgo", "url", "sev", "src", "dst")
 # Claves que envuelven el registro real en dataset.jsonl / triage-dataset.jsonl
 JSON_NESTED_KEYS = ("datos", "alerta", "data", "event", "payload", "detail")
+
+# ---------------------------------------------------------------------------
+# U0.2 (2026-10-30): formatos concretos que antes caian a 'raw' o 'auto'.
+# Python logging, syslog RFC 3164, logfmt, CSV/TSV y nginx error_log.
+# ---------------------------------------------------------------------------
+# Niveles extra que LEVEL_MAP no cubre (nginx, syslog, python NOTSET).
+EXTRA_LEVEL_MAP = {
+    "CRITICAL": "CRIT", "ALERT": "CRIT", "EMERG": "CRIT", "PANIC": "CRIT",
+    "SEVERE": "ERR", "NOTICE": "INF", "NOTSET": "INF", "NONE": "",
+}
+
+
+def _norm_level_any(lv):
+    """Normaliza niveles de cualquier formato a CRIT/ERR/WRN/INF/DBG."""
+    lv = (lv or "").strip().upper()
+    if not lv:
+        return ""
+    if lv in EXTRA_LEVEL_MAP:
+        return EXTRA_LEVEL_MAP[lv]
+    return _norm_level(lv)
+
+
+# Python logging: '2026-10-30 10:11:50,123 - app.logger - INFO - mensaje'.
+# La parte ',mmm - logger -' es opcional, asi que '2026-10-30 10:11:50 - INFO - x'
+# tambien matchea. El separador antes del nivel es un guion.
+PY_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "WARN", "ERROR", "CRITICAL",
+                 "CRIT", "FATAL", "NOTICE", "ALERT", "TRACE", "NOTSET")
+RE_PYTHON_LOG = re.compile(
+    r'^(?P<date>\d{4}-\d{2}-\d{2})\s+'
+    r'(?P<time>\d{2}:\d{2}:\d{2}(?:[.,]\d{1,6})?)'
+    r'(?:\s*-\s*(?P<logger>[^-\n]*?))?'
+    r'\s*-\s*'
+    r'(?P<level>' + "|".join(PY_LOG_LEVELS) + r')'
+    r'\s*[-:]\s*(?P<msg>.*)$',
+    re.IGNORECASE
+)
+
+# Syslog RFC 3164 (BSD): 'Oct 30 10:00:00 host app[1234]: mensaje'.
+# Sin anio: se pone el anio actual, igual que hace extract_ts con RE_TS_RFC3164.
+# El prefijo de prioridad '<14>' es opcional.
+RE_SYSLOG3164 = re.compile(
+    r'^(?:<(?P<pri>\d{1,2})>)?'
+    r'(?P<mon>[A-Za-z]{3})\s+(?P<day>\d{1,2})\s+'
+    r'(?P<time>\d{2}:\d{2}:\d{2})\s+'
+    r'(?P<host>[A-Za-z0-9._-]+)\s+'
+    r'(?P<app>[^\s:\[\]]+)(?:\[(?P<pid>\d+)])?:?\s*'
+    r'(?P<msg>.*)$'
+)
+
+# Severidad RFC 3164 (pri % 8): 0 emerg ... 7 debug.
+SYSLOG_SEV_MAP = {0: "CRIT", 1: "CRIT", 2: "CRIT", 3: "ERR",
+                  4: "WRN", 5: "INF", 6: "INF", 7: "DBG"}
+
+# nginx error_log: '2026/10/30 10:11:50 [error] 1234#5678: mensaje'.
+# El pid#tid es opcional (algunos logs de nginx solo traen '[error] mensaje').
+RE_NGINX_ERROR = re.compile(
+    r'^(?P<date>\d{4})/(\d{1,2})/(\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2})\s+'
+    r'\[(?P<level>[^\]]+)\]\s*'
+    r'(?:(?P<pid>\d+)(?:#(?P<tid>\d+))?:\s*)?'
+    r'(?P<msg>.*)$'
+)
+
+# Claves de logfmt/CSV que se mapean a las columnas estandar del visor.
+LOGFMT_TS_KEYS = ("ts", "time", "timestamp", "datetime", "date", "_time")
+LOGFMT_LEVEL_KEYS = ("level", "severity", "lvl", "log_level", "sev", "priority")
+LOGFMT_MSG_KEYS = ("msg", "message", "text", "log", "mensaje")
+CSV_DATE_KEYS = ("date", "fecha", "timestamp", "ts", "datetime", "time", "hora",
+                 "_time", "tiempo")
+CSV_LEVEL_KEYS = ("level", "nivel", "severity", "sev", "lvl", "log_level",
+                  "priority", "status")
+CSV_MSG_KEYS = ("message", "msg", "mensaje", "text", "texto", "log", "detail",
+                "description")
 
 
 def _norm_level(lv):
@@ -316,16 +423,27 @@ def _ui_columns(store):
     Usa store.columns() (union real de claves, sin internas) y deja solo las
     que se pueden pintar en la tabla: 'msg' primero si existe, y el resto en
     el orden natural del parseo. No devuelve 'raw' ni 'ts_norm'.
+
+    U2.1 (2026-10-30): se descartan las columnas vacias en TODAS las filas
+    (el parser auto declara method/path/code/bytes aunque el log no los traiga),
+    para que el selector y la tabla no ofrezcan huecos sin datos. 'msg' se
+    conserva siempre: una fila legitima puede ser solo un timestamp.
     """
     try:
         cols = store.columns()
     except Exception:
         cols = []
+    try:
+        filled = store.nonempty_columns()
+    except Exception:
+        filled = set(cols)
     out = []
     for c in cols:
         if c in EXPORT_SKIP_KEYS or c in out:
             continue
         if c in ("msg_len", "msg_truncated", "line", "search"):
+            continue
+        if c != "msg" and c not in filled:
             continue
         out.append(c)
     return out
@@ -941,6 +1059,416 @@ def parse_triage(lines, progress=None, file_date=None):
                   "firma": firmas, "verdict": verdicts}
 
 
+def _fix_iso_offset(s):
+    # Convierte el offset '+0200' en '+02:00' para que norm_ts lo parsee.
+    m = re.search(r'([+-])(\d{2})(\d{2})$', s)
+    if m and ":" not in m.group(0):
+        # s[:-4] deja el signo: solo hay que insertar el separador.
+        return s[:-4] + m.group(2) + ":" + m.group(3)
+    return s
+
+
+def extract_ts(line):
+    # Devuelve (ts_crudo, ts_norm) de la primera fecha reconocible.
+    # Orden: ISO 8601, epoch (s o ms), yyyy/MM/dd, dd/MM/yyyy o MM/dd/yyyy,
+    # RFC3164 ('Oct 30 10:00:00'). Devuelve ("", "") si no la hay.
+    m = RE_TS_ISO.search(line)
+    if m:
+        raw = m.group(0)
+        return raw, norm_ts(_fix_iso_offset(raw))
+    m = RE_TS_EPOCH.search(line)
+    if m:
+        raw = m.group(1)
+        return raw, norm_ts(raw)
+    m = RE_TS_YMD_SLASH.search(line)
+    if m:
+        raw = "%s-%02d-%02d %s" % (m.group(1), int(m.group(2)),
+                                   int(m.group(3)), m.group(4))
+        return m.group(0), norm_ts(raw)
+    m = RE_TS_DMY.search(line)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if a <= 12 and b > 12:          # MM/dd/yyyy
+            day, mon = b, a
+        else:                           # dd/MM/yyyy (por defecto, europeo)
+            day, mon = a, b
+        raw = "%s-%02d-%02d %s" % (m.group(3), mon, day, m.group(4))
+        return m.group(0), norm_ts(raw)
+    m = RE_TS_RFC3164.search(line)
+    if m and m.group(1).lower()[:3] in _CLF_MONTHS:
+        raw = "%d-%02d-%02d %s" % (datetime.now().year,
+                                   _CLF_MONTHS[m.group(1).lower()[:3]],
+                                   int(m.group(2)), m.group(3))
+        return m.group(0), norm_ts(raw)
+    m = RE_TS_TIME_ONLY.match(line)
+    if m:
+        # Hora suelta: se devuelve tal cual; no se puede normalizar sin fecha.
+        return m.group(1), ""
+    return "", ""
+
+
+def extract_level(line):
+    # Nivel normalizado (CRIT/ERR/WRN/INF/DBG) en CUALQUIER posicion.
+    # Primero busca '[ERROR]'; si no, la primera palabra de la lista con
+    # word boundary (case-insensitive). Devuelve "" si no lo encuentra.
+    m = RE_LEVEL_BRACKET.search(line)
+    if not m:
+        m = RE_LEVEL_WORD.search(line)
+    if not m:
+        return ""
+    return AUTO_LEVEL_MAP.get(m.group(1).upper(), m.group(1).upper())
+
+
+def extract_kv(line):
+    # Pares clave=valor (logfmt) como dict. La primera ocurrencia gana.
+    out = {}
+    for m in RE_KV.finditer(line):
+        key = m.group(1).lower()
+        if key in AUTO_RESERVED or key in out:
+            continue
+        val = m.group(2)
+        if val is None:
+            val = m.group(3)
+        if val is None:
+            val = m.group(4)
+        out[key] = val
+    return out
+
+
+def _auto_score(line):
+    # True si la linea tiene al menos una sena aprovechable.
+    return bool(extract_ts(line)[0] or extract_level(line) or RE_KV.search(line))
+
+
+def parse_auto(lines, progress=None):
+    # Parser universal 'auto' (U0.1): best-effort sobre cualquier linea.
+    # Orden: timestamp -> nivel -> primera IPv4 -> pares clave=valor a
+    # columnas dinamicas. Si no hay fecha, ni nivel ni clave=valor, la fila
+    # queda 'RAW'. El ts se normaliza con norm_ts y se guarda en ts_norm.
+    rows = []
+    levels, ips, keys = Counter(), Counter(), Counter()
+    n = len(lines)
+    for i, l in enumerate(lines):
+        ts, ts_norm = extract_ts(l)
+        lv = extract_level(l)
+        mi = RE_IP.search(l)
+        ip = mi.group(1) if mi else ""
+        kv = extract_kv(l)
+        if not ts and not lv and not kv:
+            lv = "RAW"
+        msg = l.strip()
+        if ts:
+            msg = msg.replace(ts, "", 1).strip()
+        if not msg:
+            msg = l.strip()
+        row = {"ts": ts, "ts_norm": ts_norm, "level": lv, "ip": ip,
+               "method": "", "path": "", "code": "", "bytes": "",
+               "msg": msg, "raw": l, "_line": i}
+        for k, v in kv.items():
+            if k in row:
+                if not row[k]:
+                    row[k] = v
+            else:
+                row[k] = v
+        levels[lv] += 1
+        if ip:
+            ips[ip] += 1
+        for k in kv:
+            keys[k] += 1
+        rows.append(row)
+        if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
+            progress(i + 1, n)
+    return rows, {"levels": levels, "ips": ips, "keys": keys}
+
+def parse_python_logging(lines, progress=None):
+    """Python logging: 'YYYY-MM-DD HH:MM:SS,mmm - logger - LEVEL - mensaje'.
+
+    La parte ',mmm - logger -' es opcional. Lo que no matchea se queda RAW.
+    Columnas extra: logger.
+    """
+    rows = []
+    levels, ips, loggers = Counter(), Counter(), Counter()
+    n = len(lines)
+    for i, l in enumerate(lines):
+        m = RE_PYTHON_LOG.match(l)
+        if m:
+            ts = m.group("date") + " " + m.group("time")
+            lv = _norm_level_any(m.group("level"))
+            logger = (m.group("logger") or "").strip()
+            msg = m.group("msg")
+            if logger:
+                loggers[logger] += 1
+        else:
+            lv, ts, logger, msg = "RAW", "", "", l
+        levels[lv] += 1
+        mi = RE_IP.search(l)
+        ip = mi.group(1) if mi else ""
+        if ip:
+            ips[ip] += 1
+        rows.append({
+            "ts": ts, "ts_norm": norm_ts(ts), "level": lv, "ip": ip,
+            "method": "", "path": "", "code": "", "bytes": "",
+            "msg": msg, "raw": l, "_line": i, "logger": logger,
+        })
+        if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
+            progress(i + 1, n)
+    return rows, {"levels": levels, "ips": ips, "logger": loggers}
+
+
+def parse_syslog3164(lines, progress=None):
+    """Syslog RFC 3164: 'MMM d HH:MM:SS host app[pid]: mensaje' (sin anio).
+
+    El anio se pone el actual (el formato no lo lleva). Si la linea trae
+    prioridad '<N>', el nivel sale de pri % 8; si no, se intenta adivinar
+    del mensaje. Lo que no matchea se queda RAW.
+    """
+    rows = []
+    levels, ips, hosts, apps = Counter(), Counter(), Counter(), Counter()
+    year = datetime.now().year
+    n = len(lines)
+    for i, l in enumerate(lines):
+        m = RE_SYSLOG3164.match(l)
+        if m:
+            mon = m.group("mon").lower()[:3]
+            if mon in _CLF_MONTHS:
+                ts = "%d-%02d-%02d %s" % (year, _CLF_MONTHS[mon],
+                                          int(m.group("day")), m.group("time"))
+            else:
+                ts = m.group(0)
+            lv = SYSLOG_SEV_MAP.get(int(m.group("pri")) % 8, "") if m.group("pri") else ""
+            if not lv:
+                lv = extract_level(l) or "INF"
+            host = m.group("host")
+            app = m.group("app")
+            msg = m.group("msg")
+            levels[lv] += 1
+            hosts[host] += 1
+            apps[app] += 1
+        else:
+            lv, ts, host, app, msg = "RAW", "", "", "", l
+        mi = RE_IP.search(l)
+        ip = mi.group(1) if mi else ""
+        if ip:
+            ips[ip] += 1
+        rows.append({
+            "ts": ts, "ts_norm": norm_ts(ts), "level": lv, "ip": ip,
+            "method": "", "path": "", "code": "", "bytes": "",
+            "msg": msg, "raw": l, "_line": i,
+            "host": host, "app": app, "pid": (m.group("pid") or "") if m else "",
+        })
+        if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
+            progress(i + 1, n)
+    return rows, {"levels": levels, "ips": ips, "hosts": hosts, "apps": apps}
+
+
+def _kv_pairs(line):
+    """Pares clave=valor de una linea logfmt, sin descartar las claves reservadas."""
+    out = {}
+    for m in RE_KV.finditer(line):
+        key = m.group(1).lower()
+        val = m.group(2)
+        if val is None:
+            val = m.group(3)
+        if val is None:
+            val = m.group(4)
+        if key not in out:
+            out[key] = val if val is not None else ""
+    return out
+
+
+def parse_logfmt(lines, progress=None):
+    """Logfmt: 'clave=valor clave2="valor 2' ...' con comillas opcionales.
+
+    ts/time/timestamp -> ts, level/severity/lvl -> level, msg/message -> msg.
+    El resto de claves se queda como columnas dinamicas. Las lineas sin
+    pares clave=valor se guardan como RAW.
+    """
+    rows = []
+    levels, ips, keys = Counter(), Counter(), Counter()
+    n = len(lines)
+    for i, l in enumerate(lines):
+        kv = _kv_pairs(l)
+        if not kv:
+            rows.append({
+                "ts": "", "ts_norm": "", "level": "RAW", "ip": "",
+                "method": "", "path": "", "code": "", "bytes": "",
+                "msg": l, "raw": l, "_line": i,
+            })
+            levels["RAW"] += 1
+            if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
+                progress(i + 1, n)
+            continue
+        ts = next((kv[k] for k in LOGFMT_TS_KEYS if kv.get(k)), "")
+        # U3.2 (2026-10-30): el timestamp puede ir suelto al principio de la
+        # linea ('2026-10-30T09:12:03.481Z level=info msg=...'), no como par
+        # clave=valor. Sin eso la fila se queda sin fecha y la histograma vacia.
+        if not ts:
+            ts, _ = extract_ts(l)
+        lv = next((_norm_level_any(kv[k]) for k in LOGFMT_LEVEL_KEYS if kv.get(k)), "")
+        if not lv:
+            lv = extract_level(l)
+        msg = next((kv[k] for k in LOGFMT_MSG_KEYS if kv.get(k)), "")
+        if not msg:
+            msg = l.strip()
+            # U3.2: si la fecha iba suelta al principio, no la deja en el msg.
+            if ts and msg.startswith(ts):
+                msg = msg[len(ts):].strip()
+        mi = RE_IP.search(l)
+        ip = mi.group(1) if mi else ""
+        if ip:
+            ips[ip] += 1
+        levels[lv] += 1
+        row = {"ts": ts, "ts_norm": norm_ts(ts), "level": lv, "ip": ip,
+               "method": "", "path": "", "code": "", "bytes": "",
+               "msg": msg, "raw": l, "_line": i}
+        for k, v in kv.items():
+            if k in LOGFMT_TS_KEYS or k in LOGFMT_LEVEL_KEYS or k in LOGFMT_MSG_KEYS:
+                continue
+            if k in row:
+                if not row[k]:
+                    row[k] = v
+            else:
+                row[k] = v
+            keys[k] += 1
+        rows.append(row)
+        if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
+            progress(i + 1, n)
+    return rows, {"levels": levels, "ips": ips, "keys": keys}
+
+
+def _csv_delim(header):
+    """Delimitador de una cabecera CSV: coma, punto y coma o tabulador."""
+    for d in (",", ";", "\t", "|"):
+        if d in header:
+            return d
+    return ","
+
+
+RE_CSV_DATA_FIELD = re.compile(r'^(?:\d+|\d{4}-\d{2}-\d{2}\b|\d{1,2}:\d{2}:\d{2})')
+RE_CSV_DATE_ONLY = re.compile(r'^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?$')
+
+
+def _looks_header(head):
+    """True si la primera linea son nombres de columna, no una linea de datos.
+
+    Un campo que es solo numero, una fecha o una hora indica que la primera
+    linea ya es dato (CSV sin cabecera)."""
+    if not head:
+        return False
+    return all(h and not RE_CSV_DATA_FIELD.match(h) for h in head)
+
+
+def _csv_fields(line, delim):
+    try:
+        return next(csv.reader([line], delimiter=delim))
+    except Exception:
+        return [line]
+
+
+def parse_csv(lines, progress=None):
+    """CSV/TSV: la primera linea no vacia es la cabecera.
+
+    Se mapean fecha/nivel/mensaje a ts/level/msg si existen; el resto de
+    columnas se conserva como columnas dinamicas. Si la primera linea no
+    parece una cabecera (empieza con una fecha o todos los campos son
+    numericos) se generan nombres c0, c1, ... y esa linea se parsea como dato.
+    """
+    rows = []
+    levels, ips, keys = Counter(), Counter(), Counter()
+    first = next((l for l in lines if l.strip()), "")
+    if not first:
+        return rows, {"levels": levels, "ips": ips, "keys": keys}
+    delim = _csv_delim(first)
+    head = [h.strip() for h in _csv_fields(first, delim)]
+    looks_header = _looks_header(head)
+    if looks_header:
+        header = head or ["c%d" % i for i in range(len(head))]
+        start = lines.index(first)
+    else:
+        header = ["c%d" % i for i in range(len(head))]
+        start = -1  # la primera linea es dato
+    n = len(lines)
+    for i, l in enumerate(lines):
+        if i == start or not l.strip():
+            continue
+        fields = _csv_fields(l, delim)
+        rec = {}
+        for j, name in enumerate(header):
+            rec[name] = fields[j].strip() if j < len(fields) else ""
+        ts = next((rec[k] for k in CSV_DATE_KEYS if rec.get(k)), "")
+        if not ts:
+            # CSV sin cabecera o con columna de fecha no reconocida: se saca
+            # de la linea (primer campo que parece una fecha) o del extractor
+            # universal de U0.1.
+            ts = next((f.strip() for f in fields
+                       if RE_CSV_DATE_ONLY.match(f.strip())), "")
+            if not ts:
+                ts = extract_ts(l)[0]
+        lv = next((_norm_level_any(rec[k]) for k in CSV_LEVEL_KEYS if rec.get(k)), "")
+        if not lv:
+            lv = extract_level(l)
+        msg = next((rec[k] for k in CSV_MSG_KEYS if rec.get(k)), "")
+        if not msg:
+            msg = " ".join(f for f in fields if f)
+        mi = RE_IP.search(l)
+        ip = mi.group(1) if mi else ""
+        if ip:
+            ips[ip] += 1
+        levels[lv] += 1
+        row = {"ts": ts, "ts_norm": norm_ts(ts), "level": lv, "ip": ip,
+               "method": "", "path": "", "code": "", "bytes": "",
+               "msg": msg, "raw": l, "_line": i}
+        for k, v in rec.items():
+            if k in CSV_DATE_KEYS or k in CSV_LEVEL_KEYS or k in CSV_MSG_KEYS:
+                continue
+            if k in row:
+                if not row[k]:
+                    row[k] = v
+            else:
+                row[k] = v
+            keys[k] += 1
+        rows.append(row)
+        if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
+            progress(i + 1, n)
+    return rows, {"levels": levels, "ips": ips, "keys": keys}
+
+
+def parse_nginx_error(lines, progress=None):
+    """nginx error_log: 'YYYY/MM/DD HH:MM:SS [level] pid#tid: mensaje'.
+
+    Columnas extra: pid y tid. Lo que no matchea se queda RAW.
+    """
+    rows = []
+    levels, ips, pids = Counter(), Counter(), Counter()
+    n = len(lines)
+    for i, l in enumerate(lines):
+        m = RE_NGINX_ERROR.match(l)
+        if m:
+            ts = "%s-%02d-%02d %s" % (m.group("date"), int(m.group(2)),
+                                      int(m.group(3)), m.group("time"))
+            lv = _norm_level_any(m.group("level"))
+            pid = m.group("pid") or ""
+            tid = m.group("tid") or ""
+            msg = m.group("msg")
+            levels[lv] += 1
+            if pid:
+                pids[pid] += 1
+        else:
+            lv, ts, pid, tid, msg = "RAW", "", "", "", l
+        mi = RE_IP.search(l)
+        ip = mi.group(1) if mi else ""
+        if ip:
+            ips[ip] += 1
+        rows.append({
+            "ts": ts, "ts_norm": norm_ts(ts), "level": lv, "ip": ip,
+            "method": "", "path": "", "code": "", "bytes": "",
+            "msg": msg, "raw": l, "_line": i, "pid": pid, "tid": tid,
+        })
+        if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
+            progress(i + 1, n)
+    return rows, {"levels": levels, "ips": ips, "pid": pids}
+
+
 def parse_raw(lines, progress=None):
     """RAW: lineas tal cual, sin parsear."""
     rows = []
@@ -953,6 +1481,180 @@ def parse_raw(lines, progress=None):
     return rows, {"levels": Counter({"RAW": len(rows)})}
 
 
+# ---------------------------------------------------------------------------
+# U0.3: continuaciones multilineas (stack traces) - post-proceso generico
+# ---------------------------------------------------------------------------
+# Las lineas que no matchean el formato activo y van justo detras de una linea
+# ya parseada (traceback de Python, stack trace de Java, continuation de un
+# mensaje) se anexan al 'raw' y al 'msg' de la fila anterior en vez de crear
+# filas RAW sueltas. Se aplica a TODOS los parsers desde el bucle de carga
+# (api.load_file y el tail), no parser por parser.
+MAX_CONTINUATION_LINES = 40
+
+# Prefijos tipicos de una continuacion de trace (Java, Python, JS, C#).
+CONTINUATION_PREFIXES = ("at ", "caused by", "traceback", "file ",
+                         "stack trace", "suppressed", "during handling of")
+
+# Columnas estandar de una fila; lo demas son columnas dinamicas.
+STANDARD_ROW_KEYS = frozenset(("ts", "ts_norm", "level", "ip", "method",
+                               "path", "code", "bytes", "msg", "raw",
+                               "_line", "template", "_search"))
+
+
+def _line_has_ts(line):
+    """True si la linea lleva un timestamp reconocible."""
+    return bool(extract_ts(line or "")[0])
+
+
+def is_continuation_line(line, prev_line=None, in_trace=False):
+    """True si `line` es continuacion de la linea anterior (stack trace).
+
+    Reglas (U0.3): empieza por espacio o tab, o por 'at ', 'Caused by',
+    'Traceback', 'File '; o no tiene timestamp y la anterior si lo tiene.
+    Una linea vacia solo continua un trace ya abierto (no lo abre), para no
+    pegar los saltos de linea entre entradas de log independientes.
+    """
+    if line is None:
+        return False
+    s = line.rstrip("\r")
+    if not s.strip():
+        return bool(in_trace)
+    if s[0] in " \t":
+        return True
+    low = s.lstrip().lower()
+    if low.startswith(CONTINUATION_PREFIXES):
+        return True
+    if not _line_has_ts(s):
+        # Dentro de un trace ya abierto, cualquier linea sin fecha es parte
+        # del trace (p. ej. 'ValueError: x' tras el 'raise'). Fuera de un
+        # trace, solo se anexa si la linea anterior si tenia fecha: eso evita
+        # pegar filas de CSV o logfmt que van legítimamente sin timestamp.
+        if in_trace:
+            return True
+        return bool(prev_line) and _line_has_ts(prev_line)
+    return False
+
+
+def _uncount_row(counters, row):
+    """Descuenta de los contadores una fila que se absorbe en la anterior."""
+    if not counters:
+        return
+    lv = row.get("level")
+    if lv and counters.get("levels") is not None:
+        counters["levels"][lv] -= 1
+    ip = row.get("ip")
+    if ip and counters.get("ips") is not None:
+        counters["ips"][ip] -= 1
+    keys = counters.get("keys")
+    if keys is not None:
+        for k in row:
+            if k not in STANDARD_ROW_KEYS and k in keys:
+                keys[k] -= 1
+    # Los demas contadores (logger, host, pid, method...) no se ven
+    # afectados: una linea de continuacion no matchea el formato, así que
+    # esos campos van vacios en la fila absorbida.
+    for name, c in counters.items():
+        if isinstance(c, Counter):
+            for k, v in list(c.items()):
+                if v <= 0:
+                    del c[k]
+
+
+def attach_continuations(rows, counters=None, max_lines=MAX_CONTINUATION_LINES):
+    """Anexa las lineas de continuacion a la fila anterior.
+
+    Post-proceso del bucle de carga: agrupa un stack trace en UNA fila. Solo
+    se anexa si existe fila anterior, la linea no tiene timestamp propio y
+    cumple una de las reglas de continuacion; como mucho `max_lines` lineas
+    seguidas (40 por defecto). Devuelve las filas agrupadas y deja los
+    contadores coherentes.
+    """
+    if not rows:
+        return rows
+    out = []
+    run = 0
+    for row in rows:
+        raw = row.get("raw") or ""
+        if out and run < max_lines and not row.get("ts"):
+            prev_raw = out[-1].get("raw") or ""
+            prev_last = prev_raw.split("\n")[-1] if prev_raw else ""
+            if is_continuation_line(raw, prev_last, run > 0):
+                prev = out[-1]
+                prev["raw"] = (prev.get("raw") or "") + "\n" + raw
+                msg = (row.get("msg") or "").strip()
+                if msg:
+                    prev["msg"] = ((prev.get("msg") or "") + "\n" + msg)
+                _uncount_row(counters, row)
+                run += 1
+                continue
+        out.append(row)
+        run = 0
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Volcado de stack traces sin fecha (U3.2, 2026-10-30)
+# ---------------------------------------------------------------------------
+TRACE_PATTERNS = (
+    re.compile(r"^\s*at\s+\S"),
+    re.compile(r"^Traceback \(most recent call last\):"),
+    re.compile(r"^\s*File \"[^\"]+\", line \d+"),
+    re.compile(r"^\s*Caused by:"),
+    re.compile(r"^\s*\^$"),
+    re.compile(r"^(?:Error|Exception|Fatal)[A-Za-z]*:"),
+    re.compile(r"^\s*(?:errno|syscall):"),
+    re.compile(r"^\s*code: '[A-Z0-9_]+'"),
+    re.compile(r"^node:[A-Za-z]+:\d+"),
+    re.compile(r"^Emitted 'error' event"),
+    re.compile(r"^Node\.js v\d"),
+)
+
+
+def _trace_shapes(line):
+    """Formas de stack trace que aparecen en la linea (node, Java, Python).
+
+    Se exige mas de una forma distinta para que una repeticion suelta de
+    'Traceback (most recent call last):' no convierta un log sin estructura
+    en 'trace': eso seguiria siendo 'raw'.
+    """
+    return {i for i, rx in enumerate(TRACE_PATTERNS) if rx.match(line)}
+
+
+def _is_trace_line(line):
+    """True si la linea es parte de un stack trace (node, Java o Python)."""
+    return bool(_trace_shapes(line))
+
+
+def parse_trace(lines, progress=None):
+    """Volcado de stack traces sin timestamps (p. ej. orquestador.log).
+
+    No hay fecha: 'ts' queda vacio. Nivel ERR si la linea trae
+    Error/Exception/Fatal; si no, se usa extract_level y, en su defecto, ERR
+    porque dentro de un volcado de traces todo es parte del error. Las lineas
+    se anexan a la fila anterior en attach_continuations, asi que un trace
+    completo es una sola fila.
+    """
+    rows = []
+    levels, ips, keys = Counter(), Counter(), Counter()
+    n = len(lines)
+    for i, l in enumerate(lines):
+        s = l.rstrip("\r")
+        if not s.strip():
+            continue
+        lv = extract_level(s) or "ERR"
+        mi = RE_IP.search(s)
+        ip = mi.group(1) if mi else ""
+        if ip:
+            ips[ip] += 1
+        levels[lv] += 1
+        rows.append({"ts": "", "ts_norm": "", "level": lv, "ip": ip,
+                     "method": "", "path": "", "code": "", "bytes": "",
+                     "msg": s.strip(), "raw": s, "_line": i})
+        if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
+            progress(i + 1, n)
+    return rows, {"levels": levels, "ips": ips, "keys": keys}
+
+
 PARSERS = {
     "apache": parse_apache,
     "w3c": parse_w3c,
@@ -961,47 +1663,136 @@ PARSERS = {
     "generic": parse_generic,
     "piloop": parse_piloop,
     "triage": parse_triage,
+    "auto": parse_auto,
     "raw": parse_raw,
+    "python": parse_python_logging,
+    "syslog3164": parse_syslog3164,
+    "logfmt": parse_logfmt,
+    "trace": parse_trace,
+    "csv": parse_csv,
+    "nginx_error": parse_nginx_error,
 }
 
 
 # ---------------------------------------------------------------------------
 # Deteccion de formato (heuristicas sobre las primeras lineas no vacias)
 # ---------------------------------------------------------------------------
+def _looks_csv(sample):
+    """Heuristica U0.2: cabecera con nombres y numero de columnas estable.
+
+    No vale con que haya comas: hay que parecer una tabla (>=3 columnas en
+    la cabecera y el mismo numero en la mayor parte de las lineas). Los
+    JSON y los logs con fecha en la primera columna no cuentan.
+    """
+    first = sample[0]
+    delim = _csv_delim(first)
+    if delim not in first:
+        return False
+    head = [h.strip() for h in _csv_fields(first, delim)]
+    if len(head) < 3:
+        return False
+    if not _looks_header(head):
+        return False
+    if not all(re.match(r'^[A-Za-z0-9_ .-]{1,40}$', h) for h in head):
+        return False
+    base = len(head)
+    same = sum(1 for l in sample[1:] if len(_csv_fields(l, delim)) == base)
+    return same >= (len(sample) - 1) * 0.7
+
+
+def _is_json_line(line):
+    """True si la linea, suelta, es un objeto JSON completo (JSON Lines)."""
+    s = line.strip()
+    if not s.startswith("{"):
+        return False
+    try:
+        json.loads(s)
+    except Exception:
+        return False
+    return True
+
+
 def detect_format(lines):
+    """Deteccion de formato por orden de especificidad (U1.1, 2026-10-30).
+
+    El orden es determinista y va de lo mas estructurado a lo mas laxo:
+    csv, w3c, json, syslog RFC5424, syslog RFC3164, python logging, apache
+    (access), nginx error, logfmt, piloop, triage, generic. Cada formato
+    exige su umbral sobre las primeras 100 lineas no vacias.
+
+    Si NINGUN formato alcanza su umbral no se devuelve 'raw' a la primera:
+    se cae a 'auto' (parser universal) cuando hay estructura aprovechable,
+    es decir un timestamp reconocible en mas del 40% de las lineas, o un
+    nivel/clave=valor en esa proporcion. 'raw' queda solo para lo que de
+    verdad no tiene estructura (ni fecha, ni nivel, ni clave=valor).
+    """
     sample = [l for l in lines if l.strip()][:100]
     if not sample:
         return "raw"
     n = len(sample)
-    if sum(1 for l in sample if match_apache(l)) > n * 0.7:
-        return "apache"
-    # W3C: alguna de las primeras lineas es #Fields (antes pueden ir
-    # lineas de metadatos #Software, #Reason, etc.)
+
+    def share(pred):
+        return sum(1 for l in sample if pred(l))
+
+    # 1. CSV/TSV: la primera linea no vacia es una cabecera de columnas.
+    if _looks_csv(sample):
+        return "csv"
+    # 2. W3C: '#Fields' (puede ir tras metadatos #Software, #Reason...).
     if any(l.startswith("#Fields") for l in sample):
         return "w3c"
-    ok = 0
-    for l in sample:
-        s = l.strip()
-        if s.startswith("{"):
-            try:
-                json.loads(s)
-                ok += 1
-            except Exception:
-                pass
-    if ok > n * 0.7:
+    # 3. JSON Lines (>70% de lineas que son un objeto JSON completo).
+    if share(_is_json_line) > n * 0.7:
         return "json"
-    if sum(1 for l in sample if RE_LEVEL.match(l)) > n * 0.7:
-        return "generic"
-    if sum(1 for l in sample if RE_SYSLOG.match(l)) > n * 0.7:
+    # 4. syslog RFC 5424: '1 2026-10-30T10:00:00.000Z host app[1]: msg' (>70%).
+    if share(RE_SYSLOG.match) > n * 0.7:
         return "syslog"
-    # triage (SOC): umbral 40% porque puede haber lineas de continuation
-    # o cabeceras que no siguen el patron
-    if sum(1 for l in sample if RE_TRIAGE.match(l)) >= n * 0.4:
-        return "triage"
-    # piloop: umbral bajo (40%) porque los stack traces y las continuaciones
-    # de linea no llevan timestamp y se quedan como RAW solo en esas lineas
-    if sum(1 for l in sample if RE_PILOOP.match(l)) >= n * 0.4:
+    # 5. syslog RFC 3164: 'Oct 30 10:00:00 host app[123]: msg' (>40%).
+    if share(RE_SYSLOG3164.match) >= n * 0.4:
+        return "syslog3164"
+    # 6. python logging: '... - logger - LEVEL - msg' (>40%; los trazos de
+    #    traceback no llevan el prefijo, por eso el umbral es bajo).
+    if share(RE_PYTHON_LOG.match) >= n * 0.4:
+        return "python"
+    # 7. apache/nginx access (>40%).
+    if share(match_apache) >= n * 0.4:
+        return "apache"
+    # 8. nginx error_log: '2026/10/30 10:11:50 [error] 1234#5678: msg' (>40%).
+    if share(RE_NGINX_ERROR.match) >= n * 0.4:
+        return "nginx_error"
+    # 9. logfmt: dos o mas pares clave=valor por linea (>40%).
+    if share(lambda l: len(_kv_pairs(l)) >= 2) >= n * 0.4:
+        return "logfmt"
+    # 10. piloop: 'YYYY-MM-DD HH:MM:SS componente: msg' SIN nivel explicito.
+    #     Si la linea ademas lleva nivel, es 'generic' (mas abajo): el orden
+    #     exige que generic no se lo robe a piloop cuando solo hay fecha.
+    if share(lambda l: RE_PILOOP.match(l) and not RE_LEVEL.match(l)) >= n * 0.4:
         return "piloop"
+    # 11. triage SOC: 'HH:MM:SS [fuente] FIRMA -> verdict conf ... sev ...' (>40%).
+    if share(RE_TRIAGE.match) >= n * 0.4:
+        return "triage"
+    # 12. generic: fecha + hora + nivel (>40%).
+    if share(RE_LEVEL.match) >= n * 0.4:
+        return "generic"
+    # 13. trace: volcado de stack traces sin fecha (node, Java, Python). Va
+    #     antes del fallback 'auto' porque aqui no hay timestamp que aprovechar.
+    #     Exige >=40% de lineas de trace y al menos 3 formas distintas (una
+    #     repeticion de 'Traceback' suelta sigue siendo 'raw').
+    shapes = set()
+    trace_lines = 0
+    for l in sample:
+        s = _trace_shapes(l)
+        if s:
+            trace_lines += 1
+            shapes |= s
+    if trace_lines >= n * 0.4 and len(shapes) >= 3:
+        return "trace"
+    # Fallback 'auto' (U1.1): hay estructura pero ningun formato concreto.
+    if share(lambda l: extract_ts(l)[0]) >= n * 0.4:
+        return "auto"
+    # Nada con timestamp, pero si con nivel o clave=valor: 'auto' tambien
+    # saca eso (fecha vacia, nivel y columnas dinamicas).
+    if share(_auto_score) >= n * 0.4:
+        return "auto"
     return "raw"
 
 

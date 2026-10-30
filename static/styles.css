@@ -273,6 +273,21 @@ body {
 
 .file-meta { font-size: 11px; color: var(--mut); }
 
+/* U2.1 (2026-10-30): badge del formato detectado y de las lineas RAW. */
+.file-fmt { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+.file-fmt.hidden { display: none; }
+.fmt-badge {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-family: var(--mono);
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--ink);
+}
+.fmt-badge.raw { color: var(--warn); background: var(--warn-soft); border-color: var(--warn); }
+
 .sidebar-foot { margin-top: auto; font-size: 11px; }
 
 .main {

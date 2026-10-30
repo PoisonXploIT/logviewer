@@ -4251,6 +4251,1549 @@ class TestHealthAndTailCli(unittest.TestCase):
         self.assertLess(len(inspect.getsource(server).splitlines()), 300)
 
 
+class TestParserAuto(unittest.TestCase):
+    # U0.1 (2026-10-30): parser universal 'auto' (best-effort).
+
+    def test_auto_registrado_en_PARSERS(self):
+        self.assertIn("auto", server.PARSERS)
+        self.assertIs(server.PARSERS["auto"], server.parse_auto)
+
+    def test_auto_iso_t_con_zona(self):
+        rows, _ = server.parse_auto(
+            ["2026-10-30T10:15:30.123Z app=api level=error ip=10.0.0.5 msg=fallo"])
+        r = rows[0]
+        self.assertEqual(r["ts"], "2026-10-30T10:15:30.123Z")
+        self.assertTrue(r["ts_norm"].startswith("2026-10-30T10:15:30"))
+        self.assertEqual(r["level"], "ERR")
+        self.assertEqual(r["ip"], "10.0.0.5")
+        self.assertEqual(r["app"], "api")
+
+    def test_auto_iso_espacio_sin_zona(self):
+        rows, _ = server.parse_auto(["2026-10-30 10:15:30 ERROR algo falla"])
+        self.assertEqual(rows[0]["level"], "ERR")
+        self.assertTrue(rows[0]["ts_norm"].startswith("2026-10-30T10:15:30"))
+
+    def test_auto_epoch_segundos(self):
+        rows, _ = server.parse_auto(["1761234567 INFO servicio listo"])
+        r = rows[0]
+        self.assertEqual(r["ts"], "1761234567")
+        self.assertTrue(r["ts_norm"].startswith("2025-"))
+        self.assertEqual(r["level"], "INF")
+
+    def test_auto_epoch_milisegundos(self):
+        rows, _ = server.parse_auto(["1761234567890 WARN host=web01 status=500"])
+        r = rows[0]
+        self.assertEqual(r["ts"], "1761234567890")
+        self.assertTrue(r["ts_norm"].startswith("2025-"))
+        self.assertEqual(r["level"], "WRN")
+        self.assertEqual(r["host"], "web01")
+        self.assertEqual(r["status"], "500")
+
+    def test_auto_ddmm_y_mmdd(self):
+        rows, _ = server.parse_auto(["30/10/2026 10:00:01 [ERROR] NPE"])
+        r = rows[0]
+        self.assertEqual(r["ts_norm"], "2026-10-30T10:00:01")
+        self.assertEqual(r["level"], "ERR")
+        rows, _ = server.parse_auto(["10/30/2026 10:00:02 trace query"])
+        self.assertEqual(rows[0]["ts_norm"], "2026-10-30T10:00:02")
+        self.assertEqual(rows[0]["level"], "DBG")
+
+    def test_auto_rfc3164(self):
+        rows, _ = server.parse_auto(["Oct 30 10:00:00 server[1234] INFO nginx ok"])
+        r = rows[0]
+        self.assertEqual(r["ts"], "Oct 30 10:00:00")
+        self.assertTrue(r["ts_norm"].endswith("-10-30T10:00:00"))
+        self.assertEqual(r["level"], "INF")
+
+    def test_auto_yyyy_mm_dd(self):
+        rows, _ = server.parse_auto(["2026/10/30 10:00:03 NOTICE backup ok"])
+        self.assertEqual(rows[0]["ts_norm"], "2026-10-30T10:00:03")
+        self.assertEqual(rows[0]["level"], "INF")
+
+    def test_auto_nivel_en_cualquier_posicion(self):
+        rows, _ = server.parse_auto(["crash en modulo 3: fatal, no responde"])
+        self.assertEqual(rows[0]["level"], "CRIT")
+        rows, _ = server.parse_auto(["[warning] disco lleno en /var"])
+        self.assertEqual(rows[0]["level"], "WRN")
+
+    def test_auto_sin_sena_es_raw(self):
+        rows, counters = server.parse_auto(["Traceback (most recent call last):"])
+        self.assertEqual(rows[0]["level"], "RAW")
+        self.assertEqual(rows[0]["ts"], "")
+        self.assertEqual(rows[0]["msg"], "Traceback (most recent call last):")
+        self.assertEqual(counters["levels"]["RAW"], 1)
+
+    def test_auto_extrae_ip_y_columnas_dinamicas(self):
+        rows, counters = server.parse_auto(
+            ["2026-10-30T10:00:00 pid=42 method=GET path=/a status=200 "
+            "duration=12ms client=192.168.1.7"])
+        r = rows[0]
+        self.assertEqual(r["ip"], "192.168.1.7")
+        self.assertEqual(r["pid"], "42")
+        self.assertEqual(r["method"], "GET")
+        self.assertEqual(r["path"], "/a")
+        self.assertEqual(r["code"] or r["status"], "200")
+        self.assertEqual(r["duration"], "12ms")
+        self.assertIn("pid", counters["keys"])
+
+    def test_detect_format_auto_iso_epoch_logfmt(self):
+        # Correccion (2026-10-30, U0.2): con dos o mas pares clave=valor la
+        # linea ya es logfmt, no 'auto'. 'auto' sigue para lo que solo tiene
+        # una sena suelta (un epoch y un 'host=...').
+        self.assertEqual(server.detect_format(
+            ["2026-10-30T10:15:30Z app=api level=info msg=ok"]), "logfmt")
+        self.assertEqual(server.detect_format(
+            ["1761234567890 WARN host=web01"]), "auto")
+        self.assertEqual(server.detect_format(
+            ["ts=2026-10-30 level=error msg=fallo"]), "logfmt")
+
+    def test_detect_format_sin_sena_sigue_raw(self):
+        self.assertEqual(server.detect_format(
+            ["Traceback (most recent call last):"] * 10), "raw")
+        # 3 de 10 lineas con fecha: por debajo del umbral de 40% -> raw
+        self.assertEqual(server.detect_format(
+            ["2026-10-12 20:40:16 logs: rotado a.log"] * 3
+            + ["Traceback (most recent call last):"] * 7), "raw")
+
+    def test_auto_no_rompe_formatos_conocidos(self):
+        sample = ["2026-10-12 20:40:16 logs: rotado buzon.log (>0.0 MB)"] * 5
+        self.assertEqual(server.detect_format(sample), "piloop")
+        sample = ['127.0.0.1 - - [10/Oct/2023:13:55:36 -0700] "GET /a HTTP/1.1" 200 1234'] * 5
+        self.assertEqual(server.detect_format(sample), "apache")
+
+    def test_auto_ts_norm_rellena(self):
+        rows, _ = server.parse_auto(["2026-10-30T10:15:30+0200 level=info msg=ok"])
+        self.assertTrue(rows[0]["ts_norm"])
+        self.assertEqual(rows[0]["ts_norm"], "2026-10-30T08:15:30")
+
+    def test_auto_filtro_por_ts_norm(self):
+        rows, _ = server.parse_auto(["2026-10-30T10:15:30Z level=error msg=fallo"])
+        got = server.apply_filters(rows, {"dt_from": "2026-10-30",
+                                          "dt_to": "2026-10-31"})
+        self.assertEqual(len(got), 1)
+        got = server.apply_filters(rows, {"dt_from": "2026-11-01"})
+        self.assertEqual(len(got), 0)
+
+class TestFormatosU02(unittest.TestCase):
+    """U0.2 (2026-10-30): python logging, syslog RFC3164, logfmt, CSV/TSV
+    y nginx error_log. Cada formato se detecta y se parsea con fecha,
+    nivel y columnas propias."""
+
+    # --- python logging ------------------------------------------------------
+    def test_python_logging_detect(self):
+        sample = [
+            "2026-10-30 10:11:50,123 - app.logger - INFO - arranque ok",
+            "2026-10-30 10:11:51,456 - app.logger - ERROR - fallo",
+        ] * 3
+        self.assertEqual(server.detect_format(sample), "python")
+
+    def test_python_logging_parse(self):
+        rows, counters = server.parse_python_logging(
+            ["2026-10-30 10:11:50,123 - app.logger - INFO - arranque ok"])
+        r = rows[0]
+        self.assertEqual(r["ts"], "2026-10-30 10:11:50,123")
+        self.assertEqual(r["ts_norm"], "2026-10-30T10:11:50.123000")
+        self.assertEqual(r["level"], "INF")
+        self.assertEqual(r["logger"], "app.logger")
+        self.assertEqual(r["msg"], "arranque ok")
+        self.assertEqual(counters["levels"]["INF"], 1)
+
+    def test_python_logging_sin_logger(self):
+        rows, _ = server.parse_python_logging(
+            ["2026-10-30 10:11:52 - WARNING - algo raro"])
+        self.assertEqual(rows[0]["level"], "WRN")
+        self.assertEqual(rows[0]["logger"], "")
+        self.assertEqual(rows[0]["msg"], "algo raro")
+        self.assertEqual(rows[0]["ts"], "2026-10-30 10:11:52")
+
+    def test_python_logging_linea_no_matchea_es_raw(self):
+        rows, counters = server.parse_python_logging(
+            ["Traceback (most recent call last):"])
+        self.assertEqual(rows[0]["level"], "RAW")
+        self.assertEqual(rows[0]["msg"], "Traceback (most recent call last):")
+        self.assertEqual(counters["levels"]["RAW"], 1)
+
+    def test_python_logging_ip(self):
+        rows, counters = server.parse_python_logging(
+            ["2026-10-30 10:11:50,123 - net - ERROR - 10.0.0.5 rechazado"])
+        self.assertEqual(rows[0]["ip"], "10.0.0.5")
+        self.assertEqual(counters["ips"]["10.0.0.5"], 1)
+
+    # --- syslog RFC 3164 -----------------------------------------------------
+    def test_syslog3164_detect(self):
+        sample = [
+            "Oct 30 10:00:00 web01 nginx[1234]: upstream timed out",
+            "Oct 30 10:00:01 web01 sshd[99]: Failed password for root",
+        ] * 3
+        self.assertEqual(server.detect_format(sample), "syslog3164")
+
+    def test_syslog3164_parse(self):
+        rows, counters = server.parse_syslog3164(
+            ["Oct 30 10:00:00 web01 nginx[1234]: upstream timed out"])
+        r = rows[0]
+        self.assertTrue(r["ts"].endswith("-10-30 10:00:00"))
+        self.assertTrue(r["ts_norm"])
+        self.assertEqual(r["host"], "web01")
+        self.assertEqual(r["app"], "nginx")
+        self.assertEqual(r["pid"], "1234")
+        self.assertEqual(r["msg"], "upstream timed out")
+        self.assertEqual(r["level"], "INF")
+        self.assertEqual(counters["hosts"]["web01"], 1)
+
+    def test_syslog3164_prioridad_da_nivel(self):
+        rows, _ = server.parse_syslog3164(["<12>Oct 30 10:00:02 web02 kernel: oom"])
+        self.assertEqual(rows[0]["level"], "WRN")
+        rows, _ = server.parse_syslog3164(["<11>Oct 30 10:00:03 web02 kernel: panic"])
+        self.assertEqual(rows[0]["level"], "ERR")
+
+    def test_syslog3164_sin_colon(self):
+        rows, _ = server.parse_syslog3164(["Oct 30 10:00:04 host app mensaje suelto"])
+        self.assertEqual(rows[0]["app"], "app")
+        self.assertEqual(rows[0]["msg"], "mensaje suelto")
+
+    # --- logfmt --------------------------------------------------------------
+    def test_logfmt_detect(self):
+        sample = ["ts=2026-10-30T10:15:30Z level=info msg=ok app=api"] * 3
+        self.assertEqual(server.detect_format(sample), "logfmt")
+
+    def test_logfmt_parse_mapeos(self):
+        rows, counters = server.parse_logfmt([
+            'timestamp="2026-10-30 10:15:31" severity=error '
+            "message=\"disk full\" host=web01 duration=12ms",
+        ])
+        r = rows[0]
+        self.assertEqual(r["ts"], "2026-10-30 10:15:31")
+        self.assertEqual(r["ts_norm"], "2026-10-30T10:15:31")
+        self.assertEqual(r["level"], "ERR")
+        self.assertEqual(r["msg"], "disk full")
+        self.assertEqual(r["host"], "web01")
+        self.assertEqual(r["duration"], "12ms")
+        self.assertIn("host", counters["keys"])
+
+    def test_logfmt_linea_sin_kv_es_raw(self):
+        rows, counters = server.parse_logfmt(["Traceback (most recent call last):"])
+        self.assertEqual(rows[0]["level"], "RAW")
+        self.assertEqual(counters["levels"]["RAW"], 1)
+
+    def test_logfmt_filtro_por_nivel(self):
+        rows, _ = server.parse_logfmt([
+            "ts=2026-10-30T10:00:00Z level=error msg=fallo",
+            "ts=2026-10-30T10:00:01Z level=info msg=ok",
+        ])
+        got = server.apply_filters(rows, {"level": ["ERR"]})
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["msg"], "fallo")
+
+    # --- CSV / TSV ----------------------------------------------------------
+    def test_csv_detect(self):
+        sample = [
+            "fecha,nivel,mensaje,host",
+            "2026-10-30 10:00:00,ERROR,timeout,web01",
+            "2026-10-30 10:00:01,INFO,ok,web02",
+        ] * 2
+        self.assertEqual(server.detect_format(sample), "csv")
+
+    def test_csv_parse(self):
+        rows, counters = server.parse_csv([
+            "fecha,nivel,mensaje,host",
+            "2026-10-30 10:00:00,ERROR,timeout,web01",
+        ])
+        r = rows[0]
+        self.assertEqual(r["ts"], "2026-10-30 10:00:00")
+        self.assertEqual(r["ts_norm"], "2026-10-30T10:00:00")
+        self.assertEqual(r["level"], "ERR")
+        self.assertEqual(r["msg"], "timeout")
+        self.assertEqual(r["host"], "web01")
+        self.assertEqual(counters["keys"]["host"], 1)
+        self.assertEqual(len(rows), 1)
+
+    def test_csv_punto_y_coma_y_tabulador(self):
+        rows, _ = server.parse_csv(["date;level;message",
+                                   "2026-10-30;WARN;reintento"])
+        self.assertEqual(rows[0]["level"], "WRN")
+        self.assertEqual(rows[0]["msg"], "reintento")
+        rows, _ = server.parse_csv(["date\tlevel\tmessage",
+                                    "2026-10-30\tDEBUG\ttask done"])
+        self.assertEqual(rows[0]["level"], "DBG")
+        self.assertEqual(rows[0]["msg"], "task done")
+
+    def test_csv_sin_cabecera_genera_columnas(self):
+        rows, _ = server.parse_csv([
+            "2026-10-30,INFO,ok,web01",
+            "2026-10-31,ERROR,caida,web02",
+        ])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["ts"], "2026-10-30")
+        self.assertEqual(rows[0]["level"], "INF")
+        self.assertEqual(rows[0]["c2"], "ok")
+        self.assertEqual(rows[0]["c3"], "web01")
+
+    def test_csv_comillas_y_delimitador_dentro_del_valor(self):
+        rows, _ = server.parse_csv([
+            "date,level,message",
+            '2026-10-30,ERROR,"a, b",',
+        ])
+        self.assertEqual(rows[0]["msg"], "a, b")
+
+    # --- nginx error_log ----------------------------------------------------
+    def test_nginx_error_detect(self):
+        sample = [
+            "2026/10/30 10:11:50 [error] 1234#5678: *3 upstream timed out",
+            "2026/10/30 10:11:51 [warn] 1234#0: worker exited",
+        ] * 3
+        self.assertEqual(server.detect_format(sample), "nginx_error")
+
+    def test_nginx_error_parse(self):
+        rows, counters = server.parse_nginx_error([
+            "2026/10/30 10:11:50 [error] 1234#5678: *3 upstream timed out",
+            "2026/10/30 10:11:51 [emerg] 99: no such worker",
+        ])
+        self.assertEqual(rows[0]["ts"], "2026-10-30 10:11:50")
+        self.assertEqual(rows[0]["ts_norm"], "2026-10-30T10:11:50")
+        self.assertEqual(rows[0]["level"], "ERR")
+        self.assertEqual(rows[0]["pid"], "1234")
+        self.assertEqual(rows[0]["tid"], "5678")
+        self.assertEqual(rows[0]["msg"], "*3 upstream timed out")
+        self.assertEqual(rows[1]["level"], "CRIT")
+        self.assertEqual(rows[1]["pid"], "99")
+        self.assertEqual(rows[1]["tid"], "")
+        self.assertEqual(counters["pid"]["1234"], 1)
+
+    def test_nginx_error_no_confundido_con_generic(self):
+        sample = ["2026/10/30 10:11:50 [error] 1234#5678: *3 upstream timed out"] * 5
+        self.assertNotEqual(server.detect_format(sample), "generic")
+        self.assertNotEqual(server.detect_format(sample), "auto")
+
+    def test_los_nuevos_parsers_estan_en_PARSERS(self):
+        for key in ("python", "syslog3164", "logfmt", "csv", "nginx_error"):
+            self.assertIn(key, server.PARSERS)
+
+    def test_no_rompe_formatos_conocidos(self):
+        # Los formatos previos siguen detectandose igual tras U0.2.
+        self.assertEqual(server.detect_format(
+            ["2026-10-12 20:40:16 logs: rotado buzon.log"] * 5), "piloop")
+        self.assertEqual(server.detect_format(
+            ['127.0.0.1 - - [10/Oct/2023:13:55:36 -0700] "GET /a HTTP/1.1" 200 1234'] * 5),
+            "apache")
+        self.assertEqual(server.detect_format(
+            ["2026-10-30 10:00:00 INFO arranque"] * 5), "generic")
+        self.assertEqual(server.detect_format(
+            ["Traceback (most recent call last):"] * 10), "raw")
+
+
+class TestDetectFormatU11(unittest.TestCase):
+    """U1.1 (2026-10-30): orden determinista de firmas y fallback 'auto'.
+
+    detect_format prueba los formatos de mas estructurado a menos y solo
+    devuelve 'raw' si no hay timestamp, ni nivel, ni clave=valor.
+    """
+
+    def test_csv_primero_que_otras_firmas(self):
+        sample = ["fecha,nivel,mensaje,host"] + ["2026-10-30 10:00:00,INFO,ok,web01"] * 9
+        self.assertEqual(server.detect_format(sample), "csv")
+
+    def test_syslog5424_antes_que_3164(self):
+        sample = ["1 2026-10-30T10:00:00.123Z web01 kernel[12]: oom kill"] * 8
+        self.assertEqual(server.detect_format(sample), "syslog")
+
+    def test_iso_t_no_cae_a_raw(self):
+        sample = ["2026-10-30T10:15:30.000Z api srv01 GET /health 200 12ms"] * 5
+        fmt = server.detect_format(sample)
+        self.assertNotEqual(fmt, "raw")
+        self.assertIn(fmt, ("auto", "generic", "syslog"))
+        rows, _ = server.PARSERS[fmt](sample)
+        self.assertTrue(rows[0]["ts_norm"])
+
+    def test_epoch_no_cae_a_raw(self):
+        sample = ["1761234567890 WARN host=web01 disk lleno"] * 5
+        self.assertEqual(server.detect_format(sample), "auto")
+        rows, _ = server.parse_auto(sample)
+        self.assertEqual(rows[0]["level"], "WRN")
+        self.assertEqual(rows[0]["ts_norm"], "2025-10-23T15:49:27.890000")
+
+    def test_hora_sola_no_cae_a_raw(self):
+        sample = ["10:11:12 rotacion de buzon.log"] * 5
+        self.assertEqual(server.detect_format(sample), "auto")
+        rows, _ = server.parse_auto(sample)
+        self.assertEqual(rows[0]["ts"], "10:11:12")
+        self.assertNotEqual(rows[0]["level"], "RAW")
+
+    def test_java_con_fecha_es_generic(self):
+        sample = [
+            "2026-10-30 09:12:01.123 ERROR com.example.Main - fallo en el parseo",
+            "    at com.example.LogParser.parse(LogParser.java:42)",
+            "    at com.example.Main.main(Main.java:17)",
+            "2026-10-30 09:12:02.456 INFO com.example.Main - reintentando",
+        ]
+        self.assertEqual(server.detect_format(sample), "generic")
+
+    def test_xml_no_cae_a_raw(self):
+        sample = [
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+            "<log>",
+            "  <entry time=\"2026-10-30T10:00:00Z\" level=\"error\">disk full</entry>",
+            "  <entry time=\"2026-10-30T10:00:01Z\" level=\"info\">ok</entry>",
+            "</log>",
+        ]
+        fmt = server.detect_format(sample)
+        self.assertNotEqual(fmt, "raw")
+        self.assertIn(fmt, ("logfmt", "auto"))
+
+    def test_generic_gana_a_piloop_si_hay_nivel(self):
+        # '2026-10-30 10:00:00 INFO arranque' tiene nivel: es generic,
+        # no piloop (que es timestamp + componente, sin nivel).
+        sample = ["2026-10-30 10:00:00 INFO arranque"] * 5
+        self.assertEqual(server.detect_format(sample), "generic")
+        sample = ["2026-10-12 20:40:16 logs: rotado buzon.log"] * 5
+        self.assertEqual(server.detect_format(sample), "piloop")
+
+    def test_apache_umbral_40(self):
+        sample = (['127.0.0.1 - - [10/Oct/2023:13:55:36 -0700] "GET /a HTTP/1.1" 200 1234'] * 4
+                  + ["Traceback (most recent call last):"] * 6)
+        self.assertEqual(server.detect_format(sample), "apache")
+
+    def test_sin_estructura_sigue_raw(self):
+        self.assertEqual(server.detect_format(["Traceback (most recent call last):"] * 10), "raw")
+        self.assertEqual(server.detect_format(["    at a.B(B.java:1)"] * 10), "raw")
+        self.assertEqual(server.detect_format([]), "raw")
+        # 3 de 10 lineas con fecha: por debajo del 40% y sin nivel ni kv.
+        self.assertEqual(server.detect_format(
+            ["2026-10-12 20:40:16 logs: rotado a.log"] * 3
+            + ["Traceback (most recent call last):"] * 7), "raw")
+
+    def test_fallback_auto_antes_que_raw(self):
+        # Ningun formato concreto, pero hay timestamps en el 60% de las lineas.
+        sample = ["2026-10-30T10:00:00Z algo suelto"] * 6 + ["sin fecha ni nada"] * 4
+        self.assertEqual(server.detect_format(sample), "auto")
+
+    def test_w3c_detect(self):
+        sample = [
+            "#Software: Microsoft Internet Information Services 10.0",
+            "#Fields: date time c-ip cs-method cs-uri-stem sc-status",
+            "2026-10-30\t10:00:00\t10.0.0.5\tGET\t/a\t200",
+        ] * 3
+        self.assertEqual(server.detect_format(sample), "w3c")
+
+    def test_jsonl_detect(self):
+        sample = ['{"ts":"2026-10-30T10:00:00Z","level":"info","msg":"ok"}'] * 8
+        self.assertEqual(server.detect_format(sample), "json")
+
+    def test_orden_csv_no_confunde_con_logfmt(self):
+        sample = ["ts=2026-10-30T10:15:30Z level=info msg=ok app=api"] * 5
+        self.assertEqual(server.detect_format(sample), "logfmt")
+
+
+class TestContinuacionesU03(unittest.TestCase):
+    """U0.3: los stack traces se anexan a la fila del error (una sola fila)."""
+
+    JAVA = [
+        "2026-10-30 09:12:01 buzon: error al procesar tarea t4c35fe97",
+        "java.lang.RuntimeException: fallo en el parseo",
+        "    at com.example.LogParser.parse(LogParser.java:42)",
+        "    at com.example.Main.main(Main.java:17)",
+        "Caused by: java.io.IOException: stream cerrado",
+        "    at java.io.InputStream.read(InputStream.java:101)",
+        "2026-10-30 09:12:05 buzon: reintentando",
+    ]
+
+    PY = [
+        "2026-10-30 09:20:00 - app - ERROR - boom",
+        "Traceback (most recent call last):",
+        '  File "app.py", line 3, in main',
+        '    raise ValueError("x")',
+        "ValueError: x",
+        "2026-10-30 09:20:01 - app - INFO - sigue",
+    ]
+
+    def _ds(self, lines, name="trace.log"):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return server.load_file(path, user="local")
+
+    def test_reglas_de_continuacion(self):
+        prev_ts = "2026-10-30 09:12:01 buzon: error"
+        self.assertTrue(server.is_continuation_line("    at a.B(B.java:1)", prev_ts))
+        self.assertTrue(server.is_continuation_line("Caused by: java.io.IOException", prev_ts))
+        self.assertTrue(server.is_continuation_line("Traceback (most recent call last):", prev_ts))
+        self.assertTrue(server.is_continuation_line('  File "a.py", line 1', prev_ts))
+        # sin timestamp y la anterior lo tiene: continuacion
+        self.assertTrue(server.is_continuation_line("ValueError: x", prev_ts))
+        # una linea con su propio timestamp NO es continuacion
+        self.assertFalse(server.is_continuation_line("2026-10-30 09:12:05 buzon: ok", prev_ts))
+        # linea vacia: solo si el trace ya esta abierto
+        self.assertFalse(server.is_continuation_line("", prev_ts, False))
+        self.assertTrue(server.is_continuation_line("", prev_ts, True))
+        # sin anterior ni timestamp: no se anexa a nada
+        self.assertFalse(server.is_continuation_line("campo=valor", None))
+
+    def test_java_trace_en_una_fila(self):
+        ds = self._ds(self.JAVA, "java_trace.log")
+        rows = ds["store"].rows
+        self.assertEqual(len(rows), 2, "el trace debe quedar en una sola fila")
+        self.assertIn("at com.example.LogParser.parse", rows[0]["raw"])
+        self.assertIn("Caused by: java.io.IOException", rows[0]["raw"])
+        self.assertIn("at com.example.LogParser.parse", rows[0]["msg"])
+        self.assertEqual(rows[0]["_line"], 0)
+        self.assertEqual(rows[1]["_line"], 6)
+
+    def test_python_trace_en_una_fila(self):
+        ds = self._ds(self.PY, "py_trace.log")
+        rows = ds["store"].rows
+        self.assertEqual(len(rows), 2)
+        self.assertIn("Traceback (most recent call last):", rows[0]["raw"])
+        self.assertIn('raise ValueError("x")', rows[0]["raw"])
+        self.assertIn("ValueError: x", rows[0]["msg"])
+
+    def test_tope_de_lineas_de_continuacion(self):
+        lines = ["2026-10-30 10:00:00 app: error"]
+        lines += ["    at frame.%d(Frame.java:%d)" % (i, i) for i in range(60)]
+        ds = self._ds(lines, "largo.log")
+        rows = ds["store"].rows
+        self.assertEqual(len(rows), 2, "el trace se corta a los 40 frames")
+        self.assertEqual(rows[0]["raw"].count("\n"), 40)
+
+    def test_csv_sin_timestamp_no_se_pega(self):
+        # Un CSV legitimo sin columna de fecha no debe fusionarse en una fila.
+        ds = self._ds(["user,action", "ana,login", "bob,logout", "carla,download"],
+                      "sinfecha.csv")
+        self.assertGreater(len(ds["store"].rows), 1)
+
+    def test_contadores_coherentes_tras_agrupar(self):
+        ds = self._ds(self.JAVA, "java_trace2.log")
+        store = ds["store"]
+        levels = store.counters.get("levels", {})
+        total = sum(v for v in levels.values() if v > 0)
+        self.assertEqual(total, len(store.rows),
+                         "los RAW absorbidos deben descontarse del contador")
+        self.assertGreater(levels.get("RAW", 0), 0)
+
+    def test_attach_continuations_reutilizable(self):
+        rows, counters = server.parse_raw([
+            "2026-10-30 10:00:00 app: error",
+            "Traceback (most recent call last):",
+            "  File \"a.py\", line 1",
+        ])
+        merged = server.attach_continuations(rows, counters)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["raw"].count("\n"), 2)
+        self.assertEqual(sum(counters["levels"].values()), 1)
+
+
+class TestFormatBadgeAndDynamicCols(unittest.TestCase):
+    """U2.1 (2026-10-30): el parser auto puebla columnas dinamicas, el export
+    las conserva y el dataset informa del formato y de las lineas RAW."""
+
+    LOGFMT = [
+        'linea suelta sin estructura ni pares clave valor',
+        '2026-10-30T10:00:01Z level=INFO host=web01 app=api pid=4211 '
+        'method=GET path=/orders status=200 duration=12ms',
+        '2026-10-30T10:00:02Z level=ERROR host=web02 app=worker pid=4212 '
+        'status=500 duration=3s msg="falla el job"',
+    ]
+
+    # Logfmt + stack trace + linea suelta: mezcla real de un servicio.
+    MIXED = LOGFMT + [
+        "Traceback (most recent call last):",
+        "  File \"worker.py\", line 42, in run",
+        "    raise ValueError('disk full')",
+        "2026-10-30 10:00:05,123 - app.logger - INFO - servicio listo",
+    ]
+
+    def _mem(self, rows):
+        for r in rows:
+            r["_search"] = server._make_search(r)
+        return server.MemStore(rows=rows)
+
+    def test_auto_puebla_claves_dinamicas(self):
+        rows, counters = server.parse_auto(self.LOGFMT)
+        self.assertEqual(rows[0]["level"], "RAW")
+        self.assertEqual(rows[1]["host"], "web01")
+        self.assertEqual(rows[1]["app"], "api")
+        self.assertEqual(rows[1]["pid"], "4211")
+        self.assertEqual(rows[1]["status"], "200")
+        self.assertEqual(rows[1]["duration"], "12ms")
+        self.assertEqual(rows[1]["method"], "GET")
+        self.assertEqual(rows[1]["path"], "/orders")
+        self.assertEqual(rows[2]["level"], "ERR")
+        self.assertIn("duration", counters["keys"])
+
+    def test_ui_columns_ofrecen_las_claves_y_no_los_huecos(self):
+        rows, _ = server.parse_auto(self.LOGFMT)
+        cols = server._ui_columns(self._mem(rows))
+        for c in ("host", "app", "pid", "status", "duration", "method", "path"):
+            self.assertIn(c, cols, c)
+        # 'bytes' no aparece en ningun registro: no se ofrece vacio
+        self.assertNotIn("bytes", cols)
+        self.assertNotIn("raw", cols)
+        self.assertNotIn("ts_norm", cols)
+
+    def test_format_stats_cuenta_raw(self):
+        rows, _ = server.parse_auto(self.LOGFMT)
+        ds = {"store": self._mem(rows), "format": "auto", "name": "x.log",
+              "size": 100, "total": len(rows)}
+        st = server.format_stats(ds)
+        self.assertEqual(st["raw_lines"], 1)
+        self.assertEqual(st["cont_lines"], 0)
+        self.assertEqual(st["raw_pct"], round(100.0 / len(rows), 1))
+        # cacheado en el dataset: la segunda llamada no recalcula el conteo
+        self.assertIs(ds["_raw_stats"], st)
+        self.assertEqual(server.format_stats(ds), st)
+
+    def test_format_stats_en_dataset_real(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "servicio.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.MIXED) + "\n")
+        ds = server.load_file(path, user="local")
+        s = server.summary(ds)
+        self.assertIn("raw_lines", s)
+        self.assertIn("raw_pct", s)
+        self.assertIn("cont_lines", s)
+        # 7 lineas, menos filas: las continuaciones del traceback se anexan
+        self.assertEqual(s["cont_lines"], s["total"] - s["parsed"])
+        self.assertGreater(s["total"], 0)
+        self.assertGreater(s["cont_lines"], 0)
+        self.assertEqual(s["raw_pct"],
+                         round(100.0 * (s["raw_lines"] + s["cont_lines"]) /
+                               s["total"], 1))
+
+    def test_export_conserva_las_claves_del_parser_auto(self):
+        rows, _ = server.parse_auto(self.LOGFMT)
+        cols = server.export_columns(self._mem(rows))
+        for c in ("host", "app", "pid", "status", "duration", "method", "path"):
+            self.assertIn(c, cols, c)
+        for k in server.EXPORT_SKIP_KEYS:
+            self.assertNotIn(k, cols)
+
+    def test_api_rows_devuelve_formato_y_raw(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "servicio.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.LOGFMT) + "\n")
+        ds = server.load_file(path, user="local")
+        self.addCleanup(lambda: server.SESSIONS.get("local", {}).pop(
+            ds["name"], None))
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        server.SESSIONS.setdefault("local", {})[ds["name"]] = ds
+        port = srv.server_address[1]
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/rows?name=%s" % (port, ds["name"])) as r:
+                body = json.loads(r.read().decode("utf-8"))
+        finally:
+            srv.shutdown()
+        self.assertIn("raw_lines", body)
+        self.assertIn("raw_pct", body)
+        self.assertIn("cont_lines", body)
+        self.assertIn("host", body["columns"])
+        self.assertIn("duration", body["columns"])
+        self.assertGreaterEqual(body["raw_lines"], 1)
+
+
+class TestPythonLoggingU31(unittest.TestCase):
+    """U3.1 (2026-10-30): python logging con muestras realistas.
+
+    Formato: 'YYYY-MM-DD HH:MM:SS,mmm - logger - LEVEL - mensaje'.
+    Se comprueba formato detectado, ts (con coma de milisegundos), nivel
+    normalizado y la columna 'logger'.
+    """
+
+    REAL = [
+        "2026-10-30 10:11:50,123 - app.logger - INFO - arranque del servicio ok",
+        "2026-10-30 10:11:51,456 - app.logger - WARNING - reintento 2 de 3",
+        "2026-10-30 10:11:52,789 - net.client - ERROR - 10.0.0.5 rechazado",
+        "2026-10-30 10:11:53,001 - db.pool - DEBUG - query devolvio 12 filas",
+        "2026-10-30 10:11:54,500 - app - CRITICAL - disco lleno en /var",
+    ]
+
+    def test_detect_python_logging(self):
+        self.assertEqual(server.detect_format(self.REAL), "python")
+
+    def test_detect_python_con_tracebacks_intercalados(self):
+        sample = self.REAL[:3] + [
+            "Traceback (most recent call last):",
+            '  File "app.py", line 3, in main',
+            '    raise ValueError("x")',
+            "ValueError: x",
+        ]
+        self.assertEqual(server.detect_format(sample), "python")
+
+    def test_ts_logger_nivel_y_msg(self):
+        rows, counters = server.parse_python_logging(self.REAL)
+        self.assertEqual(len(rows), 5)
+        r = rows[0]
+        self.assertEqual(r["ts"], "2026-10-30 10:11:50,123")
+        self.assertEqual(r["ts_norm"], "2026-10-30T10:11:50.123000")
+        self.assertEqual(r["level"], "INF")
+        self.assertEqual(r["logger"], "app.logger")
+        self.assertEqual(r["msg"], "arranque del servicio ok")
+        self.assertEqual(counters["levels"]["CRIT"], 1)
+        self.assertEqual(counters["logger"]["net.client"], 1)
+
+    def test_niveles_normalizados(self):
+        for lvl, expected in (("WARNING", "WRN"), ("CRITICAL", "CRIT"),
+                             ("DEBUG", "DBG"), ("ERROR", "ERR"),
+                             ("FATAL", "CRIT"), ("NOTSET", "INF")):
+            rows, _ = server.parse_python_logging(
+                ["2026-10-30 10:11:50,123 - app - %s - mensaje" % lvl])
+            self.assertEqual(rows[0]["level"], expected, lvl)
+
+    def test_sin_logger_y_sin_milisegundos(self):
+        rows, _ = server.parse_python_logging(
+            ["2026-10-30 10:11:52 - WARNING - algo raro"])
+        self.assertEqual(rows[0]["level"], "WRN")
+        self.assertEqual(rows[0]["logger"], "")
+        self.assertEqual(rows[0]["ts"], "2026-10-30 10:11:52")
+        self.assertEqual(rows[0]["msg"], "algo raro")
+
+    def test_separador_con_colon(self):
+        rows, _ = server.parse_python_logging(
+            ["2026-10-30 10:11:52,000 - worker - INFO: tarea terminada"])
+        self.assertEqual(rows[0]["level"], "INF")
+        self.assertEqual(rows[0]["logger"], "worker")
+        self.assertEqual(rows[0]["msg"], "tarea terminada")
+
+    def test_linea_no_matchea_es_raw_sin_ts(self):
+        rows, counters = server.parse_python_logging(
+            ["Traceback (most recent call last):"])
+        self.assertEqual(rows[0]["level"], "RAW")
+        self.assertEqual(rows[0]["ts"], "")
+        self.assertEqual(rows[0]["msg"], "Traceback (most recent call last):")
+        self.assertEqual(counters["levels"]["RAW"], 1)
+
+    def test_ip_y_filtros(self):
+        rows, counters = server.parse_python_logging([self.REAL[2]])
+        self.assertEqual(rows[0]["ip"], "10.0.0.5")
+        self.assertEqual(counters["ips"]["10.0.0.5"], 1)
+        rows, _ = server.parse_python_logging(self.REAL)
+        got = server.apply_filters(rows, {"dt_from": "2026-10-30",
+                                          "dt_to": "2026-10-31"})
+        self.assertEqual(len(got), 5)
+        got = server.apply_filters(rows, {"level": "ERR,CRIT"})
+        self.assertEqual(len(got), 2)
+
+
+class TestSyslog3164U31(unittest.TestCase):
+    """U3.1: syslog RFC 3164 real (nginx, sshd, postgres, kernel, systemd).
+
+    Sin anio: se rellena con el anio actual. La prioridad '<N>' da el nivel
+    (pri % 8) y hay columnas host, app y pid.
+    """
+
+    REAL = [
+        "Oct 30 10:00:00 web01 nginx[1234]: upstream timed out while proxying /api",
+        "Oct 30 10:00:01 web01 sshd[99]: Failed password for root from 10.0.0.5 port 22 ssh2",
+        "Oct 30 10:00:02 db01 postgres[501]: connection to server lost",
+        "<13>Oct 30 10:00:03 web-01 kernel: out of memory: kill process 4321",
+        "<11>Oct 30 10:00:04 web-01 systemd[1]: Main process exited",
+    ]
+
+    def test_detect_syslog3164(self):
+        self.assertEqual(server.detect_format(self.REAL), "syslog3164")
+
+    def test_detect_syslog3164_con_lineas_raw(self):
+        sample = self.REAL + ["Traceback (most recent call last):"] * 5
+        self.assertEqual(server.detect_format(sample), "syslog3164")
+
+    def test_columnas_host_app_pid_msg(self):
+        rows, counters = server.parse_syslog3164(self.REAL)
+        self.assertEqual(len(rows), 5)
+        r = rows[0]
+        self.assertEqual(r["host"], "web01")
+        self.assertEqual(r["app"], "nginx")
+        self.assertEqual(r["pid"], "1234")
+        self.assertEqual(r["msg"], "upstream timed out while proxying /api")
+        self.assertEqual(r["level"], "INF")
+        self.assertTrue(r["ts_norm"].endswith("-10-30T10:00:00"))
+        self.assertEqual(counters["hosts"]["web01"], 2)
+        self.assertEqual(counters["apps"]["sshd"], 1)
+
+    def test_anio_actual_rellenado(self):
+        rows, _ = server.parse_syslog3164([self.REAL[0]])
+        self.assertEqual(rows[0]["ts"][:4], time.strftime("%Y"))
+
+    def test_prioridad_da_nivel(self):
+        for pri, expected in ((13, "INF"), (11, "ERR"), (3, "ERR"),
+                             (7, "DBG"), (0, "CRIT"), (4, "WRN")):
+            rows, _ = server.parse_syslog3164(
+                ["<%d>Oct 30 10:00:05 web01 app: mensaje" % pri])
+            self.assertEqual(rows[0]["level"], expected, pri)
+
+    def test_sin_prioridad_nivel_del_mensaje(self):
+        rows, _ = server.parse_syslog3164(
+            ["Oct 30 10:00:06 web01 nginx: ERROR upstream caido"])
+        self.assertEqual(rows[0]["level"], "ERR")
+        self.assertEqual(rows[0]["app"], "nginx")
+
+    def test_sin_pid_y_host_con_guion(self):
+        rows, _ = server.parse_syslog3164(
+            ["Oct 30 10:00:05 web-01 app mensaje suelto"])
+        self.assertEqual(rows[0]["host"], "web-01")
+        self.assertEqual(rows[0]["app"], "app")
+        self.assertEqual(rows[0]["pid"], "")
+        self.assertEqual(rows[0]["msg"], "mensaje suelto")
+        self.assertEqual(rows[0]["level"], "INF")
+
+    def test_ip_y_filtros_syslog3164(self):
+        rows, counters = server.parse_syslog3164(self.REAL)
+        self.assertEqual(rows[1]["ip"], "10.0.0.5")
+        self.assertEqual(counters["ips"]["10.0.0.5"], 1)
+        got = server.apply_filters(rows, {"dt_from": "2026-10-30",
+                                         "dt_to": "2026-10-31"})
+        self.assertEqual(len(got), 5)
+        got = server.apply_filters(rows, {"level": ["ERR"]})
+        self.assertEqual(len(got), 1)
+
+    def test_syslog3164_no_confundido_con_5424(self):
+        sample = ["1 2026-10-30T10:00:00.000Z web01 nginx[1]: ok"] * 8
+        self.assertEqual(server.detect_format(sample), "syslog")
+
+
+class TestIso8601U31(unittest.TestCase):
+    """U3.1: ISO 8601 con T, Z, fraccion y offsets; ts_norm siempre en UTC."""
+
+    def test_iso_z_con_fraccion(self):
+        raw, norm = server.extract_ts(
+            "2026-10-30T10:15:30.123Z app=api level=info msg=ok")
+        self.assertEqual(raw, "2026-10-30T10:15:30.123Z")
+        self.assertTrue(norm.startswith("2026-10-30T10:15:30"))
+
+    def test_iso_offset_positivo_con_colon(self):
+        raw, norm = server.extract_ts("2026-10-30T10:15:30+02:00 app=api")
+        self.assertEqual(raw, "2026-10-30T10:15:30+02:00")
+        self.assertEqual(norm, "2026-10-30T08:15:30")
+
+    def test_iso_offset_sin_colon(self):
+        raw, norm = server.extract_ts("2026-10-30T10:15:30+0200 app=api")
+        self.assertEqual(raw, "2026-10-30T10:15:30+0200")
+        self.assertEqual(norm, "2026-10-30T08:15:30")
+
+    def test_iso_offset_negativo(self):
+        raw, norm = server.extract_ts("2026-10-30T10:15:30-05:00 app=api")
+        self.assertEqual(norm, "2026-10-30T15:15:30")
+
+    def test_iso_con_espacio_y_sin_zona(self):
+        raw, norm = server.extract_ts("2026-10-30 10:15:30 INFO arranque")
+        self.assertEqual(raw, "2026-10-30 10:15:30")
+        self.assertEqual(norm, "2026-10-30T10:15:30")
+
+    def test_iso_en_json_line(self):
+        line = ('{"@timestamp": "2026-10-30T10:15:30.000+01:00", '
+                '"level": "error", "message": "disk full", "ip": "10.0.0.9"}')
+        self.assertEqual(server.detect_format([line] * 5), "json")
+        rows, counters = server.parse_json([line])
+        self.assertEqual(rows[0]["ts"], "2026-10-30T10:15:30.000+01:00")
+        self.assertEqual(rows[0]["level"], "ERR")
+        self.assertEqual(rows[0]["msg"], "disk full")
+        self.assertEqual(rows[0]["ip"], "10.0.0.9")
+        self.assertEqual(counters["levels"]["ERR"], 1)
+
+    def test_iso_en_auto_puebla_columnas(self):
+        rows, counters = server.parse_auto(
+            ["2026-10-30T10:15:30+0200 level=error ip=10.0.0.7 "
+             "method=POST path=/orders status=500 duration=3s"])
+        r = rows[0]
+        self.assertEqual(r["ts"], "2026-10-30T10:15:30+0200")
+        self.assertEqual(r["ts_norm"], "2026-10-30T08:15:30")
+        self.assertEqual(r["level"], "ERR")
+        self.assertEqual(r["ip"], "10.0.0.7")
+        self.assertEqual(r["status"], "500")
+        self.assertIn("duration", counters["keys"])
+
+    def test_detect_iso_t_no_cae_a_raw(self):
+        sample = ["2026-10-30T10:15:30.000Z api srv01 GET /health 200 12ms"] * 5
+        fmt = server.detect_format(sample)
+        self.assertNotEqual(fmt, "raw")
+        rows, _ = server.PARSERS[fmt](sample)
+        self.assertTrue(rows[0]["ts_norm"])
+
+    def test_rango_de_filtros_con_iso(self):
+        rows, _ = server.parse_auto(["2026-10-30T23:59:59Z level=info msg=fin",
+                                     "2026-11-01T00:00:01Z level=info msg=inicio"])
+        got = server.apply_filters(rows, {"dt_from": "2026-10-31",
+                                         "dt_to": "2026-11-02"})
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["ts"], "2026-11-01T00:00:01Z")
+
+
+class TestEpochU31(unittest.TestCase):
+    """U3.1: epoch en segundos y en milisegundos."""
+
+    def test_epoch_segundos(self):
+        raw, norm = server.extract_ts("1761234567 INFO servicio listo")
+        self.assertEqual(raw, "1761234567")
+        self.assertEqual(norm, "2025-10-23T15:49:27")
+
+    def test_epoch_milisegundos(self):
+        raw, norm = server.extract_ts("1761234567890 WARN host=web01")
+        self.assertEqual(raw, "1761234567890")
+        self.assertEqual(norm, "2025-10-23T15:49:27.890000")
+
+    def test_epoch_en_logfmt(self):
+        rows, _ = server.parse_logfmt(
+            ['ts=1761234567 level=error msg="fallo de conexion" app=api'])
+        r = rows[0]
+        self.assertEqual(r["ts"], "1761234567")
+        self.assertEqual(r["ts_norm"], "2025-10-23T15:49:27")
+        self.assertEqual(r["level"], "ERR")
+        self.assertEqual(r["msg"], "fallo de conexion")
+        self.assertEqual(r["app"], "api")
+
+    def test_epoch_en_csv_sin_cabecera(self):
+        rows, _ = server.parse_csv(["1761234567,ERROR,caida,web01",
+                                    "1761234568,INFO,ok,web02"])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["ts"], "1761234567")
+        self.assertEqual(rows[0]["ts_norm"], "2025-10-23T15:49:27")
+        self.assertEqual(rows[0]["level"], "ERR")
+        self.assertEqual(rows[0]["c3"], "web01")
+
+    def test_epoch_no_tapa_a_iso(self):
+        raw, norm = server.extract_ts("2026-10-30T10:00:00Z id=1761234567890")
+        self.assertEqual(raw, "2026-10-30T10:00:00Z")
+        self.assertTrue(norm.startswith("2026-10-30T10:00:00"))
+
+    def test_detect_epoch_es_auto(self):
+        sample = ["1761234567890 WARN host=web01 disk lleno"] * 5
+        self.assertEqual(server.detect_format(sample), "auto")
+        rows, counters = server.parse_auto(sample)
+        self.assertEqual(rows[0]["level"], "WRN")
+        self.assertEqual(rows[0]["ts_norm"], "2025-10-23T15:49:27.890000")
+        self.assertEqual(rows[0]["host"], "web01")
+        self.assertIn("host", counters["keys"])
+
+    def test_epoch_en_filtros_de_fecha(self):
+        rows, _ = server.parse_auto(["1761234567 INFO arranque",
+                                     "1761234567890 WARN caida"])
+        got = server.apply_filters(rows, {"dt_from": "2025-10-23",
+                                         "dt_to": "2025-10-24"})
+        self.assertEqual(len(got), 2)
+
+
+class TestLogfmtU31(unittest.TestCase):
+    """U3.1: logfmt real (Heroku, Go, Prometheus) con comillas y claves variadas."""
+
+    REAL = [
+        'ts=2026-10-30T10:00:00Z level=info msg="arranque ok" app=api pid=4211',
+        "ts=2026-10-30T10:00:01Z severity=warn message='disk full on /var' "
+        "host=web01 duration=12ms",
+        'time="2026-10-30 10:00:02" lvl=debug method=GET path=/orders status=200',
+    ]
+
+    def test_detect_logfmt(self):
+        self.assertEqual(server.detect_format(self.REAL), "logfmt")
+
+    def test_comillas_dobles_y_simples(self):
+        rows, counters = server.parse_logfmt(self.REAL)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]["msg"], "arranque ok")
+        self.assertEqual(rows[1]["msg"], "disk full on /var")
+        self.assertEqual(rows[0]["level"], "INF")
+        self.assertEqual(rows[1]["level"], "WRN")
+        self.assertEqual(rows[2]["level"], "DBG")
+        self.assertEqual(rows[0]["pid"], "4211")
+        self.assertEqual(rows[1]["duration"], "12ms")
+        self.assertEqual(rows[2]["status"], "200")
+        self.assertIn("duration", counters["keys"])
+
+    def test_ts_de_claves_alternativas(self):
+        rows, _ = server.parse_logfmt(
+            ['timestamp="2026-10-30 10:15:31" level=error msg=fallo'])
+        self.assertEqual(rows[0]["ts"], "2026-10-30 10:15:31")
+        self.assertEqual(rows[0]["ts_norm"], "2026-10-30T10:15:31")
+        rows, _ = server.parse_logfmt(
+            ["_time=2026-10-30T10:15:32Z log_level=warning msg=aviso"])
+        self.assertEqual(rows[0]["ts"], "2026-10-30T10:15:32Z")
+        self.assertEqual(rows[0]["level"], "WRN")
+
+    def test_linea_sin_kv_es_raw(self):
+        rows, counters = server.parse_logfmt(["Traceback (most recent call last):"])
+        self.assertEqual(rows[0]["level"], "RAW")
+        self.assertEqual(rows[0]["ts"], "")
+        self.assertEqual(counters["levels"]["RAW"], 1)
+
+    def test_valor_vacio_y_claves_dinamicas(self):
+        rows, counters = server.parse_logfmt(["level=error code=500 msg= retry=3"])
+        r = rows[0]
+        self.assertEqual(r["level"], "ERR")
+        self.assertEqual(r["code"], "500")
+        self.assertEqual(r["retry"], "3")
+        self.assertIn("retry", counters["keys"])
+
+    def test_detect_logfmt_con_mecla_raw(self):
+        sample = self.REAL + ["Traceback (most recent call last):"] * 2
+        self.assertEqual(server.detect_format(sample), "logfmt")
+
+    def test_filtros_logfmt(self):
+        rows, _ = server.parse_logfmt(self.REAL)
+        got = server.apply_filters(rows, {"level": ["WRN"]})
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["host"], "web01")
+        got = server.apply_filters(rows, {"dt_from": "2026-10-30",
+                                         "dt_to": "2026-10-31"})
+        self.assertEqual(len(got), 3)
+
+
+class TestCsvDelimitadoresU31(unittest.TestCase):
+    """U3.1: CSV con coma, punto y coma, tabulador y barra; cabecera o sin ella."""
+
+    def test_coma_con_cabecera_espanola(self):
+        rows, counters = server.parse_csv([
+            "fecha,nivel,mensaje,host",
+            "2026-10-30 10:00:00,ERROR,timeout,web01",
+            "2026-10-30 10:00:01,INFO,ok,web02",
+        ])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["ts"], "2026-10-30 10:00:00")
+        self.assertEqual(rows[0]["ts_norm"], "2026-10-30T10:00:00")
+        self.assertEqual(rows[0]["level"], "ERR")
+        self.assertEqual(rows[0]["msg"], "timeout")
+        self.assertEqual(rows[0]["host"], "web01")
+        self.assertEqual(counters["keys"]["host"], 2)
+
+    def test_punto_y_coma(self):
+        rows, _ = server.parse_csv(["date;level;message;host",
+                                    "2026-10-30 10:00:00;WARN;reintento 3;web01"])
+        self.assertEqual(rows[0]["ts"], "2026-10-30 10:00:00")
+        self.assertEqual(rows[0]["level"], "WRN")
+        self.assertEqual(rows[0]["msg"], "reintento 3")
+        self.assertEqual(rows[0]["host"], "web01")
+
+    def test_tabulador(self):
+        rows, _ = server.parse_csv(["date\tlevel\tmessage\thost",
+                                    "2026-10-30 10:00:00\tDEBUG\ttask done\tweb02"])
+        self.assertEqual(rows[0]["level"], "DBG")
+        self.assertEqual(rows[0]["msg"], "task done")
+        self.assertEqual(rows[0]["host"], "web02")
+        self.assertTrue(rows[0]["ts_norm"].startswith("2026-10-30T10:00:00"))
+
+    def test_barra_vertical(self):
+        rows, _ = server.parse_csv(["fecha|nivel|mensaje",
+                                    "2026-10-30 10:00:00|ERROR|caida del servicio"])
+        self.assertEqual(rows[0]["level"], "ERR")
+        self.assertEqual(rows[0]["msg"], "caida del servicio")
+        self.assertEqual(rows[0]["ts_norm"], "2026-10-30T10:00:00")
+
+    def test_sin_cabecera_columnas_generadas(self):
+        rows, _ = server.parse_csv([
+            "2026-10-30,INFO,ok,web01",
+            "2026-10-31,ERROR,caida,web02",
+        ])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["ts"], "2026-10-30")
+        self.assertEqual(rows[0]["level"], "INF")
+        self.assertEqual(rows[0]["c2"], "ok")
+        self.assertEqual(rows[1]["c3"], "web02")
+
+    def test_comilla_dentro_del_valor(self):
+        rows, _ = server.parse_csv([
+            "date,level,message,host",
+            '2026-10-30,ERROR,"a, b, c",web01',
+        ])
+        self.assertEqual(rows[0]["msg"], "a, b, c")
+        self.assertEqual(rows[0]["host"], "web01")
+
+    def test_detect_csv_con_iso_y_epoch(self):
+        sample = ["fecha,nivel,mensaje,host"] + [
+            "2026-10-30T10:00:00Z,INFO,ok,web01"] * 9
+        self.assertEqual(server.detect_format(sample), "csv")
+        rows, _ = server.parse_csv(sample[:2])
+        self.assertEqual(rows[0]["ts"], "2026-10-30T10:00:00Z")
+        self.assertTrue(rows[0]["ts_norm"].startswith("2026-10-30T10:00:00"))
+
+    def test_csv_con_columnas_de_ip(self):
+        rows, counters = server.parse_csv([
+            "timestamp,level,client_ip,message",
+            "2026-10-30 10:00:00,ERROR,10.0.0.5,timeout",
+        ])
+        self.assertEqual(rows[0]["ip"], "10.0.0.5")
+        self.assertEqual(counters["ips"]["10.0.0.5"], 1)
+        self.assertEqual(rows[0]["level"], "ERR")
+
+
+class TestHoraSolaU31(unittest.TestCase):
+    """U3.1: lineas solo con hora (sin fecha): ts se guarda, ts_norm queda vacio."""
+
+    def test_extract_ts_hora_sola(self):
+        raw, norm = server.extract_ts("10:11:12 rotacion de buzon.log")
+        self.assertEqual(raw, "10:11:12")
+        self.assertEqual(norm, "")
+
+    def test_extract_ts_hora_con_milisegundos(self):
+        raw, norm = server.extract_ts("10:11:12,345 rotacion de buzon.log")
+        self.assertEqual(raw, "10:11:12,345")
+        self.assertEqual(norm, "")
+
+    def test_auto_hora_sola_no_es_raw(self):
+        rows, counters = server.parse_auto(["10:11:12 rotacion de buzon.log"])
+        self.assertEqual(rows[0]["ts"], "10:11:12")
+        self.assertEqual(rows[0]["ts_norm"], "")
+        self.assertNotEqual(rows[0]["level"], "RAW")
+        self.assertEqual(rows[0]["msg"], "rotacion de buzon.log")
+        self.assertEqual(counters["levels"]["RAW"], 0)
+
+    def test_detect_hora_sola_es_auto(self):
+        sample = ["10:11:12 rotacion de buzon.log"] * 5
+        self.assertEqual(server.detect_format(sample), "auto")
+
+    def test_triage_hora_sola_con_fecha_de_fichero(self):
+        line = ("10:11:12 [ai-netwatch] netwatch:findings:pid:23160 -> sospechoso "
+                "conf 0.8 sev 2.0 accion yes | ESCALADA t4f87df76")
+        rows, counters = server.parse_triage([line], file_date="2026-10-30")
+        r = rows[0]
+        self.assertEqual(r["ts"], "2026-10-30 10:11:12")
+        self.assertEqual(r["fuente"], "ai-netwatch")
+        self.assertEqual(r["tarea"], "t4f87df76")
+        self.assertEqual(r["sev"], 2.0)
+        self.assertNotEqual(r["level"], "RAW")
+        self.assertEqual(counters["fuente"]["ai-netwatch"], 1)
+
+    def test_triage_detect_format(self):
+        line = ("10:11:12 [ai-netwatch] netwatch:findings:pid:23160 -> sospechoso "
+                "conf 0.8 sev 2.0 accion yes | sin tarea")
+        self.assertEqual(server.detect_format([line] * 5), "triage")
+
+    def test_epoch_gana_a_la_hora_sola(self):
+        # El extractor prueba ISO y epoch antes que la hora suelta: si la
+        # linea lleva un epoch, ese es el ts (la hora queda en el mensaje).
+        raw, norm = server.extract_ts("10:11:12 1761234567 suelto")
+        self.assertEqual(raw, "1761234567")
+        self.assertEqual(norm, "2025-10-23T15:49:27")
+
+
+class TestJavaTraceU31(unittest.TestCase):
+    """U3.1: stack trace de Java multilinea (frames, Caused by, Suppressed)."""
+
+    TRACE = [
+        "2026-10-30 09:12:01 ERROR com.example.Main - fallo en el parseo",
+        "java.lang.RuntimeException: nested failure",
+        "    at com.example.LogParser.parse(LogParser.java:42)",
+        "    at com.example.Main.main(Main.java:17)",
+        "Caused by: java.io.IOException: stream cerrado",
+        "    at java.io.InputStream.read(InputStream.java:101)",
+        "Suppressed: java.lang.IllegalStateException: cierre forzado",
+        "2026-10-30 09:12:05 INFO com.example.Main - reintentando",
+        "2026-10-30 09:12:06 WARN com.example.Main - reintento 1 de 3",
+        "2026-10-30 09:12:07 DEBUG com.example.Main - contexto: 42 filas",
+    ]
+
+    def test_detect_generic_del_trace_java(self):
+        self.assertEqual(server.detect_format(self.TRACE), "generic")
+
+    def test_trace_en_una_sola_fila(self):
+        rows, counters = server.parse_generic(self.TRACE)
+        merged = server.attach_continuations(rows, counters)
+        self.assertEqual(len(merged), 4)
+        r = merged[0]
+        self.assertEqual(r["level"], "ERR")
+        self.assertEqual(r["ts"], "2026-10-30 09:12:01")
+        self.assertEqual(r["_line"], 0)
+        for frame in ("java.lang.RuntimeException", "at com.example.LogParser.parse",
+                      "Caused by: java.io.IOException",
+                      "Suppressed: java.lang.IllegalStateException"):
+            self.assertIn(frame, r["raw"], frame)
+            self.assertIn(frame, r["msg"], frame)
+        self.assertEqual(sum(counters["levels"].values()), 4)
+
+    def test_reglas_de_continuacion_java(self):
+        prev = "2026-10-30 09:12:01 ERROR com.example.Main - fallo"
+        self.assertTrue(server.is_continuation_line("    at a.B(B.java:1)", prev))
+        self.assertTrue(server.is_continuation_line("Caused by: java.io.IOException", prev))
+        self.assertTrue(server.is_continuation_line("Suppressed: java.lang.IllegalStateException", prev))
+        self.assertTrue(server.is_continuation_line("java.lang.RuntimeException: x", prev))
+        self.assertFalse(server.is_continuation_line("2026-10-30 09:12:05 INFO ok", prev))
+
+    def test_tope_de_frames(self):
+        lines = ["2026-10-30 10:00:00 ERROR app - boom"]
+        lines += ["    at frame.%d(Frame.java:%d)" % (i, i) for i in range(60)]
+        rows, counters = server.parse_raw(lines)
+        merged = server.attach_continuations(rows, counters)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[0]["raw"].count("\n"), 40)
+
+    def test_load_file_end_to_end_java(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "java_trace.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.TRACE) + "\n")
+        ds = server.load_file(path, user="local")
+        self.addCleanup(lambda: server.SESSIONS.get("local", {}).pop(ds["name"], None))
+        self.assertEqual(ds["format"], "generic")
+        rows = ds["store"].rows
+        self.assertEqual(len(rows), 4)
+        self.assertIn("at com.example.Main.main", rows[0]["raw"])
+        st = server.format_stats(ds)
+        self.assertGreater(st["cont_lines"], 0)
+
+
+class TestNginxErrorU31(unittest.TestCase):
+    """U3.1: nginx error_log real, con pid#tid, sin pid y niveles nginx."""
+
+    REAL = [
+        "2026/10/30 10:11:50 [error] 1234#5678: *3 upstream timed out (110: Connection timed out) while proxying",
+        "2026/10/30 10:11:51 [emerg] 99: bind() to 0.0.0.0:80 failed (98: Address already in use)",
+        "2026/10/30 10:11:52 [warn] 1234#0: worker process 4321 exited on signal 11",
+        "2026/10/30 10:11:53 [debug] 1234#5678: *4 http request line parsed",
+    ]
+
+    def test_detect_nginx_error(self):
+        self.assertEqual(server.detect_format(self.REAL), "nginx_error")
+
+    def test_pid_tid_y_msg(self):
+        rows, counters = server.parse_nginx_error(self.REAL)
+        self.assertEqual(len(rows), 4)
+        r = rows[0]
+        self.assertEqual(r["ts"], "2026-10-30 10:11:50")
+        self.assertEqual(r["ts_norm"], "2026-10-30T10:11:50")
+        self.assertEqual(r["level"], "ERR")
+        self.assertEqual(r["pid"], "1234")
+        self.assertEqual(r["tid"], "5678")
+        self.assertIn("upstream timed out", r["msg"])
+        self.assertEqual(counters["pid"]["1234"], 3)
+
+    def test_niveles_nginx_normalizados(self):
+        rows, _ = server.parse_nginx_error(self.REAL)
+        self.assertEqual([r["level"] for r in rows], ["ERR", "CRIT", "WRN", "DBG"])
+
+    def test_sin_pid_y_tid(self):
+        rows, _ = server.parse_nginx_error(
+            ["2026/10/30 10:11:54 [alert] worker process 4321 exited on signal 11"])
+        self.assertEqual(rows[0]["level"], "CRIT")
+        self.assertEqual(rows[0]["pid"], "")
+        self.assertEqual(rows[0]["tid"], "")
+        self.assertEqual(rows[0]["ts_norm"], "2026-10-30T10:11:54")
+
+    def test_ip_en_el_mensaje(self):
+        rows, counters = server.parse_nginx_error(
+            ["2026/10/30 10:11:55 [error] 1234#1: *7 client 192.168.1.7 timed out"])
+        self.assertEqual(rows[0]["ip"], "192.168.1.7")
+        self.assertEqual(counters["ips"]["192.168.1.7"], 1)
+
+    def test_linea_no_matchea_es_raw(self):
+        # parse_nginx_error solo contabiliza en 'levels' las lineas que si
+        # matchean: la linea suelta queda RAW en la fila pero no en el contador.
+        rows, counters = server.parse_nginx_error(["nginx: the configuration file syntax is ok"])
+        self.assertEqual(rows[0]["level"], "RAW")
+        self.assertEqual(rows[0]["ts"], "")
+        self.assertEqual(rows[0]["pid"], "")
+        self.assertEqual(rows[0]["msg"], "nginx: the configuration file syntax is ok")
+        self.assertEqual(counters["levels"].get("RAW", 0), 0)
+
+    def test_filtros_nginx_error(self):
+        rows, _ = server.parse_nginx_error(self.REAL)
+        got = server.apply_filters(rows, {"level": ["CRIT"]})
+        self.assertEqual(len(got), 1)
+        self.assertIn("bind()", got[0]["msg"])
+        got = server.apply_filters(rows, {"dt_from": "2026-10-30",
+                                         "dt_to": "2026-10-31"})
+        self.assertEqual(len(got), 4)
+
+
+class TestNginxAccessCombinedU31(unittest.TestCase):
+    """U3.1: nginx access_log combined (CLF + referer + user agent)."""
+
+    COMBINED = (
+        '192.168.1.5 - - [30/Oct/2026:10:11:12 +0000] "GET /orders HTTP/1.1" 200 1234 '
+        '"https://tienda.example.com/lista" "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"'
+    )
+    NOT_FOUND = (
+        '10.0.0.9 - john [30/Oct/2026:10:11:13 -0500] "POST /api/v1/login HTTP/1.1" 404 0 '
+        '"-" "curl/8.4.0"'
+    )
+    ZERO_BYTES = (
+        '10.0.0.11 - - [30/Oct/2026:10:11:14 +0100] "GET /favicon.ico HTTP/1.1" 304 - '
+        '"https://tienda.example.com/" "Mozilla/5.0"'
+    )
+
+    def test_detect_combined_es_apache(self):
+        self.assertEqual(server.detect_format([self.COMBINED] * 5), "apache")
+
+    def test_combined_columnas_clf(self):
+        rows, counters = server.parse_apache([self.COMBINED, self.NOT_FOUND,
+                                             self.ZERO_BYTES])
+        self.assertEqual(len(rows), 3)
+        r = rows[0]
+        self.assertEqual(r["ip"], "192.168.1.5")
+        self.assertEqual(r["method"], "GET")
+        self.assertEqual(r["path"], "/orders")
+        self.assertEqual(r["code"], "200")
+        self.assertEqual(r["bytes"], "1234")
+        self.assertEqual(r["ts"], "30/Oct/2026:10:11:12 +0000")
+        self.assertEqual(server.norm_ts(r["ts"]), "2026-10-30T10:11:12")
+        self.assertEqual(counters["codes"]["404"], 1)
+        self.assertEqual(counters["methods"]["POST"], 1)
+        self.assertEqual(counters["ips"]["10.0.0.9"], 1)
+
+    def test_bytes_guion_y_offset_negativo(self):
+        rows, _ = server.parse_apache([self.NOT_FOUND, self.ZERO_BYTES])
+        self.assertEqual(rows[0]["bytes"], "0")
+        self.assertEqual(rows[1]["bytes"], "-")
+        self.assertEqual(server.norm_ts(rows[0]["ts"]), "2026-10-30T15:11:13")
+        self.assertEqual(server.norm_ts(rows[1]["ts"]), "2026-10-30T09:11:14")
+
+    def test_ua_con_comillas_no_rompe_el_parseo(self):
+        line = ('127.0.0.1 - - [30/Oct/2026:10:11:15 +0000] "GET /a HTTP/1.1" 200 512 '
+                '"-" "UA test"')
+        rows, counters = server.parse_apache([line])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["code"], "200")
+        self.assertEqual(counters["codes"]["200"], 1)
+
+    def test_filtros_por_codigo_y_fecha(self):
+        # parse_apache no rellena ts_norm (lo hace la carga en api.load_file):
+        # el rango dt_from/dt_to se comprueba con el dataset cargado, y aqui
+        # se usa el filtro 'dt' sobre el ts crudo CLF.
+        rows, _ = server.parse_apache([self.COMBINED, self.NOT_FOUND, self.ZERO_BYTES])
+        got = server.apply_filters(rows, {"code": "404"})
+        self.assertEqual(len(got), 1)
+        got = server.apply_filters(rows, {"dt": "30/Oct/2026"})
+        self.assertEqual(len(got), 3)
+        got = server.apply_filters(rows, {"path": "/orders"})
+        self.assertEqual(len(got), 1)
+
+
+class TestXmlishU31(unittest.TestCase):
+    """U3.1: XML-ish (log4j / Splunk XML): los atributos clave=valor se aprovechan."""
+
+    XML = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        "<log>",
+        '  <entry time="2026-10-30T10:00:00Z" level="error">disk full</entry>',
+        '  <entry time="2026-10-30T10:00:01Z" level="info">ok</entry>',
+        '  <entry time="2026-10-30T10:00:02Z" severity="warning">retry 3</entry>',
+        "</log>",
+    ]
+
+    def test_detect_xml_no_cae_a_raw(self):
+        fmt = server.detect_format(self.XML)
+        self.assertIn(fmt, ("logfmt", "auto"))
+
+    def test_entry_con_ts_y_nivel(self):
+        fmt = server.detect_format(self.XML)
+        rows, counters = server.PARSERS[fmt](self.XML)
+        self.assertEqual(len(rows), 6)
+        r = rows[2]
+        self.assertEqual(r["ts"], "2026-10-30T10:00:00Z")
+        self.assertEqual(r["ts_norm"], "2026-10-30T10:00:00")
+        self.assertEqual(r["level"], "ERR")
+        self.assertEqual(rows[4]["level"], "WRN")
+        self.assertEqual(rows[1]["level"], "RAW")
+        self.assertEqual(rows[1]["ts"], "")
+        self.assertEqual(counters["levels"]["RAW"], 2)
+
+    def test_xml_con_ip_y_claves_dinamicas(self):
+        rows, counters = server.parse_auto([
+            '<event ts="2026-10-30T10:00:03Z" level="error" ip="10.0.0.5" '
+            'host="web01" msg="timeout"/>',
+        ])
+        r = rows[0]
+        self.assertEqual(r["ts"], "2026-10-30T10:00:03Z")
+        self.assertEqual(r["level"], "ERR")
+        self.assertEqual(r["ip"], "10.0.0.5")
+        self.assertEqual(r["host"], "web01")
+        self.assertIn("host", counters["keys"])
+
+    def test_xml_de_un_solo_entry_no_es_raw(self):
+        sample = ['<log><entry time="2026-10-30T10:00:00Z" level="info">ok</entry></log>'] * 5
+        self.assertNotEqual(server.detect_format(sample), "raw")
+
+
+class TestAutoMixtoU31(unittest.TestCase):
+    """U3.1: el parser auto con lineas mixtas de varios formatos reales."""
+
+    MIXED = [
+        "2026-10-30T10:00:00Z level=info msg=arranque app=api",
+        "1761234567890 WARN host=web01 disk lleno",
+        "Oct 30 10:00:02 web01 sshd[99]: Failed password for root from 10.0.0.5 port 22 ssh2",
+        "10:11:12 rotacion de buzon.log",
+        "2026/10/30 10:11:50 [error] 1234#5678: *3 upstream timed out",
+        "Traceback (most recent call last):",
+        '  File "worker.py", line 42, in run',
+        "    raise ValueError('disk full')",
+        '{"ts": "2026-10-30T10:00:05Z", "level": "error", "msg": "json suelto"}',
+    ]
+
+    def test_detect_de_mecla_es_auto(self):
+        self.assertEqual(server.detect_format(self.MIXED), "auto")
+
+    def test_filas_y_niveles_de_cada_linea(self):
+        rows, counters = server.parse_auto(self.MIXED)
+        self.assertEqual(len(rows), 9)
+        self.assertEqual(rows[0]["level"], "INF")
+        self.assertEqual(rows[1]["level"], "WRN")
+        self.assertTrue(rows[1]["ts_norm"].startswith("2025-10-23T15:49:27"))
+        self.assertTrue(rows[2]["ts"].endswith("10:00:02"))
+        self.assertTrue(rows[2]["ts_norm"].endswith("-10-30T10:00:02"))
+        self.assertEqual(rows[3]["ts"], "10:11:12")
+        self.assertEqual(rows[3]["ts_norm"], "")
+        self.assertEqual(rows[4]["level"], "ERR")
+        self.assertEqual(rows[4]["ts_norm"], "2026-10-30T10:11:50")
+        self.assertEqual(rows[5]["level"], "RAW")
+        self.assertEqual(rows[5]["ts"], "")
+        self.assertEqual(rows[8]["level"], "ERR")
+        self.assertEqual(counters["levels"]["RAW"], 3)
+        self.assertEqual(counters["ips"]["10.0.0.5"], 1)
+
+    def test_columnas_dinamicas_del_mecla(self):
+        rows, counters = server.parse_auto(self.MIXED)
+        self.assertIn("app", counters["keys"])
+        self.assertIn("host", counters["keys"])
+        self.assertEqual(rows[0]["app"], "api")
+        self.assertEqual(rows[1]["host"], "web01")
+        cols = server._ui_columns(server.MemStore(rows=rows))
+        for c in ("app", "host", "ip", "level", "ts"):
+            self.assertIn(c, cols, c)
+        self.assertNotIn("raw", cols)
+
+    def test_mecla_continuaciones_se_anexan(self):
+        rows, counters = server.parse_auto(self.MIXED)
+        merged = server.attach_continuations(rows, counters)
+        self.assertEqual(len(merged), 6)
+        self.assertIn("raise ValueError", merged[4]["raw"])
+        self.assertEqual(sum(counters["levels"].values()), 6)
+
+    def test_filtros_sobre_mecla(self):
+        rows, _ = server.parse_auto(self.MIXED)
+        got = server.apply_filters(rows, {"level": ["RAW"]})
+        self.assertEqual(len(got), 3)
+        got = server.apply_filters(rows, {"dt_from": "2026-10-30",
+                                         "dt_to": "2026-10-31"})
+        self.assertEqual(len(got), 4)
+
+    def test_load_file_end_to_end_mecla(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "mixto.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.MIXED) + "\n")
+        ds = server.load_file(path, user="local")
+        self.addCleanup(lambda: server.SESSIONS.get("local", {}).pop(ds["name"], None))
+        self.assertEqual(ds["format"], "auto")
+        st = server.format_stats(ds)
+        # Las 3 lineas del traceback se anexan a la fila anterior: no son
+        # filas RAW sueltas, son continuaciones.
+        self.assertGreaterEqual(st["cont_lines"], 3)
+        self.assertGreater(st["raw_pct"], 0.0)
+
+    def test_auto_no_inventa_ts_cuando_no_lo_hay(self):
+        rows, _ = server.parse_auto(["sin fecha ni nivel ni pares"])
+        self.assertEqual(rows[0]["ts"], "")
+        self.assertEqual(rows[0]["ts_norm"], "")
+        self.assertEqual(rows[0]["level"], "RAW")
+        self.assertEqual(rows[0]["msg"], "sin fecha ni nivel ni pares")
+
+
+class TestSmokeU32(unittest.TestCase):
+    """U3.2 (2026-10-30): huecos encontrados en el smoke real end-to-end.
+
+    Cubre dos fallos detectados al subir los logs de OperVanta al visor en
+    8877: logfmt con la fecha suelta al principio de la linea (sin clave=valor)
+    y volcados de stack traces sin timestamp (orquestador.log), que caian a
+    'raw' con la histograma vacia.
+    """
+
+    NODE_TRACE = [
+        "node:events:487",
+        "      throw er; // Unhandled 'error' event",
+        "      ^",
+        "",
+        "Error: EPIPE: broken pipe, write",
+        "    at Socket._write (node:internal/net:75:18)",
+        "    at writeOrBuffer (node:internal/streams/writable:570:12)",
+        "Emitted 'error' event on Socket instance at:",
+        "    at emitErrorNT (node:internal/streams/destroy:170:8)",
+        "  errno: -4047,",
+        "  syscall: 'write',",
+        "  code: 'EPIPE'",
+        "}",
+        "",
+        "Node.js v24.18.0",
+    ]
+
+    LOGFMT_BARE = [
+        '2026-10-30T09:12:03.481Z level=info service=ingest msg="worker started" queue=3',
+        '2026-10-30T09:12:04.101Z level=warn service=ingest msg="retrying" attempt=2',
+        '2026-10-30T09:12:05.999Z level=error service=ingest host=10.0.0.5 port=5432',
+    ]
+
+    def test_logfmt_sin_clave_ts_coge_la_fecha_suelta(self):
+        rows, _ = server.parse_logfmt(self.LOGFMT_BARE)
+        self.assertEqual(rows[0]["ts"], "2026-10-30T09:12:03.481Z")
+        self.assertEqual(rows[0]["ts_norm"], "2026-10-30T09:12:03.481000")
+        self.assertEqual(rows[1]["ts_norm"], "2026-10-30T09:12:04.101000")
+        self.assertEqual(rows[2]["level"], "ERR")
+        self.assertEqual(rows[2]["host"], "10.0.0.5")
+        # La fecha suelta no se pierde: si no hay msg, el msg es la linea sin ts
+        self.assertEqual(rows[2]["msg"], "level=error service=ingest host=10.0.0.5 port=5432")
+
+    def test_logfmt_clave_ts_sigue_teniendo_prioridad(self):
+        rows, _ = server.parse_logfmt(
+            ['2026-01-01T00:00:00Z ts=2026-10-30T10:00:00Z level=info msg=x'])
+        self.assertEqual(rows[0]["ts"], "2026-10-30T10:00:00Z")
+
+    def test_detect_trace_de_volcado_node(self):
+        self.assertEqual(server.detect_format(self.NODE_TRACE), "trace")
+
+    def test_parse_trace_asigna_nivel_err(self):
+        rows, counters = server.parse_trace(self.NODE_TRACE)
+        self.assertTrue(all(r["level"] == "ERR" for r in rows))
+        self.assertTrue(all(r["ts"] == "" for r in rows))
+        self.assertGreaterEqual(counters["levels"]["ERR"], 10)
+
+    def test_trace_end_to_end_agrupa_el_stack(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "orquestador.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.NODE_TRACE) + "\n")
+        ds = server.load_file(path, user="local")
+        self.addCleanup(lambda: server.SESSIONS.get("local", {}).pop(ds["name"], None))
+        self.assertEqual(ds["format"], "trace")
+        rows = ds["store"].rows
+        # Todo el volcado va sin fecha, asi que attach_continuations lo agrupa
+        # (con el tope de MAX_CONTINUATION_LINES) en pocas filas.
+        self.assertGreater(len(rows), 0)
+        self.assertLess(len(rows), len(self.NODE_TRACE))
+        hist = ds["store"].histogram({}, gran="min")
+        self.assertEqual(sum(b["count"] for b in hist), len(rows))
+        self.assertTrue(hist[0]["t"].startswith("linea "))
+
+    def test_histograma_por_linea_mem_y_sql_coinciden(self):
+        rows = [{"ts": "", "ts_norm": "", "level": "ERR", "ip": "",
+                 "method": "", "path": "", "code": "", "bytes": "",
+                 "msg": "trace %d" % i, "raw": "trace %d" % i, "_line": i}
+                for i in range(250)]
+        mem = server.MemStore(rows=[dict(r) for r in rows])
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        sql = server.SqlStore(os.path.join(tmpdir, "t.db"))
+        self.addCleanup(sql.close)
+        sql.add_rows([dict(r) for r in rows], {})
+        for gran in ("min", "h"):
+            got = mem.histogram({}, gran=gran)
+            want = sql.histogram({}, gran=gran)
+            self.assertEqual(got, want, "gran=%s" % gran)
+            self.assertGreater(sum(b["count"] for b in got), 0)
+        # 250 filas, step 100 -> 3 bloques de 100, 100 y 50
+        self.assertEqual([b["count"] for b in mem.histogram({}, gran="min")],
+                         [100, 100, 50])
+
+    def test_histograma_con_fecha_no_usa_el_fallback(self):
+        rows = [{"ts": "2026-10-30 10:00:00", "ts_norm": "2026-10-30T10:00:00",
+                 "level": "INF", "msg": "a", "raw": "a", "_line": 0},
+                {"ts": "", "ts_norm": "", "level": "RAW", "msg": "b",
+                 "raw": "b", "_line": 1}]
+        mem = server.MemStore(rows=[dict(r) for r in rows])
+        got = mem.histogram({})
+        self.assertEqual(got, [{"t": "2026-10-30T10:00", "count": 1}])
+
+
 if __name__ == "__main__":
     unittest.main()
 

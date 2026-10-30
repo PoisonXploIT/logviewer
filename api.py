@@ -539,6 +539,10 @@ def load_file(path, progress=None, user="local"):
                 rows, counters = parse_triage(chunk, file_date=file_date)
             else:
                 rows, counters = parser(chunk)
+            # U0.3: los stack traces y continuaciones se anexan a la fila
+            # anterior en lugar de quedar como filas RAW sueltas. Post-proceso
+            # unico, valido para todos los parsers.
+            rows = attach_continuations(rows, counters)
             for r in rows:
                 r["_search"] = _make_search(r)
                 # Fase 9A: plantilla calculada en el parseo
@@ -555,12 +559,21 @@ def load_file(path, progress=None, user="local"):
             pct = 30 + int(65 * min(1.0, lines_processed / config.SQLITE_THRESHOLD))
             _report("parsing", pct, "parseando (%d lineas)" % lines_processed)
 
+        # U0.3: contador de continuaciones consecutivas para no cortar el
+        # lote en mitad de un stack trace (el trace se agruparia en dos filas).
+        cont_run = 0
         for line in lines():
             chunk.append(line)
             total_lines += 1
-            if len(chunk) >= PARSE_CHUNK:
+            prev_line = chunk[-2] if len(chunk) > 1 else None
+            if is_continuation_line(line, prev_line, cont_run > 0):
+                cont_run += 1
+            else:
+                cont_run = 0
+            if len(chunk) >= PARSE_CHUNK and cont_run < MAX_CONTINUATION_LINES:
                 _flush(chunk)
                 chunk = []
+                cont_run = 0
         if chunk:
             _flush(chunk)
         _report("parsing", 95, "parseando")
@@ -596,6 +609,40 @@ KPI_KEYS_BY_FORMAT = {
 }
 
 
+def format_stats(ds):
+    """U2.1 (2026-10-30): formato detectado y lineas RAW/continuacion.
+
+    'raw_lines' son las filas que el parser no pudo estructurar (level RAW):
+    en el parser auto son las lineas sin fecha, sin nivel y sin pares
+    clave=valor. Las continuaciones de stack trace ya anexadas a la fila
+    anterior dejan de contar como fila propia, asi que el RAW mide solo lo que
+    sigue sin parsear. El resultado se cachea en el dataset: las filas no
+    cambian tras la carga (el tail añade filas nuevas, y entonces se recalcula
+    porque el total cambia).
+    """
+    store = ds["store"]
+    total = ds.get("total") or store.total_rows()
+    cached = ds.get("_raw_stats")
+    if cached and cached.get("total_lines") == total:
+        return cached
+    try:
+        raw = store.count_filtered({"level": "RAW"})
+    except Exception:
+        raw = 0
+    try:
+        parsed = store.total_rows()
+    except Exception:
+        parsed = total
+    # Lineas que no llegaron a ser una fila propia: las continuaciones de stack
+    # trace anexadas a la fila anterior (U0.3) mas las RAW que siguen sueltas.
+    cont = max(0, total - parsed)
+    pct = round(100.0 * (raw + cont) / total, 1) if total else 0.0
+    stats = {"raw_lines": raw, "cont_lines": cont, "raw_pct": pct,
+             "total_lines": total}
+    ds["_raw_stats"] = stats
+    return stats
+
+
 def summary(ds):
     """KPIs de un dataset."""
     store = ds["store"]
@@ -609,6 +656,7 @@ def summary(ds):
         "compressed": ds.get("compressed", ""),
         "backend": "sqlite" if isinstance(store, SqlStore) else "mem",
     }
+    s.update(format_stats(ds))
     kpis = store.kpis()
     for key in KPI_KEYS_BY_FORMAT.get(ds["format"], ("ips", "levels")):
         if key in kpis:
@@ -1773,6 +1821,7 @@ class Handler(BaseHTTPRequestHandler):
         start = (page - 1) * size
         total = store.count_filtered(q)
         chunk = store.page_filtered(q, start, size)
+        fstats = format_stats(ds)
         # P1.1 (bug B3): el recorte de msg se hace AQUI, en la serializacion
         # de la lista; el store conserva el contenido completo para el drawer
         # (raw entero) y para el export.
@@ -1786,6 +1835,10 @@ class Handler(BaseHTTPRequestHandler):
             # P3.1: columnas reales del dataset (sin claves internas) para que
             # el selector de columnas sepa que puede ofrecer.
             "columns": _ui_columns(store),
+            # U2.1 (2026-10-30): badge de formato detectado + % de lineas RAW.
+            "raw_lines": fstats["raw_lines"],
+            "cont_lines": fstats["cont_lines"],
+            "raw_pct": fstats["raw_pct"],
         })
 
     def _templates(self, q, user):
@@ -2196,6 +2249,8 @@ class Handler(BaseHTTPRequestHandler):
             truncated = w.truncated
             w.truncated = False
         rows, counters = tail_parse(ds, lines)
+        # U0.3: igual que en la carga, un trace del tail se agrupa en una fila
+        rows = attach_continuations(rows, counters)
         # P1.2 (bug B6): la escritura al store y la actualizacion de ds['total']
         # van en el MISIMO LOCK. Antes add_rows se ejecutaba fuera: una lectura
         # (/rows, /search, export) podia ver las filas ya insertadas con un

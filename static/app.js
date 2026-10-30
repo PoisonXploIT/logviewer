@@ -245,6 +245,10 @@ const app = {
   // P3.1: columnas visibles y su orden (selector de columnas)
   cols: [],
   availableCols: [],
+  // U2.1 (2026-10-30): lineas RAW/continuacion detectadas por el parser
+  rawLines: 0,
+  contLines: 0,
+  rawPct: 0,
 };
 
 const SUPPORTED_EXTS = [".log", ".txt", ".csv", ".json",
@@ -736,14 +740,28 @@ function bindChips(container) {
 /* ---------- tabla ---------- */
 /* P3.1: columnas por formato. app.cols es la seleccion ordenada que usa la
    tabla; se cambia en el selector de columnas y viaja en la URL (?cols=...). */
+/* U2.1 (2026-10-30): formatos que pueblan columnas dinamicas (clave=valor del
+   parser auto, logfmt, CSV, python logging, syslog, nginx error). Para ellos el
+   default no se queda en ts/level/msg: saca todas las columnas reales, con msg
+   al final y un tope de 12 para no abrir la tabla. */
+const DYNAMIC_FMTS = ["auto", "logfmt", "csv", "tsv", "python", "syslog3164",
+                      "nginx_error", "generic", "piloop", "triage", "json"];
+const MAX_DEFAULT_COLS = 12;
+
 function defaultCols(available) {
+  const avail = available || [];
   let d;
   if (app.fmt === "apache" || app.fmt === "w3c")
     d = ["ts", "ip", "method", "path", "code", "bytes"];
   else if (app.fmt === "syslog")
     d = ["ts", "host", "app", "pid", "msg"];
-  else
+  else if (DYNAMIC_FMTS.includes(app.fmt)) {
+    const dyn = avail.filter((c) => c !== "ts" && c !== "level" && c !== "msg");
+    d = ["ts", "level"].concat(dyn.slice(0, MAX_DEFAULT_COLS - 2));
+    if (avail.includes("msg")) d.push("msg");
+  } else {
     d = ["ts", "level", "msg"];
+  }
   const fit = d.filter((c) => (available || []).includes(c));
   return fit.length ? fit : (available || []).slice(0, 5);
 }
@@ -929,6 +947,10 @@ async function renderRows(opts) {
     app.pageRows = res.rows;
     app.fmt = res.format || app.fmt;
     app.availableCols = res.columns || app.availableCols;
+    app.rawLines = res.raw_lines || 0;
+    app.contLines = res.cont_lines || 0;
+    app.rawPct = res.raw_pct || 0;
+    renderFmtBadge();
     // P3.1: la seleccion de columnas viene de la URL; si no, de lo guardado
     // por formato; si no, del default del formato.
     if (!app.cols.length) {
@@ -1916,6 +1938,29 @@ async function loadDashboard(name) {
   }
 }
 
+/* U2.1 (2026-10-30): badge visible del formato detectado y del numero de
+   lineas RAW/continuacion, junto al nombre del archivo. Se refresca en cada
+   carga y en cada render de filas (el tail puede cambiar el total). */
+function renderFmtBadge() {
+  const el = document.getElementById("file-fmt");
+  if (!el) return;
+  const fmt = app.fmt || "auto";
+  const pct = app.rawPct || 0;
+  const raw = app.rawLines || 0;
+  const cont = app.contLines || 0;
+  const tipFmt = "Formato detectado por el parser; " + pct + "% de las lineas " +
+    "no dieron una fila estructurada";
+  const tipRaw = ui.fmtNum(raw) + " lineas sin parsear + " + ui.fmtNum(cont) +
+    " continuaciones anexadas a la fila anterior";
+  el.innerHTML = '<span class="fmt-badge" title="' + ui.esc(tipFmt) + '">' +
+    "formato: " + ui.esc(fmt) + " | " + pct + "% raw</span> " +
+    ((raw || cont)
+      ? '<span class="fmt-badge raw" title="' + ui.esc(tipRaw) + '">' +
+        ui.fmtNum(raw + cont) + " raw/continuacion</span>"
+      : "");
+  el.classList.remove("hidden");
+}
+
 function showDash() {
   document.getElementById("empty").classList.add("hidden");
   document.getElementById("dash").classList.remove("hidden");
@@ -1927,6 +1972,7 @@ function showDash() {
   if (app.encoding) bits.push(app.encoding);
   if (app.compressed) bits.push(app.compressed);
   document.getElementById("file-meta").textContent = bits.join(" · ");
+  renderFmtBadge();
   document.getElementById("act-export").disabled = false;
   document.getElementById("act-clear").disabled = false;
   document.getElementById("act-tail").disabled = false;
