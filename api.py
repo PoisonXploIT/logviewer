@@ -416,7 +416,7 @@ def splunk_indexes():
     sin lanzar searches sobre el indice de 2M+ eventos. Puede fallar
     (404) si el usuario no tiene permiso para listar: el llamador lo
     trata como informativo, no como fallo duro."""
-    with _splunk_open("/services/data/2.0/indexes") as resp:
+    with _splunk_open("/services/data/indexes?output_mode=json&count=0") as resp:
         raw = resp.read().decode("utf-8", "replace")
     try:
         data = json.loads(raw)
