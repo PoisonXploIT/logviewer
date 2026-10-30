@@ -292,7 +292,6 @@ const filters = {
     document.getElementById("fip").value = this.state.ip;
     document.getElementById("fpath").value = this.state.path;
     document.getElementById("fq").value = this.state.q;
-    document.getElementById("fdt").value = this.state.dt;
     document.getElementById("ftpl").value = this.state.tpl;
     document.getElementById("fdfrom").value = this.state.dtFrom;
     document.getElementById("fdto").value = this.state.dtTo;
@@ -2271,9 +2270,9 @@ function wire() {
 
   // Filtros: inputs con debounce
   let debounce = null;
-  ["fip", "fpath", "fq", "fdt", "ftpl", "fdfrom", "fdto"].forEach((id) => {
+  ["fip", "fpath", "fq", "ftpl", "fdfrom", "fdto"].forEach((id) => {
     document.getElementById(id).addEventListener("input", (e) => {
-      const key = { fip: "ip", fpath: "path", fq: "q", fdt: "dt",
+      const key = { fip: "ip", fpath: "path", fq: "q",
                    ftpl: "tpl", fdfrom: "dtFrom", fdto: "dtTo" }[id];
       clearTimeout(debounce);
       debounce = setTimeout(() => {
@@ -2477,7 +2476,7 @@ function wire() {
 }
 
 /* ---------- P3.2: navegacion con teclado y drawer de sidebar ---------- */
-const FILTER_FIELDS = ["fip", "fpath", "fdt", "fdfrom", "fdto", "fq", "ftpl"];
+const FILTER_FIELDS = ["fip", "fpath", "fdfrom", "fdto", "fq", "ftpl"];
 
 function stepPage(delta) {
   if (!app.active) return;
