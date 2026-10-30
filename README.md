@@ -7,7 +7,7 @@ LLM analysis runs against a model on `127.0.0.1`. Built for SOC analysts
 and security students who want fast triage without shipping sensitive logs
 anywhere.
 
-**Version 1.2** — local-first, offline-capable, nothing goes to the cloud.
+**Version 2.0** — local-first, offline-capable, nothing goes to the cloud.
 
 ## Why local
 

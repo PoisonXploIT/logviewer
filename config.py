@@ -54,7 +54,7 @@ TAIL_LINES = max(1, int(os.environ.get("LOGVIEWER_TAIL_LINES", "5000")))
 UPLOAD_CHUNK = 1024 * 1024         # 1 MB: bloque de lectura del upload (Bug B9)
 
 # P5.1 (2026-10-30): identificacion del servicio para /api/health.
-APP_VERSION = "1.2"
+APP_VERSION = "2.0"
 START_TIME = time.time()           # momento de arranque del proceso
 LOG_MAX_BYTES = 5 * 1024 * 1024    # 5 MB: tope de requests.log y audit.log (Bug B11)
 
