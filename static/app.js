@@ -33,6 +33,20 @@ const api = {
       body: JSON.stringify({ name }),
     }).then((r) => r.json()),
   rows: (params) => fetch("/api/rows?" + new URLSearchParams(params)).then((r) => r.json()),
+  // P3.1: vistas guardadas de filtros (persistentes en el servidor)
+  views: () => fetch("/api/views").then((r) => r.json()),
+  viewSave: (name, query) =>
+    fetch("/api/views", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify({ name, query }),
+    }).then((r) => r.json()),
+  viewDelete: (name) =>
+    fetch("/api/views/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify({ name }),
+    }).then((r) => r.json()),
   templates: (name, min, level) =>
     fetch("/api/templates?name=" + encodeURIComponent(name) +
       "&min=" + (min || 1)
@@ -98,6 +112,13 @@ const api = {
     fetch("/api/top?field=" + field + "&limit=" + limit +
       (name ? "&name=" + encodeURIComponent(name) : ""))
       .then((r) => r.json()),
+  // P4.1: correlacion alertas <-> triage por firma (filtrado en servidor)
+  correlate: (params) =>
+    fetch("/api/correlate?" + new URLSearchParams(params)).then((r) => r.json()),
+  // P4.2: dashboard SOC (severidad, fuente, tarea) agregado en el servidor
+  socDashboard: (params) =>
+    fetch("/api/soc/dashboard?" + new URLSearchParams(params))
+      .then((r) => r.json()),
   exportUrl: (params) => "/api/export?" + new URLSearchParams(params),
   watch: (name, enabled) =>
     fetch("/api/watch", {
@@ -108,6 +129,17 @@ const api = {
   tail: (name, last) =>
     fetch("/api/tail?name=" + encodeURIComponent(name) + "&last=" + last)
       .then((r) => r.json()),
+  // P3.2: modo 'seguir archivo' (solo con LOGVIEWER_TAIL_DIRS + allowlist)
+  openFile: (path) =>
+    fetch("/api/open-file", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...csrfHeaders() },
+      body: JSON.stringify({ path }),
+    }).then(async (r) => {
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || ("error HTTP " + r.status));
+      return data;
+    }),
   upload: (files) => {
     const fd = new FormData();
     files.forEach((f) => fd.append("file", f));
@@ -210,6 +242,9 @@ const app = {
   active: "",
   encoding: "",
   compressed: "",
+  // P3.1: columnas visibles y su orden (selector de columnas)
+  cols: [],
+  availableCols: [],
 };
 
 const SUPPORTED_EXTS = [".log", ".txt", ".csv", ".json",
@@ -261,86 +296,183 @@ const filters = {
     badge.textContent = n + (n === 1 ? " activo" : " activos");
     badge.classList.toggle("hidden", n === 0);
   },
+  // P3.1: hidrata el estado desde una query string (la URL o una vista)
+  fromQuery(query) {
+    const p = (typeof query === "string")
+      ? new URLSearchParams(query)
+      : new URLSearchParams(query || {});
+    this.state = {
+      level: p.get("level") || "",
+      code: p.get("code") || "",
+      ip: p.get("ip") || "",
+      path: p.get("path") || "",
+      q: p.get("q") || "",
+      dt: p.get("dt") || "",
+      tpl: p.get("tpl") || "",
+      dtFrom: p.get("dt_from") || "",
+      dtTo: p.get("dt_to") || "",
+    };
+    this.syncInputs();
+    this.paintChips();
+  },
 };
 
-/* ---------- presets de filtros (Fase 5) ---------- */
-const presets = {
-  KEY: "lv-presets",
-  list() {
+/* ---------- P3.1: filtros en la URL (vistas compartibles) ---------- */
+function currentQuery() {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(filters.params())) p.set(k, v);
+  if (app.active) p.set("name", app.active);
+  if (app.page > 1) p.set("page", String(app.page));
+  if (app.cols.length) p.set("cols", app.cols.join(","));
+  return p.toString();
+}
+
+// Refleja los filtros activos en la query string: la URL se puede compartir,
+// pegar o recargar y el servidor ya filtra por esos parametros.
+function syncUrl() {
+  const qs = currentQuery();
+  const url = location.pathname + (qs ? "?" + qs : "");
+  try {
+    history.replaceState(null, "", url);
+  } catch (e) {
+    /* entornos sin history: la URL simplemente no se actualiza */
+  }
+}
+
+function readUrl() {
+  const p = new URLSearchParams(location.search);
+  filters.fromQuery(p);
+  app.urlFilters = filters.activeCount() > 0 || !!p.get("page") || !!p.get("cols");
+  app.page = Math.max(1, parseInt(p.get("page") || "1", 10) || 1);
+  const cols = (p.get("cols") || "").split(",").map((c) => c.trim()).filter(Boolean);
+  if (cols.length) app.cols = cols;
+  return p.get("name") || "";
+}
+
+/* ---------- P3.1: vistas guardadas (persistentes en el servidor) ----------
+   Una vista es un nombre + la query de filtros (lo que se ve en la URL).
+   Se guarda en views.json del servidor: sobrevive a reinicios y no depende
+   del navegador, a diferencia de los presets antiguos de localStorage. */
+const views = {
+  cache: [],
+  async load() {
     try {
-      return JSON.parse(localStorage.getItem(this.KEY) || "[]");
+      const res = await api.views();
+      this.cache = Array.isArray(res.views) ? res.views : [];
     } catch (e) {
-      return [];
+      this.cache = [];
+      ui.toast("No se pudieron leer las vistas: " + e.message);
     }
+    return this.cache;
   },
-  saveAll(items) {
-    localStorage.setItem(this.KEY, JSON.stringify(items));
-  },
-  add(name, filterState) {
-    const items = this.list();
-    const i = items.findIndex((p) => p.name === name);
-    const entry = { name, filters: filterState };
-    if (i >= 0) items[i] = entry; else items.push(entry);
-    this.saveAll(items);
+  save(name, query) {
+    return api.viewSave(name, query).then((res) => {
+      if (res && res.view) {
+        const i = this.cache.findIndex((v) => v.name === res.view.name);
+        if (i >= 0) this.cache[i] = res.view; else this.cache.push(res.view);
+      }
+      renderViews();
+      ui.toast("Vista guardada: " + name);
+      return res;
+    }).catch((e) => {
+      ui.toast("Error al guardar la vista: " + e.message);
+    });
   },
   remove(name) {
-    this.saveAll(this.list().filter((p) => p.name !== name));
+    return api.viewDelete(name).then(() => {
+      this.cache = this.cache.filter((v) => v.name !== name);
+      renderViews();
+      ui.toast("Vista borrada: " + name);
+    }).catch((e) => {
+      ui.toast("Error al borrar la vista: " + e.message);
+    });
   },
 };
 
-function renderPresets() {
+function viewUrl(v) {
+  const base = location.origin + location.pathname;
+  return base + "?" + new URLSearchParams(v.query || {}).toString();
+}
+
+function renderViews() {
   const el = document.getElementById("presets");
-  const items = presets.list();
-  el.innerHTML = items.map((p) =>
-    '<div class="preset-item" data-name="' + ui.esc(p.name) + '" '
-    + 'role="button" tabindex="0" title="Aplicar preset">' +
-    '<span class="preset-name">' + ui.esc(p.name) + "</span>" +
-    '<button class="preset-remove" data-name="' + ui.esc(p.name) +
-    '" title="Borrar preset" aria-label="Borrar preset ' + ui.esc(p.name) + '">' +
-    '<svg class="icon"><use href="#i-x"></use></svg></button>' +
-    "</div>"
-  ).join("");
+  if (!el) return;
+  const items = views.cache;
+  if (!items.length) {
+    el.innerHTML = '<p class="muted">Sin vistas guardadas: filtra y pulsa '
+      + '"Guardar vista".</p>';
+  } else {
+    el.innerHTML = items.map((v) =>
+      '<div class="preset-item" data-name="' + ui.esc(v.name) + '" '
+      + 'role="button" tabindex="0" title="Aplicar vista">' +
+      '<span class="preset-name">' + ui.esc(v.name) + "</span>" +
+      '<button class="preset-copy" data-name="' + ui.esc(v.name) + '" '
+      + 'title="Copiar enlace de la vista" aria-label="Copiar enlace de la vista ' +
+      ui.esc(v.name) + '">' +
+      '<svg class="icon"><use href="#i-copy"></use></svg></button>' +
+      '<button class="preset-remove" data-name="' + ui.esc(v.name) + '" '
+      + 'title="Borrar vista" aria-label="Borrar vista ' + ui.esc(v.name) + '">' +
+      '<svg class="icon"><use href="#i-x"></use></svg></button>' +
+      "</div>"
+    ).join("");
+  }
   el.querySelectorAll(".preset-item").forEach((item) => {
-    const act = () => applyPreset(item.dataset.name);
+    const act = () => applyView(item.dataset.name);
     item.addEventListener("click", (e) => {
-      if (e.target.closest(".preset-remove")) return;
+      if (e.target.closest(".preset-remove") || e.target.closest(".preset-copy")) return;
       act();
     });
     item.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") { e.preventDefault(); act(); }
     });
   });
+  el.querySelectorAll(".preset-copy").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const v = views.cache.find((x) => x.name === btn.dataset.name);
+      if (!v) return;
+      ui.copy(viewUrl(v));
+      ui.toast("Enlace de la vista copiado");
+    });
+  });
   el.querySelectorAll(".preset-remove").forEach((btn) => {
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
-      presets.remove(btn.dataset.name);
-      renderPresets();
+      views.remove(btn.dataset.name);
     });
   });
-  document.getElementById("preset-save").disabled = !app.active;
+  const saveBtn = document.getElementById("preset-save");
+  if (saveBtn) saveBtn.disabled = !app.active;
 }
 
-function applyPreset(name) {
-  const p = presets.list().find((x) => x.name === name);
-  if (!p) return;
-  filters.state = Object.assign(
-    { level: "", code: "", ip: "", path: "", q: "", dt: "" },
-    p.filters);
-  filters.syncInputs();
-  filters.paintChips();
-  app.page = 1;
-  renderRows();
-  ui.toast("Preset aplicado: " + name);
+function applyView(name) {
+  const v = views.cache.find((x) => x.name === name);
+  if (!v) return;
+  const q = v.query || {};
+  filters.fromQuery(new URLSearchParams(q));
+  const cols = String(q.cols || "").split(",").map((c) => c.trim()).filter(Boolean);
+  if (cols.length) app.cols = cols;
+  app.page = Math.max(1, parseInt(q.page || "1", 10) || 1);
+  if (q.name && q.name !== app.active &&
+      app.sessions.some((s) => s.name === q.name)) {
+    api.activate(q.name).then(() => {
+      app.active = q.name;
+      renderSessions();
+      loadDashboard(app.active);
+    }).catch(() => {});
+  } else {
+    syncUrl();
+    renderRows();
+  }
+  ui.toast("Vista aplicada: " + name);
 }
 
-function saveCurrentPreset() {
+function saveCurrentView() {
   if (!app.active) return;
-  const def = "Preset " + (presets.list().length + 1);
-  const name = prompt("Nombre del preset", def);
+  const def = "Vista " + (views.cache.length + 1);
+  const name = prompt("Nombre de la vista", def);
   if (!name || !name.trim()) return;
-  presets.add(name.trim(), Object.assign({}, filters.state));
-  renderPresets();
-  ui.toast("Preset guardado: " + name.trim());
+  views.save(name.trim(), currentQuery());
 }
 
 /* ---------- charts ---------- */
@@ -602,15 +734,127 @@ function bindChips(container) {
 }
 
 /* ---------- tabla ---------- */
-function theadCols() {
+/* P3.1: columnas por formato. app.cols es la seleccion ordenada que usa la
+   tabla; se cambia en el selector de columnas y viaja en la URL (?cols=...). */
+function defaultCols(available) {
+  let d;
   if (app.fmt === "apache" || app.fmt === "w3c")
-    return ["ts", "ip", "method", "path", "code", "bytes"];
-  if (app.fmt === "syslog")
-    return ["ts", "host", "app", "pid", "msg"];
-  return ["ts", "level", "msg"];
+    d = ["ts", "ip", "method", "path", "code", "bytes"];
+  else if (app.fmt === "syslog")
+    d = ["ts", "host", "app", "pid", "msg"];
+  else
+    d = ["ts", "level", "msg"];
+  const fit = d.filter((c) => (available || []).includes(c));
+  return fit.length ? fit : (available || []).slice(0, 5);
+}
+
+// Deja solo columnas validas (existentes en el dataset) sin duplicados.
+function normalizeCols(cols, available) {
+  const avail = available || [];
+  const out = [];
+  for (const c of cols || []) {
+    if (avail.includes(c) && !out.includes(c)) out.push(c);
+  }
+  return out.length ? out : defaultCols(avail);
+}
+
+function theadCols() {
+  return normalizeCols(app.cols, app.availableCols);
 }
 
 const MONO_COLS = ["ts", "ip", "path", "host", "app", "pid"];
+
+/* ---------- P3.1: empty state y selector de columnas ---------- */
+function showEmptyState(total, activeFilters) {
+  const el = document.getElementById("no-results");
+  const tbl = document.getElementById("tblwrap");
+  const pager = document.getElementById("pager");
+  if (!el) return;
+  if (total > 0) {
+    el.classList.add("hidden");
+    if (tbl) tbl.classList.remove("hidden");
+    if (pager) pager.classList.remove("hidden");
+    return;
+  }
+  el.classList.remove("hidden");
+  if (tbl) tbl.classList.add("hidden");
+  if (pager) pager.classList.add("hidden");
+  const msg = el.querySelector(".no-results-msg");
+  if (msg) {
+    msg.textContent = activeFilters
+      ? "0 filas con estos filtros: ninguna linea coincide con " +
+        activeFilters + (activeFilters === 1 ? " filtro activo." : " filtros activos.")
+      : "0 filas en este archivo (sin filtros).";
+  }
+  const clearBtn = el.querySelector(".no-results-clear");
+  if (clearBtn) clearBtn.classList.toggle("hidden", !activeFilters);
+}
+
+function renderColSelector() {
+  const list = document.getElementById("cols-list");
+  if (!list) return;
+  const avail = app.availableCols || [];
+  const cols = theadCols();
+  list.innerHTML = avail.map((c) => {
+    const on = cols.includes(c);
+    const pos = on ? cols.indexOf(c) + 1 : 0;
+    return '<div class="col-item' + (on ? " on" : "") + '" data-col="' +
+      ui.esc(c) + '">' +
+      '<button class="col-toggle" title="Mostrar u ocultar ' + ui.esc(c) + '">' +
+      ui.esc(c) + "</button>" +
+      (on ? '<span class="col-pos">' + pos + "</span>" +
+            '<button class="col-up" title="Subir columna">sube</button>' +
+            '<button class="col-down" title="Bajar columna">baja</button>'
+        : "") +
+      "</div>";
+  }).join("");
+  list.querySelectorAll(".col-item").forEach((item) => {
+    const c = item.dataset.col;
+    item.querySelector(".col-toggle").addEventListener("click", () => {
+      const cur = theadCols();
+      if (cur.includes(c)) app.cols = cur.filter((x) => x !== c);
+      else app.cols = cur.concat([c]);
+      persistCols();
+      renderRows();
+    });
+    const up = item.querySelector(".col-up");
+    const down = item.querySelector(".col-down");
+    if (up) up.addEventListener("click", () => moveCol(c, -1));
+    if (down) down.addEventListener("click", () => moveCol(c, 1));
+  });
+}
+
+function moveCol(col, delta) {
+  const cur = theadCols();
+  const i = cur.indexOf(col);
+  if (i < 0) return;
+  const j = i + delta;
+  if (j < 0 || j >= cur.length) return;
+  cur.splice(i, 1);
+  cur.splice(j, 0, col);
+  app.cols = cur;
+  persistCols();
+  renderRows();
+}
+
+function persistCols() {
+  localStorage.setItem("lv-cols-" + app.fmt, app.cols.join(","));
+  syncUrl();
+}
+
+function resetColsToDefault() {
+  app.cols = defaultCols(app.availableCols || []);
+  persistCols();
+  renderRows();
+  ui.toast("Columnas: las del formato");
+}
+
+function showAllCols() {
+  app.cols = (app.availableCols || []).slice();
+  persistCols();
+  renderRows();
+  ui.toast("Mostradas todas las columnas del archivo");
+}
 
 function copyBtn(i, col) {
   return '<button class="copy-cell" data-idx="' + i + '" data-col="' + col + '" ' +
@@ -683,7 +927,19 @@ async function renderRows(opts) {
     app.filteredTotal = res.total;
     app.page = res.page;
     app.pageRows = res.rows;
+    app.fmt = res.format || app.fmt;
+    app.availableCols = res.columns || app.availableCols;
+    // P3.1: la seleccion de columnas viene de la URL; si no, de lo guardado
+    // por formato; si no, del default del formato.
+    if (!app.cols.length) {
+      const saved = localStorage.getItem("lv-cols-" + app.fmt) || "";
+      app.cols = normalizeCols(saved.split(",").map((c) => c.trim()),
+                              app.availableCols);
+    } else {
+      app.cols = normalizeCols(app.cols, app.availableCols);
+    }
     const cols = theadCols();
+    renderColSelector();
     document.getElementById("thead").innerHTML =
       "<tr>" + cols.map((c) =>
         '<th class="' + (MONO_COLS.includes(c) ? "lbl" : "") + '">' +
@@ -697,6 +953,9 @@ async function renderRows(opts) {
       ui.fmtNum(res.total) + " filas - página " + res.page + " de " + ui.fmtNum(pages);
     document.getElementById("prev").disabled = res.page <= 1;
     document.getElementById("next").disabled = res.page >= pages;
+    // P3.1: empty state explicativo en lugar de una tabla vacia
+    showEmptyState(res.total, filters.activeCount());
+    syncUrl();
     renderHistogram();
   } catch (e) {
     document.getElementById("count").textContent = "Error: " + e.message;
@@ -842,7 +1101,12 @@ const drawer = {
     ["ts", "Fecha"], ["level", "Nivel"], ["ip", "IP"], ["host", "Host"],
     ["app", "App"], ["pid", "PID"], ["method", "Método"], ["path", "Path"],
     ["code", "Código"], ["bytes", "Bytes"], ["msg", "Mensaje"],
+    ["fuente", "Fuente"], ["firma", "Firma"], ["tenant", "Tenant"],
+    ["tarea", "Tarea"], ["dedupe", "Dedupe"], ["url", "URL"],
   ],
+  // P3.2: el drawer muestra una vista previa de la linea raw; el resto se
+  // despliega con "Mostrar todo". La copia va SIEMPRE con la linea completa.
+  RAW_PREVIEW: 600,
   get closed() {
     return !document.getElementById("drawer").classList.contains("open");
   },
@@ -853,8 +1117,11 @@ const drawer = {
         .map(([k, label]) =>
           "<tr><th>" + label + "</th><td>" + ui.esc(row[k]) + "</td></tr>")
         .join("");
-    // Fase 7C: raw con escape + resaltado de los terminos activos
-    document.getElementById("drawer-raw").innerHTML = hlText(row.raw || "");
+    // Fase 7C: raw con escape + resaltado de los terminos activos.
+    // P3.2: vista previa + "Mostrar todo" + copia de la linea completa.
+    this.rawRow = row;
+    this.rawExpanded = false;
+    this._paintRaw();
     this._setCtxAvailability(row);
     renderDrawerRunbooks(row); // Fase 10B: errores conocidos
     this.anRow = row;          // Fase 12A: fila que mandara "Analizar"
@@ -869,6 +1136,50 @@ const drawer = {
     el.classList.remove("open");
     el.setAttribute("aria-hidden", "true");
     document.getElementById("drawer-backdrop").classList.add("hidden");
+  },
+  rawFull() {
+    return String((this.rawRow && this.rawRow.raw) || "");
+  },
+  _paintRaw() {
+    const full = this.rawFull();
+    const pre = document.getElementById("drawer-raw");
+    const btn = document.getElementById("drawer-expand");
+    const len = document.getElementById("raw-len");
+    const line = document.getElementById("raw-line");
+    if (line) {
+      line.textContent = (this.rawRow && this.rawRow._line != null)
+        ? "Línea " + (this.rawRow._line + 1) + " del archivo" : "";
+    }
+    if (full.length <= this.RAW_PREVIEW) {
+      pre.innerHTML = hlText(full);
+      btn.classList.add("hidden");
+      btn.setAttribute("aria-expanded", "false");
+      if (len) len.textContent = full.length + " caracteres (completa)";
+      return;
+    }
+    if (this.rawExpanded) {
+      pre.innerHTML = hlText(full);
+      btn.textContent = "Ocultar";
+      btn.setAttribute("aria-expanded", "true");
+      if (len) len.textContent = full.length + " de " + full.length +
+        " caracteres (completa)";
+    } else {
+      pre.innerHTML = hlText(full.slice(0, this.RAW_PREVIEW)) +
+        "<span class='raw-cut'>[...]</span>";
+      btn.textContent = "Mostrar todo";
+      btn.setAttribute("aria-expanded", "false");
+      if (len) len.textContent = this.RAW_PREVIEW + " de " + full.length +
+        " caracteres (faltan " + (full.length - this.RAW_PREVIEW) +
+        " por mostrar)";
+    }
+    btn.classList.remove("hidden");
+  },
+  toggleRaw() {
+    this.rawExpanded = !this.rawExpanded;
+    this._paintRaw();
+  },
+  copyRaw() {
+    ui.copy(this.rawFull());
   },
   _setCtxAvailability(row) {
     // Fase 7B: solo se ofrece contexto si la fila expone su rowid
@@ -928,12 +1239,19 @@ let rbModalId = null; // id del runbook en edicion; null = alta nueva
 
 function rbCardHtml(rb) {
   const bits = [];
+  if (rb.nombre) bits.push(
+    "<div><b>Nombre:</b> " + ui.esc(rb.nombre) + "</div>");
+  if (rb.severidad) bits.push(
+    '<div><b>Severidad sugerida:</b> <span class="rb-sev rb-sev-' +
+    ui.esc(rb.severidad) + '">' + ui.esc(rb.severidad) + "</span></div>");
   if (rb.explicacion) bits.push(
     "<div><b>Que es:</b> " + ui.esc(rb.explicacion) + "</div>");
   if (rb.causa) bits.push(
     "<div><b>Causa probable:</b> " + ui.esc(rb.causa) + "</div>");
   if (rb.solucion) bits.push(
     "<div><b>Solucion:</b> " + ui.esc(rb.solucion) + "</div>");
+  if (rb.accion) bits.push(
+    "<div><b>Accion recomendada:</b> " + ui.esc(rb.accion) + "</div>");
   if (rb.ref) bits.push(
     '<div class="rb-ref"><b>Referencia interna:</b> ' +
     ui.esc(rb.ref) + "</div>");
@@ -979,10 +1297,13 @@ function openRbModal(rb, presetPattern) {
     document.getElementById("rb-modal-title").textContent =
       "Editar runbook";
     setVal("rbf-pattern", rb.pattern);
+    setVal("rbf-nombre", rb.nombre);
     setVal("rbf-kind", rb.kind);
+    setVal("rbf-severidad", rb.severidad);
     setVal("rbf-explicacion", rb.explicacion);
     setVal("rbf-causa", rb.causa);
     setVal("rbf-solucion", rb.solucion);
+    setVal("rbf-accion", rb.accion);
     setVal("rbf-ref", rb.ref);
   } else {
     rbModalId = null;
@@ -991,9 +1312,12 @@ function openRbModal(rb, presetPattern) {
     // Alta desde la linea: patron prellenado con la plantilla (glob)
     setVal("rbf-pattern", presetPattern || "");
     setVal("rbf-kind", presetPattern ? "glob" : "regex");
+    setVal("rbf-nombre", "");
+    setVal("rbf-severidad", "WRN");
     setVal("rbf-explicacion", "");
     setVal("rbf-causa", "");
     setVal("rbf-solucion", "");
+    setVal("rbf-accion", "");
     setVal("rbf-ref", "");
   }
   document.getElementById("rb-modal").classList.remove("hidden");
@@ -1006,10 +1330,13 @@ function closeRbModal() {
 async function saveRbModal() {
   const body = {
     pattern: document.getElementById("rbf-pattern").value.trim(),
+    nombre: document.getElementById("rbf-nombre").value.trim(),
     kind: document.getElementById("rbf-kind").value,
+    severidad: document.getElementById("rbf-severidad").value,
     explicacion: document.getElementById("rbf-explicacion").value.trim(),
     causa: document.getElementById("rbf-causa").value.trim(),
     solucion: document.getElementById("rbf-solucion").value.trim(),
+    accion: document.getElementById("rbf-accion").value.trim(),
     ref: document.getElementById("rbf-ref").value.trim(),
   };
   if (!body.pattern) { ui.toast("Falta el patron"); return; }
@@ -1137,6 +1464,41 @@ function setSplunkVisible(v) {
   go.classList.toggle("hidden", !v);
 }
 
+/* ---------- P3.2: modo 'seguir archivo' (allowlist de directorios) ---------- */
+function setFollowVisible(v) {
+  // El panel se muestra siempre: con follow:true la caja de ruta y el
+  // boton; con follow:false el aviso de que esta desactivado.
+  document.getElementById("follow-wrap").classList.remove("hidden");
+  document.getElementById("follow-note").classList.toggle("hidden", !!v);
+  document.getElementById("follow-path").hidden = !v;
+  document.getElementById("follow-go").hidden = !v;
+}
+
+async function runFollowFile() {
+  const path = document.getElementById("follow-path").value.trim();
+  const status = document.getElementById("follow-status");
+  const btn = document.getElementById("follow-go");
+  if (!path) { ui.toast("Indica la ruta del archivo de log"); return; }
+  btn.disabled = true;
+  status.textContent = "Abriendo y cargando...";
+  try {
+    const res = await api.openFile(path);
+    status.textContent = res.name + ": " + ui.fmtNum(res.total) +
+      " filas. Tail en vivo sobre el original.";
+    app.sessions = res.sessions || app.sessions;
+    app.active = res.active || res.name;
+    renderSessions();
+    await loadDashboard(app.active);
+    tail.start(app.active);
+    ui.toast("Siguiendo " + res.name + " en vivo");
+  } catch (e) {
+    status.textContent = "";
+    ui.toast("No se pudo seguir el archivo: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function runSplunkImport() {
   const spl = document.getElementById("splunk-spl").value.trim();
   if (!spl) { ui.toast("Pega primero una query SPL"); return; }
@@ -1214,6 +1576,113 @@ async function runDiagnose() {
   }
 }
 
+/* ---------- P4.1: correlacion alertas <-> triage por firma ---------- */
+const CORR_STATUS_CLASS = {
+  escalada: "corr-escalada",
+  encolada: "corr-encolada",
+  descartada: "corr-descartada",
+  sin_triage: "corr-sin",
+};
+
+async function runCorrelate() {
+  const modal = document.getElementById("corr-modal");
+  const status = document.getElementById("corr-status");
+  const countsEl = document.getElementById("corr-counts");
+  const table = document.getElementById("corr-table");
+  const body = table.querySelector("tbody");
+  countsEl.innerHTML = "";
+  body.innerHTML = "";
+  status.textContent = "Cruzando alertas y triage por firma...";
+  modal.classList.remove("hidden");
+  try {
+    const r = await api.correlate({ limit: 200 });
+    if (r.error) throw new Error(r.error);
+    status.textContent = (r.alerts_total + " alertas x " + r.triage_total +
+                          " lineas de triage: " + r.matched +
+                          " alertas encontradas en el triage" +
+                          (r.truncated ? " (mostrando " + r.limit + ")" : ""));
+    countsEl.innerHTML = Object.keys(r.counts).map((k) =>
+      '<span class="corr-chip ' + (CORR_STATUS_CLASS[k] || "") + '">' +
+      ui.esc(k) + " = " + ui.fmtNum(r.counts[k]) + "</span>").join("");
+    countsEl.classList.remove("hidden");
+    body.innerHTML = (r.items || []).map((it) =>
+      "<tr><td><code>" + ui.esc(it.firma) + "</code></td>" +
+      '<td class="' + (CORR_STATUS_CLASS[it.status] || "") + '">' +
+      ui.esc(it.status) + "</td>" +
+      "<td>" + ui.esc(it.motivo) + "</td>" +
+      "<td><code>" + ui.esc(it.tarea || "-") + "</code></td>" +
+      "<td>" + ui.esc((it.triage || []).map((t) =>
+        t.verdict + " | " + (t.tarea || "sin tarea")).join(" ; ") || "-") +
+      "</td></tr>").join("");
+    table.classList.remove("hidden");
+  } catch (e) {
+    status.textContent = "Error: " + e.message;
+  }
+}
+
+/* ---------- P4.2: dashboard SOC (severidad, fuente, tarea) ---------- */
+const SOC_SEV_CLASS = {
+  CRIT: "soc-crit",
+  ERR: "soc-err",
+  WRN: "soc-wrn",
+  INF: "soc-inf",
+};
+const SOC_TASK_CLASS = {
+  abierta: "soc-abierta",
+  encolada: "soc-encolada",
+  descartada: "soc-descartada",
+  sin_dato: "soc-sin",
+};
+let socLast = null;   // ultimo resultado del dashboard (para el filtro)
+
+async function runSocDashboard() {
+  const modal = document.getElementById("soc-modal");
+  const status = document.getElementById("soc-status");
+  const sevChips = document.getElementById("soc-sev-chips");
+  const taskChips = document.getElementById("soc-tarea-chips");
+  const fBody = document.getElementById("soc-fuente-table").querySelector("tbody");
+  const aBody = document.getElementById("soc-alert-table").querySelector("tbody");
+  status.textContent = "Agregando alertas SOC en el servidor...";
+  modal.classList.remove("hidden");
+  try {
+    const r = await api.socDashboard({
+      sev: document.getElementById("soc-sev").value,
+      fuente: document.getElementById("soc-fuente").value,
+      tarea: document.getElementById("soc-tarea").value,
+      limit: 100,
+    });
+    if (r.error) throw new Error(r.error);
+    socLast = r;
+    status.textContent = r.alerts_total + " alertas" +
+      (r.triage_total ? " x " + r.triage_total + " lineas de triage" : "") +
+      " (dataset: " + r.alerts_name + ")" +
+      (r.truncated ? ": mostrando " + r.limit : "");
+    sevChips.innerHTML = (r.sev || []).length === 0 ? "" : Object.keys(r.sev).map((k) =>
+      '<span class="soc-chip ' + (SOC_SEV_CLASS[k] || "") + '">' +
+      ui.esc(k) + " = " + ui.fmtNum(r.sev[k]) + "</span>").join("");
+    taskChips.innerHTML = Object.keys(r.tarea).map((k) =>
+      '<span class="soc-chip ' + (SOC_TASK_CLASS[k] || "") + '">' +
+      ui.esc(k) + " = " + ui.fmtNum(r.tarea[k]) + "</span>").join("");
+    fBody.innerHTML = (r.fuente || []).map((f) =>
+      "<tr><td>" + ui.esc(f.fuente) + "</td><td>" + ui.fmtNum(f.count) + "</td>" +
+      ["CRIT", "ERR", "WRN", "INF"].map((s) =>
+        "<td class=" + (SOC_SEV_CLASS[s] || "") + ">" + ui.fmtNum(f.sev[s] || 0) + "</td>").join("") +
+      "</tr>").join("") || "<tr><td colspan=6>Sin fuentes</td></tr>";
+    aBody.innerHTML = (r.items || []).map((it) =>
+      "<tr><td>" + ui.esc(it.ts) + "</td><td>" + ui.esc(it.fuente) + "</td>" +
+      "<td><code>" + ui.esc(it.firma || "-") + "</code></td>" +
+      "<td class=" + (SOC_SEV_CLASS[it.sev] || "") + ">" +
+      ui.esc(it.sev) + (it.sev_raw && it.sev_raw !== it.sev.toLowerCase()
+        ? " (" + ui.esc(it.sev_raw) + ")" : "") + "</td>" +
+      "<td><code>" + ui.esc(it.tarea || "-") + "</code></td>" +
+      "<td class=" + (SOC_TASK_CLASS[it.status] || "") + ">" +
+      ui.esc(it.status) + "</td></tr>").join("") ||
+      "<tr><td colspan=6>Sin alertas con ese filtro</td></tr>";
+  } catch (e) {
+    status.textContent = "Error: " + e.message;
+  }
+}
+
 async function delRb(id) {
   if (!confirm("Borrar este runbook?")) return;
   try {
@@ -1232,6 +1701,15 @@ async function refreshSessions() {
   app.sessions = res.sessions;
   app.active = res.active;
   renderSessions();
+  // P4.1: la correlacion SOC solo tiene sentido si hay alertas y triaje
+  const names = (res.sessions || []).map((s) => s.name.toLowerCase());
+  document.getElementById("act-correlate")
+    .classList.toggle("hidden",
+                      !(names.some((n) => n.includes("alerta")) &&
+                        names.some((n) => n.includes("triage"))));
+  // P4.2: el dashboard SOC necesita solo el dataset de alertas
+  document.getElementById("act-soc")
+    .classList.toggle("hidden", !names.some((n) => n.includes("alerta")));
 }
 
 function sessionMeta(s) {
@@ -1418,8 +1896,11 @@ async function loadDashboard(name) {
     app.total = s.total;
     app.encoding = s.encoding || "";
     app.compressed = s.compressed || "";
-    app.page = 1;
-    filters.reset();
+    // P3.1: si la URL trajo filtros/pagina, se conservan al cargar el dashboard
+    if (!app.urlFilters) {
+      app.page = 1;
+      filters.reset();
+    }
     showDash();
     await fetchTops(name);
     renderKpis(s);
@@ -1427,7 +1908,7 @@ async function loadDashboard(name) {
     renderSeg();
     renderRows();
     renderTemplates();
-    renderPresets();
+    renderViews();
     ui.status("ok", ui.fmtNum(s.total) + " líneas · " + s.format);
   } catch (e) {
     ui.status("error", "Error de carga");
@@ -1490,7 +1971,7 @@ async function clearView() {
   document.getElementById("act-tail").disabled = true;
   document.getElementById("act-diagnose").disabled = true;
   renderSessions();
-  renderPresets();
+  renderViews();
   ui.status("idle", "Sin archivo");
 }
 
@@ -1667,7 +2148,36 @@ function wire() {
   document.getElementById("act-clear").addEventListener("click", clearView);
   document.getElementById("act-tail").addEventListener("click", toggleTail);
   document.getElementById("btn-present").addEventListener("click", togglePresent);
-  document.getElementById("preset-save").addEventListener("click", saveCurrentPreset);
+  document.getElementById("preset-save").addEventListener("click", saveCurrentView);
+  // P3.1: selector de columnas, copiar enlace y empty state
+  const colsPanel = document.getElementById("cols-panel");
+  const colsToggle = document.getElementById("cols-toggle");
+  if (colsToggle && colsPanel) {
+    colsToggle.addEventListener("click", () => {
+      const hidden = colsPanel.classList.toggle("hidden");
+      colsToggle.setAttribute("aria-expanded", String(!hidden));
+    });
+  }
+  const colsDefault = document.getElementById("cols-default");
+  if (colsDefault) colsDefault.addEventListener("click", resetColsToDefault);
+  const colsAll = document.getElementById("cols-all");
+  if (colsAll) colsAll.addEventListener("click", showAllCols);
+  const copyLink = document.getElementById("btn-copy-link");
+  if (copyLink) {
+    copyLink.addEventListener("click", () => {
+      syncUrl();
+      ui.copy(location.href);
+      ui.toast("Enlace de la vista copiado (filtros en la URL)");
+    });
+  }
+  const nrClear = document.getElementById("no-results-clear");
+  if (nrClear) {
+    nrClear.addEventListener("click", () => {
+      filters.reset();
+      app.page = 1;
+      renderRows();
+    });
+  }
   document.getElementById("audit-toggle").addEventListener("click", () => {
     const body = document.getElementById("audit-body");
     const isHidden = body.classList.toggle("hidden");
@@ -1750,6 +2260,16 @@ function wire() {
   document.getElementById("hiscanvas").addEventListener("click",
     (e) => histClick(e));
 
+  // P3.2: en movil la sidebar es un drawer lateral
+  const sideBtn = document.getElementById("btn-sidebar");
+  const sideBackdrop = document.getElementById("side-backdrop");
+  sideBtn.addEventListener("click", () => {
+    const open = document.body.classList.toggle("side-open");
+    sideBtn.setAttribute("aria-expanded", String(open));
+    sideBackdrop.classList.toggle("hidden", !open);
+  });
+  sideBackdrop.addEventListener("click", closeSidebar);
+
   // Paginacion
   document.getElementById("prev").addEventListener("click", () => {
     if (app.page > 1) { app.page--; renderRows(); }
@@ -1778,6 +2298,11 @@ function wire() {
   // Fase 7B: contexto de la linea en el log original
   document.getElementById("drawer-ctx-btn")
     .addEventListener("click", showDrawerContext);
+  // P3.2: drawer con linea completa (Mostrar todo) y copia al portapapeles
+  document.getElementById("drawer-expand")
+    .addEventListener("click", () => drawer.toggleRaw());
+  document.getElementById("drawer-copy")
+    .addEventListener("click", () => drawer.copyRaw());
 
   // Fase 12A: boton "Analizar" del drawer (solo si /api/config dice que si)
   document.getElementById("an-btn").addEventListener("click", runAnalyze);
@@ -1785,10 +2310,29 @@ function wire() {
   // Fase 13: seccion "Importar de Splunk" (visible solo si esta configurado)
   document.getElementById("splunk-go")
     .addEventListener("click", runSplunkImport);
+  // P3.2: abrir un log por ruta y hacer tail del original (allowlist)
+  document.getElementById("follow-go")
+    .addEventListener("click", runFollowFile);
 
   // Fase 12C: boton "Diagnostico rapido" (solo si /api/config dice llm:true)
   document.getElementById("act-diagnose")
     .addEventListener("click", runDiagnose);
+  // P4.1: boton "Correlacion SOC" (alertas x triage por firma)
+  document.getElementById("act-correlate")
+    .addEventListener("click", runCorrelate);
+  document.getElementById("corr-close")
+    .addEventListener("click", () => {
+      document.getElementById("corr-modal").classList.add("hidden");
+    });
+  // P4.2: boton "Dashboard SOC" (reparto por severidad, fuente y tarea)
+  document.getElementById("act-soc")
+    .addEventListener("click", runSocDashboard);
+  document.getElementById("soc-go")
+    .addEventListener("click", runSocDashboard);
+  document.getElementById("soc-close")
+    .addEventListener("click", () => {
+      document.getElementById("soc-modal").classList.add("hidden");
+    });
   document.getElementById("diag-close")
     .addEventListener("click", () => {
       document.getElementById("diag-modal").classList.add("hidden");
@@ -1844,6 +2388,7 @@ function wire() {
     const inField = /^(input|textarea|select)$/.test(e.target.tagName);
     if (e.key === "Escape") {
       if (!drawer.closed) drawer.close();
+      else if (document.body.classList.contains("side-open")) closeSidebar();
       else if (document.body.classList.contains("present")) togglePresent();
       return;
     }
@@ -1854,7 +2399,45 @@ function wire() {
     else if (k === "e") { e.preventDefault(); exportData(); }
     else if (e.key === "/") { e.preventDefault(); document.getElementById("fq").focus(); }
     else if (k === "g") { e.preventDefault(); document.getElementById("fip").focus(); }
+    // P3.2: j/k = pagina siguiente/anterior; [ ] = recorrer los filtros
+    else if (k === "j") { e.preventDefault(); stepPage(1); }
+    else if (k === "k") { e.preventDefault(); stepPage(-1); }
+    else if (e.key === "]") { e.preventDefault(); focusFilter(1); }
+    else if (e.key === "[") { e.preventDefault(); focusFilter(-1); }
   });
+}
+
+/* ---------- P3.2: navegacion con teclado y drawer de sidebar ---------- */
+const FILTER_FIELDS = ["fip", "fpath", "fdt", "fdfrom", "fdto", "fq", "ftpl"];
+
+function stepPage(delta) {
+  if (!app.active) return;
+  const pages = Math.max(1, Math.ceil((app.filteredTotal || app.total || 0) / app.pageSize));
+  const next = app.page + delta;
+  if (next < 1 || next > pages) return;
+  app.page = next;
+  renderRows();
+}
+
+function focusFilter(step) {
+  const panel = document.getElementById("filters-panel");
+  if (panel.classList.contains("collapsed")) {
+    panel.classList.remove("collapsed");
+    document.getElementById("filters-toggle").setAttribute("aria-expanded", "true");
+    localStorage.setItem("lv-filters-collapsed", "0");
+  }
+  const current = FILTER_FIELDS.indexOf(document.activeElement.id);
+  const idx = current < 0 ? (step > 0 ? 0 : FILTER_FIELDS.length - 1) : current;
+  const target = FILTER_FIELDS[(idx + step + FILTER_FIELDS.length) % FILTER_FIELDS.length];
+  const el = document.getElementById(target);
+  if (el) el.focus();
+}
+
+function closeSidebar() {
+  document.body.classList.remove("side-open");
+  const b = document.getElementById("btn-sidebar");
+  if (b) b.setAttribute("aria-expanded", "false");
+  document.getElementById("side-backdrop").classList.add("hidden");
 }
 
 /* ---------- init ---------- */
@@ -1872,23 +2455,32 @@ async function init() {
     app.llmEnabled = !!cfg.llm;
     app.repoUrl = cfg.repo_url || "";
     setSplunkVisible(!!cfg.splunk);
+    setFollowVisible(!!cfg.follow);
   } catch (e) {
     app.llmEnabled = false;
     app.repoUrl = "";
     setSplunkVisible(false);
+    setFollowVisible(false);
   }
   // Fase 12C: el boton "Diagnostico rapido" sigue la misma regla
   setDiagnoseVisible(app.llmEnabled);
   theme.apply(theme.get());
   wire();
-  renderPresets();
+  // P3.1: la URL puede traer filtros, pagina, columnas y sesion activa
+  const urlName = readUrl();
+  views.load();
   refreshAudit();
   // Recupera la sesion si el servidor ya tiene datasets
   try {
     const res = await api.sessions();
     if (res.sessions && res.sessions.length) {
       app.sessions = res.sessions;
-      app.active = res.active || res.sessions[0].name;
+      app.active = (urlName && res.sessions.some((s) => s.name === urlName))
+        ? urlName
+        : (res.active || res.sessions[0].name);
+      if (app.active !== res.active) {
+        try { await api.activate(app.active); } catch (e) { /* */ }
+      }
       renderSessions();
       await loadDashboard(app.active);
       // Recupera el estado LIVE si el servidor sigue vigilando
@@ -1900,7 +2492,7 @@ async function init() {
   } catch (e) {
     /* primer arranque: sin sesion */
   }
-  renderPresets();
+  renderViews();
 }
 
 init();

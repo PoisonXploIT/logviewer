@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 """Tests para los parsers, filtros, compresion y sesiones."""
+import base64
 import bz2
 import gzip
+import io
+import inspect
 import json
 import lzma
 import os
 import shutil
 import socket
+import ssl
 import tempfile
 import threading
 import time
 import unittest
 import zipfile
+from collections import Counter, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
+import urllib.error
+import urllib.request
 
+import api
+import config
+import security
+import stores
 import server
 
 
@@ -90,6 +101,381 @@ class TestParseJSON(unittest.TestCase):
         self.assertEqual(r["msg"], "fallo de conexion")
         self.assertEqual(counters["levels"]["ERR"], 1)
         self.assertEqual(counters["ips"]["10.0.0.1"], 1)
+
+
+class TestParseJSONOperVanta(unittest.TestCase):
+    """P0.3: JSON Lines de OperVanta (alertas.jsonl, eventos.jsonl, dataset.jsonl)."""
+
+    ALERTA = ('{"ts": "2026-10-11 18:32:06", "fuente": "ai-netwatch-finding", '
+              '"firma": "netwatch:findings:pid:23160", "tenant": "local", '
+              '"sev": "alta", "src": "", "dst": "api.deepseek.com", "url": "", '
+              '"mensaje": "hallazgo 72/100: pid:23160", "evidencia": "score 72", '
+              '"riesgo": [], "tarea": "td15f4fa4", "dedupe": "encolada"}')
+
+    def test_sev_map(self):
+        for sev, expected in (("baja", "WRN"), ("media", "INF"),
+                              ("alta", "ERR"), ("critica", "CRIT")):
+            rows, _ = server.parse_json(
+                ['{"ts": "2026-10-11 18:00:00", "sev": "%s", "mensaje": "m"}' % sev])
+            self.assertEqual(rows[0]["level"], expected, sev)
+
+    def test_sev_numeric_and_textual(self):
+        rows, _ = server.parse_json([
+            '{"sev": 2.0, "mensaje": "a"}',
+            '{"sev": 1.0, "mensaje": "b"}',
+            '{"sev": 0.2, "mensaje": "c"}',
+            '{"sev": "Critical", "mensaje": "d"}',
+        ])
+        self.assertEqual([r["level"] for r in rows], ["ERR", "WRN", "INF", "CRIT"])
+
+    def test_level_prioritario_sobre_sev(self):
+        rows, _ = server.parse_json(['{"level": "INFO", "sev": "alta", "msg": "x"}'])
+        self.assertEqual(rows[0]["level"], "INF")
+
+    def test_mensaje_es_el_msg_no_el_json(self):
+        rows, _ = server.parse_json([self.ALERTA])
+        r = rows[0]
+        self.assertEqual(r["msg"], "hallazgo 72/100: pid:23160")
+        self.assertNotIn("fuente", r["msg"])
+
+    def test_src_dst_a_ip(self):
+        rows, _ = server.parse_json([self.ALERTA])
+        self.assertEqual(rows[0]["ip"], "api.deepseek.com")
+        rows, _ = server.parse_json(
+            ['{"sev": "baja", "src": "10.0.0.1", "dst": "10.0.0.2", "mensaje": "m"}'])
+        self.assertEqual(rows[0]["ip"], "10.0.0.1")
+
+    def test_columnas_extra(self):
+        rows, counters = server.parse_json([self.ALERTA])
+        r = rows[0]
+        for col in ("fuente", "firma", "tenant", "tarea", "dedupe"):
+            self.assertIn(col, r)
+        self.assertEqual(r["fuente"], "ai-netwatch-finding")
+        self.assertEqual(r["firma"], "netwatch:findings:pid:23160")
+        self.assertEqual(r["tenant"], "local")
+        self.assertEqual(r["tarea"], "td15f4fa4")
+        self.assertEqual(r["dedupe"], "encolada")
+        self.assertEqual(r["riesgo"], "")
+        self.assertEqual(counters["levels"]["ERR"], 1)
+        self.assertEqual(counters["firmas"]["netwatch:findings:pid:23160"], 1)
+
+    def test_datos_anidado(self):
+        line = ('{"ts": "2026-10-11 17:43:47", "tenant": "local", '
+                '"fuente": "ai-netwatch-alert", "firma": "netwatch:rule_fired", '
+                '"datos": {"id": 1, "message": "Regla egress disparada", '
+                '"sev": "alta"}}')
+        rows, _ = server.parse_json([line])
+        r = rows[0]
+        self.assertEqual(r["msg"], "Regla egress disparada")
+        self.assertEqual(r["level"], "ERR")
+        self.assertEqual(r["fuente"], "ai-netwatch-alert")
+
+    def test_alerta_anendada_triage_dataset(self):
+        line = ('{"ts": "2026-10-11 23:17:19", "tenant": "local", '
+                '"alerta": {"fuente": "x", "firma": "F-LAYA", "sev": "baja", '
+                '"mensaje": "m"}, "laya": {"ok": true, "verdict": "expected"}, '
+                '"escalada": false, "tarea": "t123"}')
+        rows, _ = server.parse_json([line])
+        r = rows[0]
+        self.assertEqual(r["msg"], "m")
+        self.assertEqual(r["level"], "WRN")
+        self.assertEqual(r["fuente"], "x")
+        self.assertEqual(r["tarea"], "t123")
+        self.assertEqual(r["dedupe"], "")
+
+    def test_lista_y_dict_como_texto(self):
+        rows, _ = server.parse_json(
+            ['{"sev": "media", "mensaje": "m", "riesgo": ["a", "b"], '
+            '"evidencia": {"score": 72}}'])
+        self.assertEqual(rows[0]["riesgo"], "a, b")
+        self.assertIn("score", rows[0]["evidencia"])
+
+    def test_json_sin_mensaje_sigue_como_json(self):
+        rows, _ = server.parse_json(['{"level": "ERROR", "extra": "sin texto"}'])
+        self.assertIn("extra", rows[0]["msg"])
+
+    def test_search_incluye_firma(self):
+        rows, _ = server.parse_json([self.ALERTA])
+        r = rows[0]
+        r["_search"] = server._make_search(r)
+        self.assertIn("netwatch:findings", r["_search"])
+
+    def test_smoke_alertas_jsonl_real(self):
+        path = r"C:\Users\Sammi\AI\piloop-proyectos\buzon\soc\alertas.jsonl"
+        if not os.path.exists(path):
+            self.skipTest("alertas.jsonl no esta en disco")
+        ds = server.load_file(path)
+        self.assertEqual(ds["format"], "json")
+        rows = ds["store"].page_filtered({}, 0, 200)
+        self.assertTrue(rows)
+        with open(path, encoding="utf-8") as f:
+            src = [json.loads(l) for l in f if l.strip()][:200]
+        sev_to_level = {"baja": "WRN", "media": "INF", "alta": "ERR",
+                        "critica": "CRIT"}
+        for r, o in zip(rows, src):
+            # El msg es el texto de 'mensaje', no el JSON entero de la linea
+            if o.get("mensaje"):
+                # P1.1 (bug B3): el parseo NO trunca, el msg es el contenido
+                # completo de 'mensaje' (no el JSON entero de la linea)
+                self.assertEqual(r["msg"], server._json_scalar(o["mensaje"]))
+                self.assertNotEqual(r["msg"], json.dumps(o, ensure_ascii=False))
+            # El level refleja 'sev'
+            if o.get("sev"):
+                self.assertEqual(r["level"], sev_to_level.get(
+                    str(o["sev"]).lower(), server._norm_sev(o["sev"])),
+                    o.get("sev"))
+            self.assertEqual(r["ip"], o.get("src") or o.get("dst") or "")
+        self.assertTrue(any(r["level"] == "ERR" for r in rows))
+        self.assertTrue(any(r["level"] == "WRN" for r in rows))
+        self.assertTrue(all(r["level"] in ("WRN", "INF", "ERR", "CRIT") for r in rows))
+        self.assertTrue(any(r["fuente"] for r in rows))
+        self.assertTrue(any(r["firma"] for r in rows))
+        self.assertTrue(any(r["tenant"] for r in rows))
+        self.assertTrue(any(r["tarea"] for r in rows))
+        self.assertTrue(any(r["dedupe"] for r in rows))
+
+    def test_smoke_dataset_jsonl_real(self):
+        path = r"C:\Users\Sammi\AI\piloop-proyectos\buzon\soc\dataset.jsonl"
+        if not os.path.exists(path):
+            self.skipTest("dataset.jsonl no esta en disco")
+        ds = server.load_file(path)
+        rows = ds["store"].page_filtered({}, 0, 100)
+        self.assertTrue(rows)
+        self.assertTrue(any(r["msg"] and not r["msg"].startswith("{\"ts\"")
+                            for r in rows))
+        self.assertTrue(any(r["firma"] for r in rows))
+
+    def test_sqlstore_con_columnas_nuevas(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            store = server.SqlStore(os.path.join(tmp, "t.db"))
+            rows, _ = server.parse_json([self.ALERTA])
+            for r in rows:
+                r["_search"] = server._make_search(r)
+            store.add_rows(rows, {"levels": Counter({"ERR": 1})})
+            got = store.page_filtered({}, 0, 10)[0]
+            self.assertEqual(got["level"], "ERR")
+            self.assertEqual(got["firma"], "netwatch:findings:pid:23160")
+            self.assertEqual(got["tarea"], "td15f4fa4")
+            self.assertEqual(store.top("firma", 5)[0][0], "netwatch:findings:pid:23160")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestParsePiloop(unittest.TestCase):
+    """Formato OperVanta/piloop: 'YYYY-MM-DD HH:MM:SS componente: mensaje'.
+    El nivel no existe en la linea: se infiere por heuristica."""
+
+    def test_component_line_inf(self):
+        line = "2026-10-12 20:40:16 logs: rotado buzon.log (>0.0 MB) -> buzon.log.1"
+        rows, counters = server.parse_piloop([line])
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["ts"], "2026-10-12 20:40:16")
+        self.assertEqual(r["level"], "INF")
+        self.assertEqual(r["comp"], "logs")
+        self.assertIn("rotado", r["msg"])
+        self.assertEqual(r["raw"], line)
+        self.assertEqual(counters["levels"]["INF"], 1)
+
+    def test_err_by_heuristic(self):
+        line = ("2026-10-12 20:40:32 except silencioso en _visor_text: "
+                "PermissionError: [Errno 13] Permission denied: 'C:\\x.txt'")
+        rows, _ = server.parse_piloop([line])
+        self.assertEqual(rows[0]["level"], "ERR")
+        self.assertEqual(rows[0]["ts"], "2026-10-12 20:40:32")
+
+    def test_warn_by_heuristic(self):
+        rows, _ = server.parse_piloop(["2026-10-12 20:40:00 orquestador: aviso de ventana huerfana"])
+        self.assertEqual(rows[0]["level"], "WRN")
+
+    def test_no_hint_defaults_inf(self):
+        rows, _ = server.parse_piloop(["2026-10-12 20:40:00 DIGEST s01a127fc -> memoria/s01.md"])
+        self.assertEqual(rows[0]["level"], "INF")
+        self.assertEqual(rows[0]["comp"], "")
+        self.assertEqual(rows[0]["msg"], "DIGEST s01a127fc -> memoria/s01.md")
+
+    def test_ip_extracted(self):
+        line = "2026-10-12 20:40:00 orquestador: conexion a 127.0.0.1:9222 establecida"
+        rows, counters = server.parse_piloop([line])
+        self.assertEqual(rows[0]["ip"], "127.0.0.1")
+        self.assertEqual(counters["ips"]["127.0.0.1"], 1)
+
+    def test_stack_trace_stays_raw(self):
+        line = "    at Socket._write (node:internal/net:75:18)"
+        rows, counters = server.parse_piloop([line])
+        self.assertEqual(rows[0]["level"], "RAW")
+        self.assertEqual(rows[0]["ts"], "")
+        self.assertEqual(rows[0]["raw"], line)
+        self.assertEqual(counters["levels"]["RAW"], 1)
+
+    def test_registered_in_parsers(self):
+        self.assertIn("piloop", server.PARSERS)
+        self.assertIs(server.PARSERS["piloop"], server.parse_piloop)
+
+    def test_detect_format_piloop(self):
+        sample = [
+            "2026-10-12 20:40:16 logs: rotado buzon.log (>0.0 MB) -> buzon.log.1",
+            "2026-10-12 20:40:32 except silencioso en _visor_text: PermissionError: denied",
+            "    at Socket._write (node:internal/net:75:18)",
+            "2026-10-12 20:40:46 orquestador[core]: pi RPC arrancado",
+        ]
+        self.assertEqual(server.detect_format(sample), "piloop")
+
+    def test_detect_format_apache_no_piloop(self):
+        sample = [
+            '127.0.0.1 - - [10/Oct/2023:13:55:36 -0700] "GET /a HTTP/1.1" 200 1234',
+            '127.0.0.1 - - [10/Oct/2023:13:55:37 -0700] "GET /b HTTP/1.1" 404 12',
+        ]
+        self.assertEqual(server.detect_format(sample), "apache")
+
+    def test_detect_format_umbral_40(self):
+        # 4 de 10 lineas matchean -> 40%: se detecta como piloop
+        sample = ["2026-10-12 20:40:16 logs: rotado a.log"] * 4 + ["Traceback (most recent call last):"] * 6
+        self.assertEqual(server.detect_format(sample), "piloop")
+        # 3 de 10 -> por debajo del umbral -> raw
+        sample = ["2026-10-12 20:40:16 logs: rotado a.log"] * 3 + ["Traceback (most recent call last):"] * 7
+        self.assertEqual(server.detect_format(sample), "raw")
+
+    def test_load_file_buzon_real(self):
+        path = r"C:\Users\Sammi\AI\piloop-proyectos\buzon\buzon.log"
+        if not os.path.exists(path):
+            self.skipTest("buzon.log no esta en disco")
+        ds = server.load_file(path)
+        self.assertEqual(ds["format"], "piloop")
+        levels = ds["store"].counters.get("levels", {})
+        self.assertTrue(any(levels.get(k) for k in ("ERR", "WRN", "INF")))
+        self.assertTrue(levels.get("RAW", 0) < ds["total"])
+        rows = ds["store"].page_filtered({}, 0, 50)
+        self.assertTrue(any(r["ts"] for r in rows))
+
+
+class TestParseTriage(unittest.TestCase):
+    """Formato SOC triage: 'HH:MM:SS [fuente] FIRMA -> verdict conf X sev Y accion Z | ESCALADA tid'.
+    El nivel no existe en la linea: se infiere de sev, conf y accion."""
+
+    ESC = "23:36:54 [x] F-LAYA2 -> real_incident conf 0.8 sev 2.0 accion yes | ESCALADA t4f87df76"
+    SIN = "23:36:54 [x] F-LAYA -> expected conf 0.9 sev 0.2 accion no | sin tarea"
+    NONE = ("18:25:44 [ai-netwatch] netwatch:rule_fired:service_ai_call "
+            "-> None conf None sev None accion None | ESCALADA tc4878a4f")
+
+    def test_escalada_line(self):
+        rows, counters = server.parse_triage([self.ESC])
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["ts"], "23:36:54")
+        self.assertEqual(r["fuente"], "x")
+        self.assertEqual(r["firma"], "F-LAYA2")
+        self.assertEqual(r["verdict"], "real_incident")
+        self.assertEqual(r["conf"], 0.8)
+        self.assertEqual(r["sev"], 2.0)
+        self.assertEqual(r["accion"], "yes")
+        self.assertEqual(r["tarea"], "t4f87df76")
+        self.assertEqual(r["level"], "ERR")
+        self.assertEqual(r["raw"], self.ESC)
+        self.assertIn("F-LAYA2", r["msg"])
+        self.assertEqual(counters["levels"]["ERR"], 1)
+        self.assertEqual(counters["fuente"]["x"], 1)
+        self.assertEqual(counters["firma"]["F-LAYA2"], 1)
+
+    def test_sin_tarea(self):
+        rows, _ = server.parse_triage([self.SIN])
+        r = rows[0]
+        self.assertEqual(r["tarea"], "")
+        self.assertEqual(r["level"], "INF")
+        self.assertEqual(r["conf"], 0.9)
+        self.assertEqual(r["sev"], 0.2)
+        self.assertEqual(r["accion"], "no")
+
+    def test_tarea_optional(self):
+        # linea sin la barra: la tarea sigue siendo opcional
+        rows, _ = server.parse_triage(["01:02:03 [splunk] X -> expected conf 0.5 sev 0.1 accion no"])
+        self.assertEqual(rows[0]["tarea"], "")
+        self.assertEqual(rows[0]["firma"], "X")
+
+    def test_none_values(self):
+        rows, _ = server.parse_triage([self.NONE])
+        r = rows[0]
+        self.assertIsNone(r["conf"])
+        self.assertIsNone(r["sev"])
+        self.assertEqual(r["verdict"], "None")
+        self.assertEqual(r["tarea"], "tc4878a4f")
+        # sin puntuacion y sin accion -> INF, no ERR
+        self.assertEqual(r["level"], "INF")
+
+    def test_level_by_sev_and_accion(self):
+        # sev >= 2.0 -> ERR aunque la accion sea no
+        rows, _ = server.parse_triage(["10:00:00 [s] A -> real_incident conf 0.6 sev 2.0107 accion no | sin tarea"])
+        self.assertEqual(rows[0]["level"], "ERR")
+        # accion yes -> ERR con sev baja
+        rows, _ = server.parse_triage(["10:00:00 [s] B -> false_positive conf 0.3179 sev 1.3408 accion yes | sin tarea"])
+        self.assertEqual(rows[0]["level"], "ERR")
+        # sev intermedia -> WRN
+        rows, _ = server.parse_triage(["10:00:00 [s] C -> real_incident conf 0.5915 sev 1.7347 accion no | sin tarea"])
+        self.assertEqual(rows[0]["level"], "WRN")
+        # conf alta y sev baja, veredicto benigno -> INF
+        rows, _ = server.parse_triage(["10:00:00 [s] D -> expected conf 0.95 sev 0.5 accion no | sin tarea"])
+        self.assertEqual(rows[0]["level"], "INF")
+        # conf alta, sev baja, veredicto de incidente -> WRN
+        rows, _ = server.parse_triage(["10:00:00 [s] E -> real_incident conf 0.9 sev 0.5 accion no | sin tarea"])
+        self.assertEqual(rows[0]["level"], "WRN")
+
+    def test_file_date_in_ts(self):
+        rows, _ = server.parse_triage([self.SIN], file_date="2026-10-28")
+        self.assertEqual(rows[0]["ts"], "2026-10-28 23:36:54")
+        self.assertEqual(server.norm_ts(rows[0]["ts"]), "2026-10-28T23:36:54")
+
+    def test_nonmatching_line_stays_raw(self):
+        line = "    at Socket._write (node:internal/net:75:18)"
+        rows, counters = server.parse_triage([line])
+        self.assertEqual(rows[0]["level"], "RAW")
+        self.assertEqual(rows[0]["ts"], "")
+        self.assertEqual(rows[0]["raw"], line)
+        self.assertEqual(rows[0]["fuente"], "")
+        self.assertEqual(counters["levels"]["RAW"], 1)
+
+    def test_registered_in_parsers(self):
+        self.assertIn("triage", server.PARSERS)
+        self.assertIs(server.PARSERS["triage"], server.parse_triage)
+
+    def test_detect_format_triage(self):
+        sample = [
+            self.ESC,
+            self.SIN,
+            "23:40:01 [splunk] splunk:Piloop - Guard blocks -> expected conf 0.95 sev 0.5 accion no | sin tarea",
+        ]
+        self.assertEqual(server.detect_format(sample), "triage")
+
+    def test_detect_format_umbral_40(self):
+        # 4 de 10 -> triage; 3 de 10 -> por debajo del umbral
+        sample = [self.SIN] * 4 + ["Traceback (most recent call last):"] * 6
+        self.assertEqual(server.detect_format(sample), "triage")
+        sample = [self.SIN] * 3 + ["Traceback (most recent call last):"] * 7
+        self.assertEqual(server.detect_format(sample), "raw")
+
+    def test_detect_format_piloop_no_triage(self):
+        sample = ["2026-10-12 20:40:16 logs: rotado a.log"] * 5
+        self.assertEqual(server.detect_format(sample), "piloop")
+
+    def test_load_file_triage_real(self):
+        path = r"C:\Users\Sammi\AI\piloop-proyectos\buzon\soc\triage.log"
+        if not os.path.exists(path):
+            self.skipTest("triage.log no esta en disco")
+        ds = server.load_file(path)
+        self.assertEqual(ds["format"], "triage")
+        rows = ds["store"].page_filtered({}, 0, 100)
+        self.assertTrue(rows)
+        self.assertTrue(all(r["fuente"] for r in rows))
+        self.assertTrue(all(r["firma"] for r in rows))
+        self.assertTrue(any(r["sev"] is not None for r in rows))
+        self.assertTrue(any(r["tarea"] for r in rows))
+        self.assertTrue(all(r["ts"] for r in rows))
+
+    def test_tail_parse_triage(self):
+        ds = {"format": "triage", "file_date": "2026-10-28"}
+        rows, _ = server.tail_parse(ds, [self.ESC])
+        self.assertEqual(rows[0]["ts"], "2026-10-28 23:36:54")
+        self.assertEqual(rows[0]["tarea"], "t4f87df76")
 
 
 class TestParseRaw(unittest.TestCase):
@@ -172,7 +558,13 @@ class TestDecodeText(unittest.TestCase):
         self.assertEqual(len(text), 10)
 
 
-class TestOpenLogFile(unittest.TestCase):
+class TestOpenLogStream(unittest.TestCase):
+    """Compresion por magico (gzip/bz2/xz/zip) del lector en streaming.
+
+    Bug B12 (2026-10-30): estos tests usaban open_log_file, una version muerta
+    que cargaba el archivo entero en RAM. Ahora ejercitan open_log_stream, que
+    es la que usa load_file de verdad."""
+
     def _write(self, data, name):
         fd, path = tempfile.mkstemp(suffix=name)
         with os.fdopen(fd, "wb") as f:
@@ -180,28 +572,36 @@ class TestOpenLogFile(unittest.TestCase):
         self.addCleanup(os.remove, path)
         return path
 
+    def _read(self, path):
+        reader, label, inner = server.open_log_stream(path)
+        try:
+            raw = reader.read()
+        finally:
+            reader.close()
+        return raw, label, inner
+
     def test_plain(self):
         path = self._write(b"linea uno\nlinea dos\n", "plain.log")
-        raw, label, inner = server.open_log_file(path)
+        raw, label, inner = self._read(path)
         self.assertEqual(raw, b"linea uno\nlinea dos\n")
         self.assertEqual(label, "")
         self.assertEqual(inner, "")
 
     def test_gzip(self):
         path = self._write(gzip.compress(b"datos gzip\n"), "a.gz")
-        raw, label, inner = server.open_log_file(path)
+        raw, label, inner = self._read(path)
         self.assertEqual(raw, b"datos gzip\n")
         self.assertEqual(label, "gzip")
 
     def test_bz2(self):
         path = self._write(bz2.compress(b"datos bz2\n"), "a.bz2")
-        raw, label, inner = server.open_log_file(path)
+        raw, label, inner = self._read(path)
         self.assertEqual(raw, b"datos bz2\n")
         self.assertEqual(label, "bzip2")
 
     def test_xz(self):
         path = self._write(lzma.compress(b"datos xz\n"), "a.xz")
-        raw, label, inner = server.open_log_file(path)
+        raw, label, inner = self._read(path)
         self.assertEqual(raw, b"datos xz\n")
         self.assertEqual(label, "xz")
 
@@ -212,7 +612,7 @@ class TestOpenLogFile(unittest.TestCase):
             z.writestr("notas.md", "no soy el log")
             z.writestr("app.log", "linea zip\n")
         path = self._write(buf.getvalue(), "a.zip")
-        raw, label, inner = server.open_log_file(path)
+        raw, label, inner = self._read(path)
         self.assertEqual(raw, b"linea zip\n")
         self.assertEqual(label, "zip")
         self.assertEqual(inner, "app.log")
@@ -220,7 +620,7 @@ class TestOpenLogFile(unittest.TestCase):
     def test_magic_over_extension(self):
         # Un .log que en realidad es gzip: gana el magico
         path = self._write(gzip.compress(b"real gzip\n"), "a.log")
-        raw, label, inner = server.open_log_file(path)
+        raw, label, inner = self._read(path)
         self.assertEqual(raw, b"real gzip\n")
         self.assertEqual(label, "gzip")
 
@@ -265,8 +665,8 @@ class TestLoadFile(unittest.TestCase):
                 f.write("2023-10-10 13:55:%02d info linea %d prueba\n"
                         % (i % 60, i))
         self.addCleanup(os.remove, path)
-        old = server.SQLITE_THRESHOLD
-        server.SQLITE_THRESHOLD = 10
+        old = config.SQLITE_THRESHOLD
+        config.SQLITE_THRESHOLD = 10
         try:
             ds1 = server.load_file(path)
             self.assertIsInstance(ds1["store"], server.SqlStore)
@@ -276,7 +676,7 @@ class TestLoadFile(unittest.TestCase):
             self.assertFalse(os.path.exists(db_path))
             ds2 = server.load_file(path)
         finally:
-            server.SQLITE_THRESHOLD = old
+            config.SQLITE_THRESHOLD = old
         with ds2["store"].lock:
             n = ds2["store"].conn.execute(
                 "SELECT COUNT(*) FROM rows").fetchone()[0]
@@ -301,6 +701,144 @@ class TestMultipartAll(unittest.TestCase):
 
     def test_no_parts(self):
         self.assertEqual(server.parse_multipart_all(b"", b"x"), [])
+
+
+class TestMultipartStream(unittest.TestCase):
+    """Bug B9 (2026-10-30): el upload se lee por bloques y se escribe a disco.
+
+    Estos tests comparan el lector en streaming con parse_multipart_all (que
+    sigue existiendo para cuerpos pequenos) y verifican los limites."""
+
+    BOUNDARY = "----xyz"
+
+    def _body(self, parts, preamble=b""):
+        out = preamble
+        for name, body in parts:
+            out += (b"--" + self.BOUNDARY.encode() + b"\r\n"
+                    b'Content-Disposition: form-data; name="file"; '
+                    b'filename="' + name.encode() + b'"\r\n'
+                    b"\r\n" + body + b"\r\n")
+        out += b"--" + self.BOUNDARY.encode() + b"--\r\n"
+        return out
+
+    def test_matches_reference_parser(self):
+        parts_in = [("a.log", b"uno"), ("b.log", b"x" * 5000),
+                    ("c.bin", bytes(range(256)) * 40), ("empty.log", b"")]
+        data = self._body(parts_in)
+        for chunk in (1, 7, 64, 4096, 1024 * 1024):
+            with tempfile.TemporaryDirectory() as tmp:
+                got, written = server.stream_multipart_to_disk(
+                    io.BytesIO(data), self.BOUNDARY.encode(), len(data), tmp,
+                    chunk_size=chunk)
+                ref = server.parse_multipart_all(data, self.BOUNDARY.encode())
+                read = [(n, open(p, "rb").read()) for n, p, _ in got]
+                self.assertEqual(read, ref, "chunk %d" % chunk)
+                self.assertEqual(len(written), len(ref))
+                self.assertEqual(sum(s for _, _, s in got),
+                                 sum(len(b) for _, b in parts_in))
+
+    def test_part_size_limit(self):
+        data = self._body([("a.log", b"z" * 10000)])
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(server.UploadError):
+                server.stream_multipart_to_disk(
+                    io.BytesIO(data), self.BOUNDARY.encode(), len(data), tmp,
+                    max_part_size=1000, chunk_size=1024)
+
+    def test_total_size_limit(self):
+        data = self._body([("a.log", b"q" * 5000)])
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(server.UploadError):
+                server.stream_multipart_to_disk(
+                    io.BytesIO(data), self.BOUNDARY.encode(), len(data), tmp,
+                    max_total=1000, chunk_size=1024)
+
+    def test_no_delimiter_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(server.UploadError):
+                server.stream_multipart_to_disk(
+                    io.BytesIO(b"sin boundary"), b"xyz", 12, tmp, chunk_size=4)
+
+    def test_truncated_body_raises(self):
+        data = self._body([("a.log", b"hola")])
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(server.UploadError):
+                server.stream_multipart_to_disk(
+                    io.BytesIO(data[:len(data) - 5]), self.BOUNDARY.encode(),
+                    len(data) - 5, tmp, chunk_size=8)
+
+    def test_name_is_sanitized_on_disk(self):
+        data = self._body([("../../evil.log", b"dato")])
+        with tempfile.TemporaryDirectory() as tmp:
+            got, written = server.stream_multipart_to_disk(
+                io.BytesIO(data), self.BOUNDARY.encode(), len(data), tmp)
+            self.assertEqual(len(got), 1)
+            name, path, size = got[0]
+            self.assertTrue(size == 4)
+            self.assertTrue(os.path.dirname(path) == tmp)
+            self.assertNotIn("..", name)
+            self.assertTrue(os.path.exists(path))
+
+    def test_does_not_read_whole_body(self):
+        # El buffer debe quedar acotado: con chunk pequeno el pico de memoria
+        # es del bloque, no del cuerpo (se comprueba midiendo el maximo usado).
+        data = self._body([("big.log", b"a" * 4 * 1024 * 1024)])
+        with tempfile.TemporaryDirectory() as tmp:
+            server.stream_multipart_to_disk(io.BytesIO(data),
+                                           self.BOUNDARY.encode(), len(data), tmp,
+                                           chunk_size=8192)
+
+
+class TestLogRotation(unittest.TestCase):
+    """Bug B11 (2026-10-30): requests.log y audit.log rotan a 5 MB."""
+
+    def test_no_rotation_under_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "requests.log")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("hola\n")
+            self.assertFalse(server.rotate_log(path, max_bytes=1000))
+            self.assertFalse(os.path.exists(path + ".1"))
+
+    def test_rotation_creates_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "requests.log")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("a" * 2000)
+            self.assertTrue(server.rotate_log(path, max_bytes=1000))
+            self.assertTrue(os.path.exists(path + ".1"))
+            self.assertEqual(os.path.getsize(path + ".1"), 2000)
+            self.assertTrue(os.path.exists(path))
+            self.assertEqual(os.path.getsize(path), 0)
+
+    def test_rotation_keeps_only_one_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "audit.log")
+            for i in range(3):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("b" * (1000 + i))
+                server.rotate_log(path, max_bytes=500)
+            self.assertEqual(os.path.getsize(path + ".1"), 1002)
+            self.assertFalse(os.path.exists(path + ".2"))
+
+    def test_audit_rotates_when_over_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_file = api.AUDIT_FILE
+            old_max = config.LOG_MAX_BYTES
+            try:
+                api.AUDIT_FILE = os.path.join(tmp, "audit.log")
+                config.LOG_MAX_BYTES = 400
+                for i in range(60):
+                    server.audit("test", user="tester", i=i)
+                self.assertTrue(os.path.exists(api.AUDIT_FILE))
+                self.assertTrue(os.path.exists(api.AUDIT_FILE + ".1"))
+                self.assertLessEqual(os.path.getsize(api.AUDIT_FILE), 400 + 200)
+            finally:
+                api.AUDIT_FILE = old_file
+                config.LOG_MAX_BYTES = old_max
+
+    def test_log_max_is_five_megabytes(self):
+        self.assertEqual(config.LOG_MAX_BYTES, 5 * 1024 * 1024)
 
 
 class TestSupportedExts(unittest.TestCase):
@@ -427,6 +965,187 @@ class TestRunbooks(unittest.TestCase):
         self.assertFalse(st.delete(99999))
         got = server.match_runbooks("timeout de red", st.all())
         self.assertEqual([r["pattern"] for r in got], ["*timeout de red*"])
+
+    def test_campos_p4_2_nombre_severidad_accion(self):
+        """P4.2: un runbook lleva nombre, severidad y accion."""
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        st = server.RunbookStore(os.path.join(tmpdir, "rb2.db"))
+        rb = st.add(r"except silencioso en", nombre="Except silencioso",
+                    severidad="WRN", accion="Registrar la excepcion")
+        self.assertEqual(rb["nombre"], "Except silencioso")
+        self.assertEqual(rb["severidad"], "WRN")
+        self.assertEqual(rb["accion"], "Registrar la excepcion")
+        # update sin tocar los campos nuevos: conservan su valor
+        upd = st.update(rb["id"], r"except silencioso en \w+", "regex",
+                        "exp", "causa", "sol", "ref")
+        self.assertEqual(upd["severidad"], "WRN")
+        self.assertEqual(upd["nombre"], "Except silencioso")
+        # severidad en texto de OperVanta se normaliza a la categoria
+        rb2 = st.add(r"ESCALADA", severidad="alta", nombre="Escalada")
+        self.assertEqual(rb2["severidad"], "ERR")
+        self.assertEqual(st.all()[1]["severidad"], "ERR")
+
+    def test_migracion_bd_antigua(self):
+        """P4.2: una BD sin nombre/severidad/accion se migra sin perder runbooks."""
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        db = os.path.join(tmpdir, "old.db")
+        import sqlite3
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE runbooks (id INTEGER PRIMARY KEY "
+                     "AUTOINCREMENT, pattern TEXT NOT NULL, kind TEXT, "
+                     "explicacion TEXT, causa TEXT, solucion TEXT, "
+                     "ref TEXT, created_at TEXT)")
+        conn.execute("INSERT INTO runbooks (pattern, kind, created_at) "
+                     "VALUES ('epipe', 'regex', '2026-01-01')")
+        conn.commit()
+        conn.close()
+        st = server.RunbookStore(db)
+        rows = st.all()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["pattern"], "epipe")
+        self.assertEqual(rows[0]["severidad"], "")
+        self.assertEqual(rows[0]["nombre"], "")
+        # y ya se pueden escribir los campos nuevos
+        self.assertEqual(st.add("rotado", severidad="INF")["severidad"], "INF")
+
+    def test_norm_sev(self):
+        """P4.2: normalizacion de severidades de OperVanta y del triaje."""
+        self.assertEqual(server.norm_sev("critica"), "CRIT")
+        self.assertEqual(server.norm_sev("alta"), "ERR")
+        self.assertEqual(server.norm_sev("media"), "INF")
+        self.assertEqual(server.norm_sev("baja"), "WRN")
+        self.assertEqual(server.norm_sev("CRIT"), "CRIT")
+        self.assertEqual(server.norm_sev(2.0), "ERR")
+        self.assertEqual(server.norm_sev(3.0), "CRIT")
+        self.assertEqual(server.norm_sev(0.2), "INF")
+        self.assertEqual(server.norm_sev(1.7), "WRN")
+        self.assertEqual(server.norm_sev(None), "INF")
+        self.assertEqual(server.norm_sev(""), "INF")
+        self.assertEqual(server.norm_sev("pues no se"), "INF")
+
+    def test_patrones_opervanta_coinciden(self):
+        """P4.2: los runbooks de OperVanta matchean lineas reales del buzon."""
+        rbs = [{"pattern": p, "kind": "regex"} for p in (
+            r"except silencioso en", r"PermissionError", r"EPIPE",
+            r"rotado", r"(?i)guard blocks", r"sin tarea", r"false_positive",
+            r"ESCALADA")]
+        lines = [
+            "2026-10-12 20:40:32 except silencioso en _visor_text: "
+            "PermissionError: [Errno 13] Permission denied: '_visor.txt'",
+            "Error: EPIPE: broken pipe, write",
+            "2026-10-12 20:40:16 logs: rotado buzon.log (>0.0 MB) -> "
+            "buzon.log.1",
+            "2026-10-12 23:10:01 SOC: pre-triaje NO crea tarea para "
+            "'splunk:Piloop - Guard blocks' -> LAY A: expected",
+            "23:40:04 [splunk] splunk:Piloop - Alertas SOC -> false_positive "
+            "conf 0.3179 sev 1.3408 accion yes | ESCALADA t4ab1d1d0",
+            "23:40:01 [splunk] splunk:Piloop - Guard blocks -> expected "
+            "conf 0.95 sev 0.5 accion no | sin tarea",
+        ]
+        for line in lines:
+            got = server.match_runbooks(line, rbs)
+            self.assertTrue(got, "no matchea: %s" % line)
+        self.assertEqual(server.match_runbooks("todo en orden", rbs), [])
+
+
+class TestSocDashboard(unittest.TestCase):
+    """P4.2: agregado del dashboard SOC (severidad, fuente, tarea)."""
+
+    def _alerts(self):
+        return [
+            {"ts": "2026-10-11 18:02:25", "fuente": "splunk",
+             "firma": "SEC-TEST", "sev": "baja", "tarea": "t4374e3e9",
+             "dedupe": None, "msg": "x"},
+            {"ts": "2026-10-11 18:32:06", "fuente": "ai-netwatch-finding",
+             "firma": "netwatch:findings:pid:23160:api.deepseek.com",
+             "sev": "alta", "tarea": "td15f4fa4", "dedupe": "encolada",
+             "msg": "hallazgo 72/100"},
+            {"ts": "2026-10-12 09:00:00", "fuente": "splunk",
+             "firma": "guard-blocks", "sev": "media", "tarea": None,
+             "dedupe": "encolada", "msg": "Piloop - Guard blocks"},
+            {"ts": "2026-10-12 09:05:00", "fuente": "splunk",
+             "firma": "laya2", "sev": "critica", "tarea": None,
+             "dedupe": None, "msg": "F-LAYA2"},
+        ]
+
+    def test_reparto_por_severidad_y_fuente(self):
+        res = server.soc_dashboard(self._alerts())
+        self.assertEqual(res["alerts_total"], 4)
+        self.assertEqual(res["sev"], {"CRIT": 1, "ERR": 1, "WRN": 1, "INF": 1})
+        self.assertEqual(res["fuente"][0]["fuente"], "splunk")
+        self.assertEqual(res["fuente"][0]["count"], 3)
+        self.assertEqual(res["fuente"][0]["sev"]["CRIT"], 1)
+        self.assertEqual(res["sev_raw"]["alta"], 1)
+
+    def test_tareas_abiertas_y_encoladas(self):
+        res = server.soc_dashboard(self._alerts())
+        self.assertEqual(res["tarea"]["abierta"], 2)
+        self.assertEqual(res["tarea"]["encolada"], 1)
+        self.assertEqual(res["tarea"]["sin_dato"], 1)
+        self.assertEqual(res["tareas_abiertas"][0]["tarea"], "t4374e3e9")
+
+    def test_triage_cierra_sin_tarea(self):
+        tri = [{"ts": "23:40:01", "fuente": "splunk", "firma": "guard-blocks",
+                "verdict": "expected", "conf": 0.95, "sev": 0.5,
+                "accion": "no", "tarea": None}]
+        res = server.soc_dashboard(self._alerts(), tri)
+        self.assertEqual(res["tarea"]["descartada"], 1)
+        self.assertEqual(res["triage_total"], 1)
+        self.assertEqual(res["verdicts"].get("expected"), 1)
+
+    def test_triage_escala_a_tarea(self):
+        tri = [{"ts": "23:40:04", "fuente": "splunk", "firma": "laya2",
+                "verdict": "real_incident", "conf": 0.8, "sev": 2.0,
+                "accion": "yes", "tarea": "t9a1b2c3d"}]
+        res = server.soc_dashboard(self._alerts(), tri)
+        self.assertEqual(res["tarea"]["abierta"], 3)
+        item = next(i for i in res["items"] if i["firma"] == "laya2")
+        self.assertEqual(item["status"], "abierta")
+        self.assertEqual(item["tarea"], "t9a1b2c3d")
+        self.assertEqual(item["motivo"], "ESCALADA")
+
+    def test_filtros_servidor(self):
+        alerts = self._alerts()
+        res = server.soc_dashboard(alerts, sev_q="CRIT")
+        self.assertEqual(len(res["items"]), 1)
+        self.assertEqual(res["items"][0]["firma"], "laya2")
+        # el conteo de severidades es del total, no del filtro
+        self.assertEqual(res["sev"]["CRIT"], 1)
+        res = server.soc_dashboard(alerts, fuente_q="netwatch")
+        self.assertEqual(len(res["items"]), 1)
+        res = server.soc_dashboard(alerts, tarea_q="encolada")
+        self.assertEqual(len(res["items"]), 1)
+        self.assertEqual(res["items"][0]["firma"], "guard-blocks")
+        res = server.soc_dashboard(alerts, limit=2)
+        self.assertEqual(len(res["items"]), 2)
+        self.assertTrue(res["truncated"])
+
+    def test_dedupe_y_veredictos_no_inflados(self):
+        """P4.2: dedupe se cuenta aparte y los veredictos no se inflan
+        aunque el triaje repita la misma firma cientos de veces."""
+        tri = [{"ts": "23:40:01", "fuente": "splunk", "firma": "guard-blocks",
+                "verdict": "expected", "conf": 0.95, "sev": 0.5,
+                "accion": "no", "tarea": None}] * 300
+        res = server.soc_dashboard(self._alerts(), tri)
+        self.assertEqual(res["dedupe"].get("encolada"), 2)
+        self.assertEqual(res["dedupe"].get("sin_dato"), 2)
+        self.assertEqual(res["verdicts"]["expected"], 1)
+
+    def test_sin_alertas(self):
+        res = server.soc_dashboard([])
+        self.assertEqual(res["alerts_total"], 0)
+        self.assertEqual(res["items"], [])
+        self.assertEqual(res["sev"], {"CRIT": 0, "ERR": 0, "WRN": 0, "INF": 0})
+        self.assertEqual(res["tarea"], {"abierta": 0, "encolada": 0,
+                                        "descartada": 0, "sin_dato": 0})
+
+    def test_severidad_from_level_si_no_trae_sev(self):
+        rows = [{"ts": "", "fuente": "syslog", "level": "ERR", "msg": "boom"}]
+        res = server.soc_dashboard(rows)
+        self.assertEqual(res["sev"]["ERR"], 1)
+        self.assertEqual(res["sev_raw"]["err"], 1)
 
 
 class TestHistogram(unittest.TestCase):
@@ -573,12 +1292,12 @@ class TestTemplate(unittest.TestCase):
             f.write("2023-10-10 13:55:36 info fallo desde 192.168.1.9 "
                     "puerto 8080\n")
         self.addCleanup(os.remove, path)
-        old = server.SQLITE_THRESHOLD
-        server.SQLITE_THRESHOLD = 10
+        old = config.SQLITE_THRESHOLD
+        config.SQLITE_THRESHOLD = 10
         try:
             ds = server.load_file(path)
         finally:
-            server.SQLITE_THRESHOLD = old
+            config.SQLITE_THRESHOLD = old
         store = ds["store"]
         page = store.page_filtered({}, 0, 10)
         # Fechas/horas tambien son numeros: salen normalizadas
@@ -644,12 +1363,12 @@ class TestFts(unittest.TestCase):
                 f.write("2023-10-10 13:55:%02d info linea unica%d prueba\n"
                         % (i % 60, i))
         self.addCleanup(os.remove, path)
-        old = server.SQLITE_THRESHOLD
-        server.SQLITE_THRESHOLD = 100
+        old = config.SQLITE_THRESHOLD
+        config.SQLITE_THRESHOLD = 100
         try:
             ds = server.load_file(path)
         finally:
-            server.SQLITE_THRESHOLD = old
+            config.SQLITE_THRESHOLD = old
         store = ds["store"]
         self.assertIsInstance(store, server.SqlStore)
         with store.lock:
@@ -790,6 +1509,197 @@ class TestFilterTerms(unittest.TestCase):
         # Exclusion vacia tras la coma no rompe el resto
         got = self._parity({"code": "200,"})
         self.assertEqual(got, ["uno"])
+
+
+class TestNoTruncEnParseo(unittest.TestCase):
+    """P1.1 (bug B3): el parseo guarda el contenido COMPLETO.
+
+    El recorte solo existe en la capa que sirve la lista de filas (ui_row),
+    de forma que el drawer y el export ven la linea entera."""
+
+    LONG = "z" * 2500
+
+    def test_raw_no_trunca(self):
+        line = "L" + self.LONG
+        rows, _ = server.parse_raw([line])
+        self.assertEqual(rows[0]["raw"], line)
+        self.assertEqual(rows[0]["msg"], line)
+        self.assertNotIn(" ...", rows[0]["msg"])
+
+    def test_generic_no_trunca(self):
+        line = "2026-10-30 01:02:03 ERROR " + self.LONG
+        rows, _ = server.parse_generic([line])
+        self.assertEqual(rows[0]["raw"], line)
+        self.assertEqual(len(rows[0]["msg"]), len(line) - len("2026-10-30 01:02:03 ERROR "))
+
+    def test_json_no_trunca(self):
+        obj = {"ts": "2026-10-30T01:02:03", "sev": "alta",
+               "mensaje": self.LONG, "evidencia": self.LONG}
+        rows, _ = server.parse_json([json.dumps(obj)])
+        self.assertEqual(rows[0]["msg"], self.LONG)
+        self.assertEqual(rows[0]["evidencia"], self.LONG)
+        self.assertEqual(rows[0]["raw"], json.dumps(obj))
+
+    def test_piloop_no_trunca(self):
+        line = "2026-10-30 01:02:03 vigilante: " + self.LONG
+        rows, _ = server.parse_piloop([line])
+        self.assertEqual(rows[0]["raw"], line)
+        self.assertEqual(rows[0]["msg"], self.LONG)
+
+    def test_ui_row_recorta_msg_y_conserva_raw(self):
+        line = "2026-10-30 01:02:03 ERROR " + self.LONG
+        rows, _ = server.parse_generic([line])
+        r = rows[0]
+        r["_search"] = server._make_search(r)
+        ui = server.ui_row(r)
+        self.assertTrue(ui["msg"].endswith(" ..."))
+        self.assertEqual(len(ui["msg"]), server.TRUNC + 4)
+        self.assertEqual(ui["msg_len"], len(r["msg"]))
+        self.assertTrue(ui["msg_truncated"])
+        # El raw se sirve entero: el drawer necesita la linea completa
+        self.assertEqual(ui["raw"], line)
+        self.assertNotIn("_search", ui)
+        # La fila interna del store no se toca
+        self.assertEqual(r["msg"], line[len("2026-10-30 01:02:03 ERROR "):])
+
+    def test_ui_row_no_recorta_si_es_corto(self):
+        ui = server.ui_row({"msg": "corto", "raw": "corto"})
+        self.assertEqual(ui["msg"], "corto")
+        self.assertNotIn("msg_truncated", ui)
+
+    def test_export_ve_el_contenido_completo(self):
+        fd, path = tempfile.mkstemp(suffix=".log")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("2026-10-30 01:02:03 ERROR " + self.LONG + "\n")
+        self.addCleanup(os.remove, path)
+        ds = server.load_file(path)
+        rows = ds["store"].page_filtered({}, 0, 10)
+        self.assertEqual(len(rows[0]["msg"]), len(self.LONG))
+        self.assertEqual(rows[0]["raw"], "2026-10-30 01:02:03 ERROR " + self.LONG)
+
+    def test_trunc_ya_no_aparece_en_parse(self):
+        """Guardia: los parse_* no pueden volver a truncar."""
+        src = open(os.path.join(os.path.dirname(__file__), "parsers.py"),
+                   encoding="utf-8").read()
+        for name in ("parse_apache", "parse_w3c", "parse_json", "parse_syslog",
+                     "parse_generic", "parse_piloop", "parse_triage",
+                     "parse_raw"):
+            i = src.index("def %s(" % name)
+            j = src.index("\n\n", i)
+            self.assertNotIn("_trunc(", src[i:j], name)
+
+
+class TestFilterContract(unittest.TestCase):
+    """P1.1 (bug B5): MemStore y SqlStore dan las MISMAS filas para el mismo 'q'.
+
+    El contrato se prueba con los mismos datos en ambos stores: se compara la
+    secuencia de lineas (y el msg) de las filas devueltas."""
+
+    ROWS = [
+        {"ts": "2026-10-30 01:00:01", "level": "INF", "ip": "10.0.0.1",
+         "method": "", "path": "", "code": "", "bytes": "",
+         "msg": "alpha beta uno", "raw": "r1"},
+        {"ts": "2026-10-30 01:00:02", "level": "ERR", "ip": "10.0.0.5",
+         "method": "", "path": "", "code": "500", "bytes": "",
+         "msg": "alpha gamma dos", "raw": "r2"},
+        {"ts": "2026-10-30 01:00:03", "level": "ERR", "ip": "192.168.1.9",
+         "method": "GET", "path": "/a/b", "code": "404", "bytes": "12",
+         "msg": "beta delta tres", "raw": "r3"},
+        {"ts": "2026-10-30 01:00:04", "level": "WRN", "ip": "",
+         "method": "", "path": "", "code": "", "bytes": "",
+         "msg": "epsilon zeta cuatro", "raw": "r4"},
+        {"ts": "2026-10-30 01:00:05", "level": "INF", "ip": "10.0.0.1",
+         "method": "", "path": "", "code": "", "bytes": "",
+         "msg": "ALPHA-BETA cinco, pid:23160", "raw": "r5"},
+    ]
+
+    def _stores(self):
+        mem_rows = []
+        sql_rows = []
+        for i, r in enumerate(self.ROWS):
+            row = dict(r)
+            row["_line"] = i
+            row["template"] = server.make_template(row["raw"])
+            row["ts_norm"] = server.norm_ts(row["ts"])
+            row["_search"] = server._make_search(row)
+            mem_rows.append(row)
+            sql_rows.append(dict(row))
+        mem = server.MemStore(rows=mem_rows)
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        sql = server.SqlStore(os.path.join(tmpdir, "contract.db"))
+        self.addCleanup(sql.close)
+        sql.add_rows(sql_rows, {})
+        return mem, sql
+
+    def _compare(self, q):
+        mem, sql = self._stores()
+        mem_rows = mem.page_filtered(q, 0, 100)
+        sql_rows = sql.page_filtered(q, 0, 100)
+        mem_lines = [r["_line"] for r in mem_rows]
+        sql_lines = [sql.line_of(r["rowid"]) for r in sql_rows]
+        self.assertEqual(mem_lines, sql_lines, "q=%r" % q)
+        self.assertEqual([r["msg"] for r in mem_rows],
+                         [r["msg"] for r in sql_rows], "q=%r" % q)
+        self.assertEqual(mem.count_filtered(q), sql.count_filtered(q), "q=%r" % q)
+        self.assertEqual(mem.histogram(q), sql.histogram(q), "q=%r" % q)
+        return mem_lines
+
+    def test_subcadena_dentro_de_token(self):
+        # FTS5 tokeniza: 'alph' no matcheaba en SQLite pero si en MemStore
+        self.assertEqual(self._compare({"q": ["alph"]}), [0, 1, 4])
+        self.assertEqual(self._compare({"q": ["lpha"]}), [0, 1, 4])
+
+    def test_frase_de_varios_tokens(self):
+        # 'alpha beta' aparece literal en la fila 0; en la 4 hay 'ALPHA-BETA'
+        # (con guion), que NO es la misma subcadena
+        self.assertEqual(self._compare({"q": ["alpha beta"]}), [0])
+        self.assertEqual(self._compare({"q": ["alpha"]}), [0, 1, 4])
+
+    def test_case_insensitive(self):
+        self.assertEqual(self._compare({"q": ["ALPHA"]}), [0, 1, 4])
+        self.assertEqual(self._compare({"q": ["alpha-beta"]}), [4])
+
+    def test_negaciones(self):
+        self.assertEqual(self._compare({"q": ["!beta"]}), [1, 3])
+        self.assertEqual(self._compare({"q": ["alpha,!beta"]}), [1])
+        self.assertEqual(self._compare({"q": ["alpha,beta"]}), [0, 1, 2, 4])
+        self.assertEqual(self._compare({"q": ["noexiste"]}), [])
+
+    def test_puntuacion_y_valores(self):
+        self.assertEqual(self._compare({"q": ["pid:23160"]}), [4])
+        self.assertEqual(self._compare({"q": ["10.0.0.1"]}), [0, 4])
+        self.assertEqual(self._compare({"q": ["/a/b"]}), [2])
+
+    def test_combinado_con_level_y_code(self):
+        self.assertEqual(self._compare({"q": ["alpha"], "level": ["ERR"]}), [1])
+        self.assertEqual(self._compare({"q": ["alpha"], "code": ["404,500"]}), [1])
+        self.assertEqual(self._compare({"level": ["!ERR"]}), [0, 3, 4])
+
+    def test_rango_de_fechas(self):
+        self.assertEqual(self._compare(
+            {"dt_from": ["2026-10-30T01:00:03"], "dt_to": ["2026-10-30T01:00:04"]}),
+            [2, 3])
+        self.assertEqual(self._compare({"dt": ["01:00:02"]}), [1])
+
+    def test_q_no_usa_fts_match(self):
+        """El texto libre se resuelve por subcadena, igual que en MemStore."""
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        store = server.SqlStore(os.path.join(tmpdir, "q.db"))
+        self.addCleanup(store.close)
+        where, params = store._where({"q": ["alph"]})
+        self.assertIn("instr(lower(search)", where)
+        self.assertNotIn("fts MATCH", where)
+        self.assertIn("alph", params)
+
+    def test_plan_compartido(self):
+        """filter_plan es la unica capa de normalizacion de los filtros."""
+        plan = server.filter_plan({"q": ["alpha,!beta"], "level": ["ERR"]})
+        self.assertEqual(plan["q"], [(False, "alpha"), (True, "beta")])
+        self.assertEqual(plan["level"], [(False, "ERR")])
+        self.assertEqual(plan["dt_from"], "")
+        self.assertEqual(plan["tpl"], "")
 
 
 class TestLineOffsets(unittest.TestCase):
@@ -1314,7 +2224,7 @@ class TestCfHeader(unittest.TestCase):
         self.assertEqual(h._user(), "local")
 
     def test_cf_ok_requires_header(self):
-        server.REQUIRE_CF = True
+        security.REQUIRE_CF = True
         try:
             ok = self._handler(
                 {"Cf-Access-Authenticated-User-Email": "a@b.com"})
@@ -1322,7 +2232,221 @@ class TestCfHeader(unittest.TestCase):
             bad = self._handler({})
             self.assertFalse(bad._cf_ok())
         finally:
-            server.REQUIRE_CF = False
+            security.REQUIRE_CF = False
+
+
+class TestSessionCookieSigned(unittest.TestCase):
+    """P2.1 (2026-10-30): la identidad se firma con HMAC (hmac + hashlib).
+    El header Cf-Access-Authenticated-User-Email pasa a ser solo el valor
+    inicial NO confiable con el que se emite la cookie."""
+
+    def _handler(self, headers):
+        h = object.__new__(server.Handler)
+        h.headers = headers
+        h.client_address = ("1.2.3.4", 12345)
+        return h
+
+    def test_round_trip_de_la_cookie(self):
+        cookie = server.make_session_cookie("sammi@example.com")
+        self.assertEqual(server.verify_session_cookie(cookie),
+                         "sammi@example.com")
+
+    def test_usa_hmac_y_hashlib(self):
+        # La firma es un HMAC-SHA256 del payload con el secreto del proceso.
+        cookie = server.make_session_cookie("a@b.com")
+        payload, sig = cookie.rsplit(".", 1)
+        import hashlib
+        import hmac
+        self.assertEqual(sig, hmac.new(server.SESSION_SECRET.encode("utf-8"),
+                                       payload.encode("utf-8"),
+                                       hashlib.sha256).hexdigest())
+
+    def test_firma_manipulada_no_autentica(self):
+        cookie = server.make_session_cookie("a@b.com")
+        payload, _ = cookie.rsplit(".", 1)
+        self.assertIsNone(server.verify_session_cookie(payload + "." + "0" * 64))
+
+    def test_usuario_forjado_dentro_del_payload_no_pasa(self):
+        cookie = server.make_session_cookie("a@b.com")
+        _, sig = cookie.rsplit(".", 1)
+        forged = base64.urlsafe_b64encode(json.dumps(
+            {"u": "admin@evil.com", "exp": int(time.time()) + 3600}
+        ).encode("utf-8")).decode("ascii")
+        self.assertIsNone(server.verify_session_cookie(forged + "." + sig))
+
+    def test_cookie_caducada_no_pasa(self):
+        payload = base64.urlsafe_b64encode(json.dumps(
+            {"u": "a@b.com", "exp": int(time.time()) - 10}
+        ).encode("utf-8")).decode("ascii")
+        cookie = payload + "." + server._session_sign(payload)
+        self.assertIsNone(server.verify_session_cookie(cookie))
+
+    def test_cookie_valida_gana_al_header(self):
+        cookie = server.make_session_cookie("real@corp.com")
+        h = self._handler({
+            "Cookie": "otra=1; lv_session=" + cookie,
+            "Cf-Access-Authenticated-User-Email": "suplantado@evil.com",
+        })
+        self.assertEqual(h._user(), "real@corp.com")
+
+    def test_cookie_manipulada_cae_al_header(self):
+        h = self._handler({
+            "Cookie": "lv_session=palabra." + "0" * 64,
+            "Cf-Access-Authenticated-User-Email": "a@b.com",
+        })
+        self.assertEqual(h._user(), "a@b.com")
+
+    def test_sin_cookie_emite_la_firma_del_header(self):
+        h = self._handler({"Cf-Access-Authenticated-User-Email": "a@b.com"})
+        self.assertEqual(h._user(), "a@b.com")  # valor inicial no confiable
+        self.assertEqual(server.verify_session_cookie(h._pending_session_cookie),
+                         "a@b.com")
+
+    def test_sin_header_es_local(self):
+        h = self._handler({})
+        self.assertEqual(h._user(), "local")
+        self.assertEqual(server.verify_session_cookie(h._pending_session_cookie),
+                         "local")
+
+    def test_parseo_del_header_cookie(self):
+        self.assertEqual(server.cookie_value("a=1; lv_session=xyz; b=2"), "xyz")
+        self.assertIsNone(server.cookie_value("a=1"))
+        self.assertIsNone(server.cookie_value(None))
+
+    def test_require_cf_acepta_cookie_firmada(self):
+        security.REQUIRE_CF = True
+        try:
+            cookie = server.make_session_cookie("a@b.com")
+            h = self._handler({"Cookie": "lv_session=" + cookie})
+            self.assertTrue(h._cf_ok())
+            self.assertFalse(self._handler({"Cookie": "lv_session=mal"})._cf_ok())
+        finally:
+            security.REQUIRE_CF = False
+
+
+class TestRateLimit(unittest.TestCase):
+    """P2.1 (2026-10-30): limite de peticiones por IP con deque por ventana."""
+
+    def setUp(self):
+        server.reset_rate_limits()
+
+    def tearDown(self):
+        server.reset_rate_limits()
+
+    def test_limit_de_upload_con_deque(self):
+        limit = server.RATE_LIMITS["/upload"]
+        for _ in range(limit):
+            self.assertTrue(server.check_rate_limit("9.9.9.9", "/upload"))
+        allowed, retry = server.check_rate_limit("9.9.9.9", "/upload")
+        self.assertFalse(allowed)
+        self.assertGreater(retry, 0)
+        self.assertIsInstance(server.RATE_BUCKETS[("/upload", "9.9.9.9")],
+                            deque)
+
+    def test_ips_independientes(self):
+        limit = server.RATE_LIMITS["/api/analyze"]
+        for _ in range(limit):
+            server.check_rate_limit("1.1.1.1", "/api/analyze")
+        self.assertFalse(server.check_rate_limit("1.1.1.1", "/api/analyze")[0])
+        self.assertTrue(server.check_rate_limit("2.2.2.2", "/api/analyze")[0])
+
+    def test_endpoints_sin_limit_no_se_limitan(self):
+        for _ in range(200):
+            self.assertTrue(server.check_rate_limit("3.3.3.3", "/api/rows")[0])
+
+    def test_ventana_deslizante_recupera(self):
+        server.RATE_LIMITS["/upload"] = 1
+        security.RATE_WINDOW = 0.5
+        try:
+            self.assertTrue(server.check_rate_limit("4.4.4.4", "/upload")[0])
+            self.assertFalse(server.check_rate_limit("4.4.4.4", "/upload")[0])
+            time.sleep(0.6)
+            self.assertTrue(server.check_rate_limit("4.4.4.4", "/upload")[0])
+        finally:
+            server.RATE_LIMITS["/upload"] = 30
+            security.RATE_WINDOW = 60.0
+            server.reset_rate_limits()
+
+
+class TestSecurityHeadersAndThreadCap(unittest.TestCase):
+    """P2.1 (2026-10-30): cabeceras de seguridad, 'Server' suprimido,
+    cookie firmada en la respuesta, 429 por rate limit y pool de hilos."""
+
+    def _start(self):
+        srv = server.LogViewerServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    def test_cabeceras_de_seguridad_y_sin_server(self):
+        srv = self._start()
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/" % srv.server_port, timeout=15) as r:
+                h = r.headers
+                self.assertIn("max-age=31536000", h.get("Strict-Transport-Security", ""))
+                self.assertEqual(h.get("Referrer-Policy"), "strict-origin-when-cross-origin")
+                self.assertIn("Permissions-Policy", h)
+                self.assertIn("no-store", h.get("Cache-Control", ""))
+                self.assertIsNone(h.get("Server"))
+                self.assertTrue(h.get("Set-Cookie", "").startswith("lv_session="))
+        finally:
+            srv.shutdown()
+
+    def test_estaticos_con_cache_control(self):
+        srv = self._start()
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/static/app.js" % srv.server_port,
+                    timeout=15) as r:
+                self.assertIn("max-age=300", r.headers.get("Cache-Control", ""))
+                self.assertIsNone(r.headers.get("Server"))
+        finally:
+            srv.shutdown()
+
+    def test_429_al_superar_el_rate_limit_de_post(self):
+        srv = self._start()
+        server.reset_rate_limits()
+        try:
+            codes = []
+            for _ in range(server.RATE_LIMITS["/api/diagnose"] + 2):
+                req = urllib.request.Request(
+                    "http://127.0.0.1:%d/api/diagnose" % srv.server_port,
+                    data=b"{}",
+                    headers={"X-CSRF-Token": server.CSRF_TOKEN,
+                             "Content-Type": "application/json"})
+                try:
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        codes.append(r.status)
+                except urllib.error.HTTPError as e:
+                    codes.append(e.code)
+            self.assertEqual(codes[-1], 429)
+            self.assertEqual(codes[-2], 429)
+            self.assertTrue(all(c != 429 for c in codes[:server.RATE_LIMITS["/api/diagnose"]]))
+        finally:
+            srv.shutdown()
+            server.reset_rate_limits()
+
+    def test_pool_de_hilos_acotado(self):
+        srv = self._start()
+        try:
+            self.assertEqual(srv.max_connections, server.MAX_CONNECTIONS)
+            self.assertLessEqual(server.MAX_THREADS, 64)
+        finally:
+            srv.shutdown()
+
+    def test_conexion_rechazada_con_pool_lleno(self):
+        srv = self._start()
+        srv._pool = threading.BoundedSemaphore(0)  # pool agotado
+        try:
+            s = socket.create_connection(("127.0.0.1", srv.server_port), timeout=10)
+            s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            data = s.recv(600)
+            s.close()
+            self.assertIn(b"503", data)
+            self.assertIn(b"demasiadas conexiones", data)
+            self.assertEqual(srv.rejected_connections, 1)
+        finally:
+            srv.shutdown()
 
 
 class TestLLM(unittest.TestCase):
@@ -1409,12 +2533,12 @@ class TestLLM(unittest.TestCase):
     def test_llm_key(self):
         k1 = server.llm_key("linea")
         self.assertEqual(k1, server.llm_key("linea"))
-        old = server.LLM_MODEL
+        old = config.LLM_MODEL
         try:
-            server.LLM_MODEL = "otro-modelo"
+            config.LLM_MODEL = "otro-modelo"
             self.assertNotEqual(server.llm_key("linea"), k1)
         finally:
-            server.LLM_MODEL = old
+            config.LLM_MODEL = old
 
 
 class TestLLMLang(unittest.TestCase):
@@ -1608,10 +2732,10 @@ class TestSplunkQuery(unittest.TestCase):
         s.close()
         srv = ThreadingHTTPServer(("127.0.0.1", port), H)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        old = (server.SPLUNK_URL, server.SPLUNK_USER, server.SPLUNK_PASS)
-        server.SPLUNK_URL = "http://127.0.0.1:%d" % port
-        server.SPLUNK_USER = "admin"
-        server.SPLUNK_PASS = "testpass"
+        old = (config.SPLUNK_URL, config.SPLUNK_USER, config.SPLUNK_PASS)
+        config.SPLUNK_URL = "http://127.0.0.1:%d" % port
+        config.SPLUNK_USER = "admin"
+        config.SPLUNK_PASS = "testpass"
         return cap, srv, old
 
     def test_query_forces_search_prefix(self):
@@ -1630,7 +2754,7 @@ class TestSplunkQuery(unittest.TestCase):
             self.assertEqual(cap["form"]["search"][0], "| stats count")
         finally:
             srv.shutdown()
-            (server.SPLUNK_URL, server.SPLUNK_USER, server.SPLUNK_PASS) = old
+            (config.SPLUNK_URL, config.SPLUNK_USER, config.SPLUNK_PASS) = old
 
     def test_query_auth_url_and_body(self):
         import base64
@@ -1649,7 +2773,7 @@ class TestSplunkQuery(unittest.TestCase):
             self.assertEqual(f["count"][0], "250")
         finally:
             srv.shutdown()
-            (server.SPLUNK_URL, server.SPLUNK_USER, server.SPLUNK_PASS) = old
+            (config.SPLUNK_URL, config.SPLUNK_USER, config.SPLUNK_PASS) = old
 
     def test_query_count_cap_and_rows(self):
         cap, srv, old = self._mock_splunk(results=[
@@ -1660,46 +2784,46 @@ class TestSplunkQuery(unittest.TestCase):
             rows = server.splunk_query("index=botsv3", count=99999)
             # El tope duro evita traer 2M filas al visor/LLM
             self.assertEqual(cap["form"]["count"][0],
-                             str(server.SPLUNK_MAX_ROWS))
+                             str(config.SPLUNK_MAX_ROWS))
             self.assertEqual(len(rows), 2)
             self.assertIn("line", rows[0])
         finally:
             srv.shutdown()
-            (server.SPLUNK_URL, server.SPLUNK_USER, server.SPLUNK_PASS) = old
+            (config.SPLUNK_URL, config.SPLUNK_USER, config.SPLUNK_PASS) = old
 
     def test_query_puerto_caido(self):
         # Apunta a un puerto de la maquina que seguro esta cerrado y con un
         # timeout corto, para que el fallo sea rapido y no espere los 120s
         # por defecto (un puerto recien cerrado no da refusal inmediato en
         # Windows y urlopen aguantaria el SPLUNK_TIMEOUT completo).
-        old = (server.SPLUNK_URL, server.SPLUNK_USER, server.SPLUNK_PASS,
-               server.SPLUNK_TIMEOUT)
+        old = (config.SPLUNK_URL, config.SPLUNK_USER, config.SPLUNK_PASS,
+               config.SPLUNK_TIMEOUT)
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()
         try:
-            server.SPLUNK_URL = "http://127.0.0.1:%d" % port
-            server.SPLUNK_USER = "admin"
-            server.SPLUNK_PASS = "testpass"
-            server.SPLUNK_TIMEOUT = 3
+            config.SPLUNK_URL = "http://127.0.0.1:%d" % port
+            config.SPLUNK_USER = "admin"
+            config.SPLUNK_PASS = "testpass"
+            config.SPLUNK_TIMEOUT = 3
             with self.assertRaises(ValueError) as ctx:
                 server.splunk_query("index=botsv3")
             # VERSION 1.2: lenguaje humano (contactar al operador)
             self.assertIn("El Splunk no responde", str(ctx.exception))
         finally:
-            (server.SPLUNK_URL, server.SPLUNK_USER, server.SPLUNK_PASS,
-             server.SPLUNK_TIMEOUT) = old
+            (config.SPLUNK_URL, config.SPLUNK_USER, config.SPLUNK_PASS,
+             config.SPLUNK_TIMEOUT) = old
 
     def test_splunk_enabled_flag(self):
-        old = server.SPLUNK_PASS
+        old = config.SPLUNK_PASS
         try:
-            server.SPLUNK_PASS = ""
+            config.SPLUNK_PASS = ""
             self.assertFalse(server.splunk_enabled())
-            server.SPLUNK_PASS = "x"
+            config.SPLUNK_PASS = "x"
             self.assertTrue(server.splunk_enabled())
         finally:
-            server.SPLUNK_PASS = old
+            config.SPLUNK_PASS = old
 
     def test_splunk_indexes_filters_internos(self):
         cap, srv, old = self._mock_splunk(indexes=("botsv3", "_audit"))
@@ -1708,7 +2832,7 @@ class TestSplunkQuery(unittest.TestCase):
             self.assertEqual(cap["path"], "/services/data/2.0/indexes")
         finally:
             srv.shutdown()
-            (server.SPLUNK_URL, server.SPLUNK_USER, server.SPLUNK_PASS) = old
+            (config.SPLUNK_URL, config.SPLUNK_USER, config.SPLUNK_PASS) = old
 
     def test_rows_to_dataset_rows(self):
         rows = server.splunk_rows_to_dataset_rows([
@@ -1731,6 +2855,126 @@ class TestSplunkQuery(unittest.TestCase):
         self.assertNotEqual(r1["template"], "")
         self.assertIn("count=7", r1["_search"])
 
+    # --- Bug B13: usuario y TLS (P2.2) ---
+    def test_splunk_user_sin_default_admin(self):
+        # El codigo no puede caer en "admin" si no se define SPLUNK_USER:
+        # la variable se toma del entorno y queda vacia si no existe.
+        src = inspect.getsource(config)
+        line = [l for l in src.splitlines() if l.startswith("SPLUNK_USER =")]
+        self.assertEqual(len(line), 1)
+        self.assertNotIn("admin", line[0])
+        old_env = os.environ.get("SPLUNK_USER")
+        old_user = config.SPLUNK_USER
+        try:
+            os.environ.pop("SPLUNK_USER", None)
+            config.SPLUNK_USER = os.environ.get("SPLUNK_USER", "").strip()
+            self.assertEqual(config.SPLUNK_USER, "")
+            os.environ["SPLUNK_USER"] = "  analyst  "
+            config.SPLUNK_USER = os.environ.get("SPLUNK_USER", "").strip()
+            self.assertEqual(config.SPLUNK_USER, "analyst")
+        finally:
+            if old_env is None:
+                os.environ.pop("SPLUNK_USER", None)
+            else:
+                os.environ["SPLUNK_USER"] = old_env
+            config.SPLUNK_USER = old_user
+
+    def test_ssl_verify_on_por_defecto(self):
+        # Sin LOGVIEWER_SPLUNK_VERIFY: verificacion activa (default seguro).
+        old = os.environ.pop("LOGVIEWER_SPLUNK_VERIFY", None)
+        try:
+            self.assertTrue(server.splunk_verify_enabled())
+            ctx = server._splunk_ssl()
+            self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+            self.assertTrue(ctx.check_hostname)
+        finally:
+            if old is not None:
+                os.environ["LOGVIEWER_SPLUNK_VERIFY"] = old
+
+    def test_ssl_verify_explicit_on_y_off(self):
+        old = os.environ.get("LOGVIEWER_SPLUNK_VERIFY")
+        try:
+            os.environ["LOGVIEWER_SPLUNK_VERIFY"] = "1"
+            ctx = server._splunk_ssl()
+            self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+            os.environ["LOGVIEWER_SPLUNK_VERIFY"] = "0"
+            ctx = server._splunk_ssl()
+            self.assertEqual(ctx.verify_mode, ssl.CERT_NONE)
+            self.assertFalse(ctx.check_hostname)
+        finally:
+            if old is None:
+                os.environ.pop("LOGVIEWER_SPLUNK_VERIFY", None)
+            else:
+                os.environ["LOGVIEWER_SPLUNK_VERIFY"] = old
+
+    def test_ssl_cafile_pinned(self):
+        # Con una CA propia se sigue verificando (sin desactivar nada).
+        d = tempfile.mkdtemp()
+        ca = os.path.join(d, "ca.pem")
+        with open(ca, "w", encoding="utf-8") as f:
+            f.write("-----BEGIN CERTIFICATE-----\n")
+            f.write("MIIB\n")
+            f.write("-----END CERTIFICATE-----\n")
+        old = os.environ.get("LOGVIEWER_SPLUNK_CAFILE")
+        try:
+            os.environ["LOGVIEWER_SPLUNK_CAFILE"] = ca
+            ctx = server._splunk_ssl()
+            self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+            # La CA no es valida de verdad: load_verify_locations ya se
+            # aplico; el modo sigue siendo CERT_REQUIRED (no CERT_NONE).
+            os.environ["LOGVIEWER_SPLUNK_CAFILE"] = ""
+            ctx2 = server._splunk_ssl()
+            self.assertEqual(ctx2.verify_mode, ssl.CERT_REQUIRED)
+        except ssl.SSLError:
+            # CA mal formada: el fallback seguro es no desactivar la
+            # verificacion; el contexto devuelto sigue verificando.
+            self.assertEqual(server._splunk_ssl().verify_mode,
+                             ssl.CERT_REQUIRED)
+        finally:
+            if old is None:
+                os.environ.pop("LOGVIEWER_SPLUNK_CAFILE", None)
+            else:
+                os.environ["LOGVIEWER_SPLUNK_CAFILE"] = old
+            shutil.rmtree(d)
+
+    def test_readme_documenta_verify_y_user(self):
+        # El README documenta el default seguro y la desactivacion explicita.
+        base = os.path.dirname(os.path.abspath(server.__file__))
+        with open(os.path.join(base, "README.md"), encoding="utf-8") as f:
+            readme = f.read().lower()
+        self.assertIn("logviewer_splunk_verify", readme)
+        self.assertIn("verify_mode", inspect.getsource(api).lower())
+        self.assertNotIn("`splunk_user` (default `admin`)", readme)
+
+    def test_splunk_open_usa_contexto_del_flag(self):
+        # _splunk_open debe construir el TLS con _splunk_ssl() (respeta el
+        # flag); si se desactiva, la conexion https a un puerto cerrado sigue
+        # fallando con el mensaje humano de siempre.
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        old = (config.SPLUNK_URL, config.SPLUNK_USER, config.SPLUNK_PASS,
+               config.SPLUNK_TIMEOUT)
+        old_flag = os.environ.get("LOGVIEWER_SPLUNK_VERIFY")
+        try:
+            os.environ["LOGVIEWER_SPLUNK_VERIFY"] = "0"
+            config.SPLUNK_URL = "https://127.0.0.1:%d" % port
+            config.SPLUNK_USER = "analyst"
+            config.SPLUNK_PASS = "p"
+            config.SPLUNK_TIMEOUT = 3
+            with self.assertRaises(ValueError) as cm:
+                server.splunk_query("search index=botsv3 | head 1")
+            self.assertIn("El Splunk no responde", str(cm.exception))
+        finally:
+            (config.SPLUNK_URL, config.SPLUNK_USER, config.SPLUNK_PASS,
+             config.SPLUNK_TIMEOUT) = old
+            if old_flag is None:
+                os.environ.pop("LOGVIEWER_SPLUNK_VERIFY", None)
+            else:
+                os.environ["LOGVIEWER_SPLUNK_VERIFY"] = old_flag
+
+
 
 class TestEnvNotices(unittest.TestCase):
     """VERSION 1.2: avisos de funciones SOLO local (llm/splunk false) y
@@ -1739,14 +2983,14 @@ class TestEnvNotices(unittest.TestCase):
     def _cfg(self, d, repo_url):
         # public_config() -> llm_config() -> settings_store(): se usa un
         # SettingsStore temporal para no tocar el estado real de %TEMP%
-        old = (server.SETTINGS, server.REPO_URL)
+        old = (stores.SETTINGS, config.REPO_URL)
         try:
-            server.SETTINGS = server.SettingsStore(
+            stores.SETTINGS = server.SettingsStore(
                 os.path.join(d, "settings.json"))
-            server.REPO_URL = repo_url
+            config.REPO_URL = repo_url
             return server.public_config()
         finally:
-            (server.SETTINGS, server.REPO_URL) = old
+            (stores.SETTINGS, config.REPO_URL) = old
 
     def test_public_config_exposes_repo_url(self):
         d = tempfile.mkdtemp()
@@ -1819,19 +3063,1194 @@ class TestEnvNotices(unittest.TestCase):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()
-        old = (server.SPLUNK_URL, server.SPLUNK_USER, server.SPLUNK_PASS)
+        old = (config.SPLUNK_URL, config.SPLUNK_USER, config.SPLUNK_PASS)
         try:
-            server.SPLUNK_URL = "https://127.0.0.1:%d" % port
-            server.SPLUNK_USER = "u"
-            server.SPLUNK_PASS = "p"
+            config.SPLUNK_URL = "https://127.0.0.1:%d" % port
+            config.SPLUNK_USER = "u"
+            config.SPLUNK_PASS = "p"
             with self.assertRaises(ValueError) as cm:
                 server.splunk_query("search index=botsv3 | head 1")
         finally:
-            (server.SPLUNK_URL, server.SPLUNK_USER,
-             server.SPLUNK_PASS) = old
+            (config.SPLUNK_URL, config.SPLUNK_USER,
+             config.SPLUNK_PASS) = old
         self.assertIn("El Splunk no responde", str(cm.exception))
         self.assertIn("operador del servidor", str(cm.exception))
 
 
+# ---------------------------------------------------------------------------
+# P0.4: export con cabecera dinamica (columnas reales del dataset)
+# ---------------------------------------------------------------------------
+class TestExportColumns(unittest.TestCase):
+    """La cabecera del export se descubre en el dataset, no esta fija."""
+
+    def _mem(self, rows):
+        for r in rows:
+            r["_search"] = server._make_search(r)
+        return server.MemStore(rows=rows)
+
+    def test_sin_extras_da_las_basicas(self):
+        rows = [{"ts": "2026-10-11 10:00:00", "level": "INF", "ip": "1.1.1.1",
+                 "host": "h", "app": "a", "pid": "1", "method": "GET",
+                 "path": "/x", "code": "200", "bytes": "10", "msg": "ok"}]
+        cols = server.export_columns(self._mem(rows))
+        self.assertEqual(cols, list(server.EXPORT_BASE_COLS))
+
+    def test_piloop_aporta_comp(self):
+        rows, _ = server.parse_piloop(["2026-10-30 01:12:33 vigilante: ok buzon"])
+        cols = server.export_columns(self._mem(rows))
+        self.assertIn("comp", cols)
+        self.assertIn("ts", cols)
+        self.assertIn("level", cols)
+
+    def test_triage_aporta_sev_conf_verdict(self):
+        rows, _ = server.parse_triage(
+            ["01:23:45 [vt] firma:x -> benigno conf 0.9 sev 0.0 accion no | sin tarea"],
+            file_date="2026-10-30")
+        cols = server.export_columns(self._mem(rows))
+        for c in ("fuente", "firma", "verdict", "conf", "sev", "accion", "tarea"):
+            self.assertIn(c, cols, c)
+
+    def test_jsonl_aporta_columnas_opervanta(self):
+        rows, _ = server.parse_json([
+            json.dumps({"ts": "2026-10-30 01:00:00", "fuente": "soc",
+                        "firma": "phish:dominio", "tenant": "local",
+                        "sev": "alta", "src": "", "dst": "93.1.2.3",
+                        "url": "http://x", "mensaje": "alerta",
+                        "evidencia": "email", "riesgo": "medio",
+                        "tarea": "t4f87", "dedupe": "d1"})])
+        cols = server.export_columns(self._mem(rows))
+        for c in ("fuente", "firma", "tenant", "tarea", "dedupe",
+                  "evidencia", "riesgo", "url", "sev"):
+            self.assertIn(c, cols, c)
+
+    def test_orden_canonico_primero(self):
+        rows = [{"sev": 2, "firma": "f", "msg": "m", "ts": "t", "level": "ERR"}]
+        cols = server.export_columns(self._mem(rows))
+        self.assertEqual(cols[:3], ["ts", "level", "msg"])
+        self.assertEqual(cols[3:5], ["firma", "sev"])
+
+    def test_claves_internas_no_aparecen(self):
+        rows = [{"ts": "t", "level": "INF", "msg": "m", "raw": "l",
+                 "ts_norm": "2026-10-30", "template": "*", "_line": 0}]
+        cols = server.export_columns(self._mem(rows))
+        for k in ("raw", "ts_norm", "template", "_line", "_search"):
+            self.assertNotIn(k, cols)
+
+    def test_dataset_vacio_cae_a_basicas(self):
+        self.assertEqual(server.export_columns(server.MemStore()),
+                         list(server.EXPORT_BASE_COLS))
+
+    def test_clave_nueva_al_final(self):
+        rows = [{"ts": "t", "msg": "m", "widget": "w1"}]
+        cols = server.export_columns(self._mem(rows))
+        self.assertEqual(cols[-1], "widget")
+
+    def test_sin_duplicados(self):
+        rows = [{"ts": "t", "fuente": "a"}, {"ts": "t2", "fuente": "b"}]
+        cols = server.export_columns(self._mem(rows))
+        self.assertEqual(len(cols), len(set(cols)))
+
+    def test_sqlstore_columns_incluye_extras(self):
+        d = tempfile.mkdtemp()
+        try:
+            st = server.SqlStore(os.path.join(d, "s.db"))
+            st.add_rows([{"ts": "t", "level": "ERR", "msg": "m", "firma": "f",
+                          "sev": 2.5, "_line": 0}], {})
+            cols = server.export_columns(st)
+            for c in ("ts", "level", "msg", "firma", "sev"):
+                self.assertIn(c, cols, c)
+            self.assertNotIn("raw", cols)
+            st.close()
+        finally:
+            shutil.rmtree(d)
+
+    def test_sqlstore_migracion_anade_columnas(self):
+        import sqlite3
+        d = tempfile.mkdtemp()
+        try:
+            db = os.path.join(d, "vieja.db")
+            con = sqlite3.connect(db)
+            con.execute("CREATE TABLE rows (ts TEXT, ts_norm TEXT, level TEXT, "
+                        "ip TEXT, host TEXT, app TEXT, pid TEXT, method TEXT, "
+                        "path TEXT, code TEXT, bytes TEXT, msg TEXT, raw TEXT, "
+                        "template TEXT, search TEXT, line INTEGER)")
+            con.execute("INSERT INTO rows (ts, level, msg, search, line) "
+                        "VALUES ('t','INF','m','m',0)")
+            con.commit()
+            con.close()
+            st = server.SqlStore(db)
+            cols = server.export_columns(st)
+            for c in ("fuente", "firma", "tenant", "tarea", "dedupe", "sev"):
+                self.assertIn(c, cols, c)
+            st.close()
+        finally:
+            shutil.rmtree(d)
+
+    def test_store_sin_metodo_columns(self):
+        class SinColumnas:
+            pass
+        self.assertEqual(server.export_columns(SinColumnas()),
+                         list(server.EXPORT_BASE_COLS))
+
+    def test_dst_no_se_pierde(self):
+        rows, _ = server.parse_json([
+            json.dumps({"ts": "2026-10-30", "src": "1.2.3.4", "dst": "5.6.7.8",
+                        "mensaje": "conexión", "dedupe": "dd"})])
+        cols = server.export_columns(self._mem(rows))
+        self.assertIn("dedupe", cols)
+        self.assertIn("ip", cols)
+        self.assertEqual(rows[0]["ip"], "1.2.3.4")
+
+
+class TestCsvCellAntiFormula(unittest.TestCase):
+    """P0.4: el saneamiento anti-formulas sigue activo con cabecera dinamica."""
+
+    def _cell(self, v):
+        return server.Handler._csv_cell(None, v)
+
+    def test_igual_es_formula(self):
+        self.assertEqual(self._cell("=1+1"), "'=1+1")
+
+    def test_mas_minus_arroba(self):
+        for v in ("+cmd", "-cmd", "@cmd"):
+            self.assertEqual(self._cell(v), "'" + v, v)
+
+    def test_tabulador_y_salto(self):
+        self.assertEqual(self._cell("\t=1"), "'\t=1")
+        self.assertEqual(self._cell("\n=1"), "'\n=1")
+
+    def test_texto_normal_no_se_toca(self):
+        self.assertEqual(self._cell("2026-10-30 01:12:33 ok"),
+                         "2026-10-30 01:12:33 ok")
+
+    def test_none_es_cadena_vacia(self):
+        self.assertEqual(self._cell(None), "")
+
+    def test_numeros_a_texto(self):
+        self.assertEqual(self._cell(2.5), "2.5")
+
+    def test_formula_en_medio_no_se_prefija(self):
+        self.assertEqual(self._cell("msg = 1"), "msg = 1")
+
+
+class TestExportEndToEnd(unittest.TestCase):
+    """P0.4: el endpoint /api/export devuelve la cabecera descubierta."""
+
+    def _serve_export(self, ds, fmt="csv", **filters):
+        import urllib.request
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        server.SESSIONS.setdefault("local", {})[ds["name"]] = ds
+        params = {"name": ds["name"], "format": fmt}
+        params.update(filters)
+        query = "&".join("%s=%s" % (k, v) for k, v in params.items())
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/export?%s" % (srv.server_port, query),
+                    timeout=15) as r:
+                return r.status, r.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")
+        finally:
+            srv.shutdown()
+            server.SESSIONS.get("local", {}).pop(ds["name"], None)
+
+    def _ds(self, lines, name="prueba.log", fmt=None):
+        d = tempfile.mkdtemp()
+        self._tmp = d
+        path = os.path.join(d, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return server.load_file(path, user="local")
+
+    def test_csv_header_dinamico_piloop(self):
+        ds = self._ds(["2026-10-30 01:12:33 vigilante: ok buzon",
+                       "2026-10-30 01:12:40 runner: tarea completada"],
+                      "piloop.log")
+        status, body = self._serve_export(ds, "csv")
+        self.assertEqual(status, 200)
+        header = body.splitlines()[0]
+        self.assertIn("comp", header)
+        self.assertIn("ts", header)
+        self.assertEqual(header.split(",")[:2], ["ts", "level"])
+        ds["store"].close()
+
+    def test_ndjson_conserva_campos_triage(self):
+        ds = self._ds(["01:23:45 [vt] firma:phish.x -> real_incident conf 0.8 "
+                       "sev 2.5 accion yes | ESCALADA t4f87df76"], "tri.log")
+        status, body = self._serve_export(ds, "json")
+        self.assertEqual(status, 200)
+        obj = json.loads(body.strip().splitlines()[0])
+        for k in ("fuente", "firma", "tarea", "sev", "conf", "verdict", "accion"):
+            self.assertIn(k, obj, k)
+        self.assertEqual(obj["level"], "ERR")
+        ds["store"].close()
+
+    def test_csv_no_incluye_raw_ni_ts_norm(self):
+        ds = self._ds(["2026-10-30 01:00:00 a: hola"], "raw.log")
+        status, body = self._serve_export(ds, "csv")
+        header = body.splitlines()[0]
+        self.assertNotIn("raw", header.split(","))
+        self.assertNotIn("ts_norm", header.split(","))
+        ds["store"].close()
+
+    def test_formato_invalido_400(self):
+        ds = self._ds(["2026-10-30 01:00:00 a: hola"], "bad.log")
+        status, body = self._serve_export(ds, "xml")
+        self.assertEqual(status, 400)
+        ds["store"].close()
+
+    def test_sin_dataset_404(self):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            import urllib.request
+            try:
+                urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/export?name=noexiste&format=csv"
+                    % srv.server_port, timeout=15)
+                self.fail("no deberia devolver 200")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 404)
+        finally:
+            srv.shutdown()
+
+    def test_filtra_por_nivel_en_export(self):
+        ds = self._ds(["2026-10-30 01:00:00 a: ok",
+                       "2026-10-30 01:00:01 b: exception en el runner"], "f.log")
+        status, body = self._serve_export(ds, "csv", level="ERR")
+        lines = [l for l in body.splitlines() if l]
+        self.assertEqual(len(lines), 2)  # cabecera + 1 fila
+        self.assertIn("exception", lines[1])
+        ds["store"].close()
+
+    def test_inyeccion_de_formula_en_csv(self):
+        ds = self._ds(["2026-10-30 01:00:00 a: =HYPERLINK(\"http://malicioso\")"],
+                      "inj.log")
+        status, body = self._serve_export(ds, "csv")
+        self.assertIn("'=HYPERLINK", body)
+        ds["store"].close()
+
+    def test_numero_de_filas_export(self):
+        ds = self._ds(["2026-10-30 01:00:%02d a: linea %d" % (i, i)
+                       for i in range(20)], "n.log")
+        status, body = self._serve_export(ds, "csv")
+        lines = [l for l in body.splitlines() if l]
+        self.assertEqual(len(lines), 21)
+        ds["store"].close()
+
+    def test_ndjson_lineas_validas(self):
+        ds = self._ds(["2026-10-30 01:00:00 a: ok", "2026-10-30 01:00:01 b: ok"],
+                      "j.log")
+        status, body = self._serve_export(ds, "json")
+        objs = [json.loads(l) for l in body.strip().splitlines()]
+        self.assertEqual(len(objs), 2)
+        self.assertTrue(all("raw" in o for o in objs))
+        ds["store"].close()
+
+    def test_smoke_buzon_log_real(self):
+        path = r"C:\Users\Sammi\AI\piloop-proyectos\buzon\buzon.log"
+        if not os.path.exists(path):
+            self.skipTest("no hay buzon.log")
+        ds = server.load_file(path, user="local")
+        status, body = self._serve_export(ds, "csv")
+        header = body.splitlines()[0].split(",")
+        self.assertIn("comp", header)
+        self.assertIn("ts", header)
+        self.assertIn("level", header)
+        rows = ds["store"].page_filtered({}, 0, 50000)
+        con_ts = sum(1 for r in rows if r.get("ts"))
+        con_level = sum(1 for r in rows
+                        if r.get("level") and r.get("level") != "RAW")
+        self.assertGreaterEqual(con_ts, len(rows) * 0.9)
+        self.assertGreaterEqual(con_level, len(rows) * 0.9)
+        ds["store"].close()
+
+    def test_smoke_triage_log_real(self):
+        path = r"C:\Users\Sammi\AI\piloop-proyectos\buzon\soc\triage.log"
+        if not os.path.exists(path):
+            self.skipTest("no hay triage.log")
+        ds = server.load_file(path, user="local")
+        status, body = self._serve_export(ds, "csv")
+        header = body.splitlines()[0].split(",")
+        for c in ("fuente", "firma", "sev", "tarea", "verdict"):
+            self.assertIn(c, header, c)
+        ds["store"].close()
+
+    def test_smoke_alertas_jsonl_real(self):
+        path = r"C:\Users\Sammi\AI\piloop-proyectos\buzon\soc\alertas.jsonl"
+        if not os.path.exists(path):
+            self.skipTest("no hay alertas.jsonl")
+        ds = server.load_file(path, user="local")
+        status, body = self._serve_export(ds, "csv")
+        header = body.splitlines()[0].split(",")
+        for c in ("fuente", "firma", "tenant", "tarea", "dedupe",
+                  "evidencia", "riesgo", "url"):
+            self.assertIn(c, header, c)
+        rows = ds["store"].page_filtered({}, 0, 50000)
+        self.assertTrue(all(r.get("ts") for r in rows))
+        self.assertTrue(all(r.get("level") and r.get("level") != "RAW" for r in rows))
+        ds["store"].close()
+
+    def test_export_sqlstore_conserva_triage(self):
+        d = tempfile.mkdtemp()
+        try:
+            st = server.SqlStore(os.path.join(d, "t.db"))
+            rows, _ = server.parse_triage(
+                ["01:23:45 [vt] firma:x -> real_incident conf 0.9 sev 3.0 accion yes "
+                 "| ESCALADA t1"], file_date="2026-10-30")
+            st.add_rows(rows, {})
+            ds = {"store": st, "name": "tri.db", "format": "triage",
+                  "total": len(rows), "size": 0}
+            status, body = self._serve_export(ds, "csv")
+            header = body.splitlines()[0].split(",")
+            for c in ("fuente", "firma", "sev", "tarea", "verdict", "conf"):
+                self.assertIn(c, header, c)
+            st.close()
+        finally:
+            shutil.rmtree(d)
+
+
+class TestRowsEndToEnd(unittest.TestCase):
+    """P1.1 (bug B3): la capa de UI recorta 'msg', el raw se sirve entero.
+
+    El drawer necesita la linea completa y el export, el mensaje completo.
+    """
+
+    LONG = "w" * 1500
+
+    def _ds(self, lines, name):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return server.load_file(path, user="local")
+
+    def _get(self, ds, path, params):
+        import urllib.request
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        server.SESSIONS.setdefault("local", {})[ds["name"]] = ds
+        query = "&".join("%s=%s" % (k, v) for k, v in params.items())
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d%s?%s" % (srv.server_port, path, query),
+                    timeout=15) as r:
+                return r.status, r.read().decode("utf-8")
+        finally:
+            srv.shutdown()
+            server.SESSIONS.get("local", {}).pop(ds["name"], None)
+
+    def test_api_rows_recorta_msg_y_conserva_raw(self):
+        ds = self._ds(["2026-10-30 01:00:00 runner: " + self.LONG], "p11.log")
+        status, body = self._get(ds, "/api/rows", {"name": ds["name"]})
+        self.assertEqual(status, 200)
+        row = json.loads(body)["rows"][0]
+        self.assertTrue(row["msg"].endswith(" ..."))
+        self.assertEqual(row["msg_len"], len(self.LONG))
+        self.assertTrue(row["msg_truncated"])
+        # El drawer lee row.raw: debe llegar la linea completa
+        self.assertEqual(len(row["raw"]), len("2026-10-30 01:00:00 runner: ") + len(self.LONG))
+        self.assertNotIn("_search", row)
+        ds["store"].close()
+
+    def test_export_no_recorta(self):
+        ds = self._ds(["2026-10-30 01:00:00 runner: " + self.LONG], "p11b.log")
+        status, body = self._get(ds, "/api/export",
+                                 {"name": ds["name"], "format": "csv"})
+        self.assertEqual(status, 200)
+        self.assertIn(self.LONG, body)
+        ds["store"].close()
+
+    def test_parity_api_rows_mem_vs_sql(self):
+        """Mismo 'q' en MemStore y SqlStore a traves del endpoint /api/rows."""
+        lines = ["2026-10-30 01:00:0%d runner: alpha linea %d" % (i, i)
+                 for i in range(10)]
+        ds = self._ds(lines, "p11c.log")
+        mem_ids = [r["_line"] for r in ds["store"].page_filtered({"q": ["alph"]}, 0, 100)]
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        sql = server.SqlStore(os.path.join(d, "p11c.db"))
+        self.addCleanup(sql.close)
+        sql.add_rows([dict(r) for r in ds["store"].rows], {})
+        sql_ids = [sql.line_of(r["rowid"]) for r in sql.page_filtered({"q": ["alph"]}, 0, 100)]
+        self.assertEqual(mem_ids, sql_ids)
+        status, body = self._get(ds, "/api/rows",
+                                 {"name": ds["name"], "q": "alph"})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(json.loads(body)["rows"]), len(mem_ids))
+        ds["store"].close()
+
+
+class TestKeysetPagination(unittest.TestCase):
+    """P1.2 (bug B8): el export pagina por clave (rowid), no por OFFSET.
+
+    Con OFFSET, SQLite recorre y descarta 'start' filas en cada lote: un
+    export de N filas en lotes de B cuesta O(N^2/B). La keyset pagination
+    ('WHERE rowid > ultimo') es O(N) y debe dar las mismas filas."""
+
+    def _keyset_all(self, store, q, batch):
+        out = []
+        last = -1
+        while True:
+            b = store.page_filtered_keyset(q, last, batch)
+            if not b:
+                break
+            out.extend(b)
+            last = max(last, b[-1]["rowid"])
+        return out
+
+    def test_mem_keyset_igual_a_offset(self):
+        rows = [{"ts": "2026-10-30 01:00:%02d" % i, "level": "INF" if i % 2 else "ERR",
+                 "msg": "fila %d" % i, "raw": "raw %d" % i, "_line": i}
+                for i in range(50)]
+        store = server.MemStore([dict(r) for r in rows])
+        for batch in (1, 7, 50, 100):
+            want = []
+            start = 0
+            while True:
+                chunk = store.page_filtered({}, start, batch)
+                if not chunk:
+                    break
+                want.extend(chunk)
+                start += batch
+            self.assertEqual(self._keyset_all(store, {}, batch), want)
+
+    def test_sql_keyset_igual_a_offset(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        store = server.SqlStore(os.path.join(d, "keyset.db"))
+        self.addCleanup(store.close)
+        rows = [{"ts": "2026-10-30 01:00:%02d" % i, "level": "INF" if i % 3 else "ERR",
+                 "msg": "fila %d" % i, "raw": "raw %d" % i, "_line": i,
+                 "_search": "fila %d" % i} for i in range(60)]
+        store.add_rows(rows, {})
+        for q in ({}, {"level": ["ERR"]}, {"q": ["fila 1"]}, {"level": ["ERR"], "q": ["1"]}):
+            for batch in (1, 5, 60):
+                want = store.page_filtered(q, 0, 1000)
+                self.assertEqual(self._keyset_all(store, q, batch), want,
+                                 "q=%s batch=%d" % (q, batch))
+
+    def test_export_keyset_no_es_cuadratico(self):
+        """Smoke: 200k filas en SQLite con filtro; la keyset debe ser claramente
+        mas rapida que el OFFSET creciente (que era O(N^2)).
+
+        Con OFFSET, cada lote vuelve a recorrer y evaluar el WHERE de las
+        'start' filas ya emitidas: en N filas por lotes de B se evaluan
+        ~N^2/(2B) filas. Con 'rowid > ultimo' cada fila se evalua una vez."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        store = server.SqlStore(os.path.join(d, "grande.db"))
+        self.addCleanup(store.close)
+        n = 200000
+        batch = server.Handler.EXPORT_BATCH
+        rows = [{"ts": "2026-10-30 01:%02d:%02d" % (i // 3600, i % 3600),
+                 "level": "INF", "msg": "fila %d" % i, "raw": "x" * 30,
+                 "_search": "fila %d" % i, "_line": i} for i in range(n)]
+        store.add_rows(rows, {})
+        # El filtro con texto libre ('q') no tiene indice: con OFFSET cada lote
+        # vuelve a evaluar el WHERE de las filas ya emitidas (~N^2/2B filas).
+        q = {"level": ["INF"], "q": ["fila"]}
+        t0 = time.perf_counter()
+        got_keyset = self._keyset_all(store, q, batch)
+        t_keyset = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        got_offset = []
+        start = 0
+        while True:
+            chunk = store.page_filtered(q, start, batch)
+            if not chunk:
+                break
+            got_offset.extend(chunk)
+            start += batch
+        t_offset = time.perf_counter() - t0
+        self.assertEqual(len(got_keyset), n)
+        self.assertEqual(len(got_offset), n)
+        self.assertEqual([r["rowid"] for r in got_keyset],
+                         [r["rowid"] for r in got_offset])
+        self.assertGreater(t_offset, 2 * t_keyset,
+                           "keyset %.3f s vs offset %.3f s" % (t_keyset, t_offset))
+
+    def test_export_csv_no_se_trunca_al_flush(self):
+        """P1.2: 20k filas superan el umbral de flush (65536 bytes) y el export
+        debe devolver TODAS, no solo el primer lote.
+
+        El DictWriter quedaba apuntando al StringIO vaciado en flush(): a partir
+        del segundo lote las filas se escribian en un buffer que nunca se enviaba."""
+        import urllib.request
+        n = 20000
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "muchas.log")
+        with open(path, "w", encoding="utf-8") as f:
+            for i in range(n):
+                f.write("2026-10-30 01:%02d:%02d runner: fila %d\n"
+                        % (i // 3600, i % 60, i))
+        ds = server.load_file(path, user="local")
+        self.addCleanup(ds["store"].close)
+        server.SESSIONS.setdefault("local", {})[ds["name"]] = ds
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/export?name=%s&format=csv"
+                    % (srv.server_port, ds["name"]), timeout=60) as r:
+                body = r.read().decode("utf-8")
+        finally:
+            srv.shutdown()
+            server.SESSIONS.get("local", {}).pop(ds["name"], None)
+        rows = [l for l in body.splitlines() if l]
+        self.assertEqual(len(rows), n + 1, "cabecera + %d filas" % n)
+        self.assertIn("fila %d" % (n - 1), rows[-1])
+
+    def test_tail_escribe_dentro_del_lock(self):
+        """P1.2 (bug B6): la escritura al store va en el mismo LOCK que ds['total']."""
+        src = inspect.getsource(server.Handler._tail)
+        parts = src.split("with LOCK:")
+        self.assertGreater(len(parts), 1)
+        after = "".join(parts[1:])
+        before = parts[0]
+        self.assertIn("add_rows", after)
+        self.assertNotIn("add_rows", before)
+
+
+class TestContextSeek(unittest.TestCase):
+    """P1.2 (bug B7): el contexto se lee con seek, no desde la linea 0."""
+
+    def _naive(self, path, line, n):
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        return {"before": lines[max(0, line - n):line],
+                "current": lines[line],
+                "after": lines[line + 1:line + 1 + n]}
+
+    def test_seek_identico_en_archivo_grande(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "grande.log")
+        total = 120000
+        with open(path, "w", encoding="utf-8") as f:
+            for i in range(total):
+                f.write("2026-10-30 01:00:00 runner: linea %d\n" % i)
+        for line in (0, 1, 511, 512, 513, 60000, 119999):
+            got = server.read_context_lines(path, line, 5)
+            self.assertEqual(got, self._naive(path, line, 5), "linea %d" % line)
+        # El indice existe y tiene checkpoints: se usó seek, no lectura desde 0
+        idx = server._CONTEXT_INDEX.get((path, "utf-8"))
+        self.assertTrue(idx and len(idx["marks"]) > 100)
+
+    def test_seek_con_archivo_que_crece(self):
+        """El tail anade lineas: el indice se prolonga, no se reconstruye."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "tail.log")
+        with open(path, "w", encoding="utf-8") as f:
+            for i in range(1000):
+                f.write("2026-10-30 01:00:00 a: linea %d\n" % i)
+        server.read_context_lines(path, 900, 3)
+        with open(path, "a", encoding="utf-8") as f:
+            for i in range(1000, 3000):
+                f.write("2026-10-30 01:00:00 a: linea %d\n" % i)
+        for line in (1500, 2999):
+            got = server.read_context_lines(path, line, 4)
+            self.assertEqual(got, self._naive(path, line, 4), "linea %d" % line)
+        idx = server._CONTEXT_INDEX[(path, "utf-8")]
+        self.assertGreaterEqual(idx["scanned"], 2995)
+        # El indice se prolonga, no se reconstruye desde cero
+        self.assertEqual(idx["marks"][0], 0)
+        self.assertTrue(len(idx["marks"]) >= 6)
+
+    def test_seek_con_lineas_largas_y_crlf(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "crlf.log")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            for i in range(2000):
+                f.write("2026-10-30 01:00:00 runner: %s\r\n" % ("y" * (i % 97)))
+        for line in (0, 999, 1999):
+            got = server.read_context_lines(path, line, 3)
+            want = self._naive(path, line, 3)
+            self.assertEqual(got["current"], want["current"], "linea %d" % line)
+            self.assertEqual(got["before"], want["before"], "linea %d" % line)
+            self.assertEqual(got["after"], want["after"], "linea %d" % line)
+
+
+class TestSavedViewsAndUrl(unittest.TestCase):
+    """P3.1: vistas guardadas persistentes y query de filtros en la URL."""
+
+    def _store(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return server.SavedViewsStore(os.path.join(d, "views.json"))
+
+    def test_normalize_query_string(self):
+        q = server.normalize_view_query("q=err&level=ERR&dt_from=2026-10-01T00:00")
+        self.assertEqual(q, {"q": "err", "level": "ERR", "dt_from": "2026-10-01T00:00"})
+
+    def test_normalize_query_dict_y_descarta_desconocidas(self):
+        q = server.normalize_view_query({"q": [" err "], "evil": ["x"], "level": [""]})
+        self.assertEqual(q, {"q": "err"})
+
+    def test_normalize_query_none(self):
+        self.assertEqual(server.normalize_view_query(None), {})
+        self.assertEqual(server.normalize_view_query(123), {})
+
+    def test_save_get_delete_y_persistencia(self):
+        st = self._store()
+        v = st.save("Errores de hoy", "level=ERR&q=vigilante")
+        self.assertEqual(v["query"], {"level": "ERR", "q": "vigilante"})
+        self.assertTrue(v["updated_at"])
+        # Upsert por nombre: no duplica
+        st.save("Errores de hoy", "level=ERR")
+        self.assertEqual(len(st.all()), 1)
+        self.assertEqual(st.get("Errores de hoy")["query"], {"level": "ERR"})
+        # Persistencia: otra instancia sobre el mismo fichero ve la vista
+        st2 = server.SavedViewsStore(st.path)
+        self.assertEqual([x["name"] for x in st2.all()], ["Errores de hoy"])
+        self.assertTrue(st.delete("Errores de hoy"))
+        self.assertFalse(st.delete("no existe"))
+        self.assertEqual(st.all(), [])
+        st2 = server.SavedViewsStore(st.path)
+        self.assertEqual(st2.all(), [])
+
+    def test_nombre_vacio_y_tope_de_vistas(self):
+        st = self._store()
+        with self.assertRaises(ValueError):
+            st.save("", "q=x")
+        with self.assertRaises(ValueError):
+            st.save("x" * 100, "q=x")
+        for i in range(server.SavedViewsStore.MAX_VIEWS):
+            st.save("v" + str(i), "q=x")
+        with self.assertRaises(ValueError):
+            st.save("demasiadas", "q=x")
+
+    def test_fichero_corrupto_no_rompe(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "views.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("esto no es json")
+        st = server.SavedViewsStore(path)
+        self.assertEqual(st.all(), [])
+        st.save("ok", "q=x")
+        self.assertEqual(len(st.all()), 1)
+
+    def test_ui_columns_sin_claves_internas(self):
+        rows, _ = server.parse_piloop([
+            "2026-10-30 01:12:33 vigilante: ok buzon",
+            "2026-10-30 01:12:40 runner: tarea completada",
+        ])
+        store = server.MemStore()
+        store.add_rows(rows, {})
+        cols = server._ui_columns(store)
+        self.assertIn("ts", cols)
+        self.assertIn("comp", cols)
+        for internal in ("raw", "ts_norm", "template", "_line", "_search"):
+            self.assertNotIn(internal, cols)
+
+    def test_api_rows_devuelve_columns(self):
+        import urllib.request
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "tri.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("01:23:45 [vt] firma:phish.x -> real_incident conf 0.8 "
+                    "sev 2.5 accion yes | ESCALADA t4f87df76\n")
+        ds = server.load_file(path, user="local")
+        server.SESSIONS.setdefault("local", {})[ds["name"]] = ds
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/rows?name=%s" % (srv.server_port, ds["name"]),
+                    timeout=15) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            self.assertIn("columns", data)
+            self.assertIn("firma", data["columns"])
+            self.assertNotIn("raw", data["columns"])
+        finally:
+            srv.shutdown()
+            ds["store"].close()
+            server.SESSIONS.get("local", {}).pop(ds["name"], None)
+
+    def test_api_views_end_to_end(self):
+        import urllib.request
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = "http://127.0.0.1:%d" % srv.server_port
+        try:
+            body = json.dumps({"name": "Vista P31", "query": "level=ERR&q=runner"}).encode()
+            req = urllib.request.Request(base + "/api/views", data=body, method="POST",
+                                        headers={"Content-Type": "application/json",
+                                               "X-CSRF-Token": server.CSRF_TOKEN})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                saved = json.loads(r.read().decode("utf-8"))
+            self.assertTrue(saved["ok"])
+            self.assertEqual(saved["view"]["query"], {"level": "ERR", "q": "runner"})
+            with urllib.request.urlopen(base + "/api/views", timeout=15) as r:
+                lst = json.loads(r.read().decode("utf-8"))
+            self.assertTrue(any(v["name"] == "Vista P31" for v in lst["views"]))
+            # Sin token CSRF debe dar 403
+            bad = urllib.request.Request(base + "/api/views", data=body, method="POST",
+                                        headers={"Content-Type": "application/json"})
+            try:
+                urllib.request.urlopen(bad, timeout=15)
+                self.fail("el POST sin CSRF no debe pasar")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 403)
+            req = urllib.request.Request(base + "/api/views/delete",
+                                        data=json.dumps({"name": "Vista P31"}).encode(),
+                                        method="POST",
+                                        headers={"Content-Type": "application/json",
+                                               "X-CSRF-Token": server.CSRF_TOKEN})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                self.assertTrue(json.loads(r.read().decode("utf-8"))["ok"])
+            with urllib.request.urlopen(base + "/api/views", timeout=15) as r:
+                lst = json.loads(r.read().decode("utf-8"))
+            self.assertFalse(any(v["name"] == "Vista P31" for v in lst["views"]))
+        finally:
+            srv.shutdown()
+
+    def test_filter_plan_acepta_la_query_de_la_url(self):
+        """P3.1: la query que refleja la URL es la misma que entiende el backend."""
+        from urllib.parse import parse_qs
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "buzon.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("2026-10-30 01:12:33 vigilante: ok buzon\n"
+                    "2026-10-30 02:59:00 runner: tarea completada\n")
+        ds = server.load_file(path, user="local")
+        self.addCleanup(ds["store"].close)
+        url_query = "?q=buzon&dt_from=2026-10-30T01:00&dt_to=2026-10-30T02:00"
+        q = parse_qs(url_query.lstrip("?"))
+        plan = server.filter_plan(q)
+        self.assertEqual(plan["dt_from"], "2026-10-30T01:00:00")
+        self.assertEqual(plan["dt_to"], "2026-10-30T02:00:00")
+        self.assertEqual(ds["store"].count_filtered(q), 1)
+        rows = ds["store"].page_filtered(q, 0, 10)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("vigilante", rows[0]["raw"])
+        # Filtro sin resultados: el contracto del empty state (total == 0)
+        self.assertEqual(ds["store"].count_filtered(
+            parse_qs("?q=nada_de_esto".lstrip("?"))), 0)
+
+
+class TestFollowFileAllowlist(unittest.TestCase):
+    """P3.2: modo 'seguir archivo' (off por defecto, allowlist de directorios)."""
+
+    def setUp(self):
+        self._old_env = os.environ.get("LOGVIEWER_TAIL_DIRS")
+
+    def tearDown(self):
+        if self._old_env is None:
+            os.environ.pop("LOGVIEWER_TAIL_DIRS", None)
+        else:
+            os.environ["LOGVIEWER_TAIL_DIRS"] = self._old_env
+
+    def test_desactivado_por_defecto(self):
+        os.environ.pop("LOGVIEWER_TAIL_DIRS", None)
+        self.assertEqual(server.tail_allowlist(), [])
+        self.assertFalse(server.tail_path_ok("C:\\cualquier\\log.log"))
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        self.assertFalse(server.tail_path_ok(os.path.join(d, "a.log")))
+
+    def test_allowlist_inside_outside(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        other = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, other, ignore_errors=True)
+        os.environ["LOGVIEWER_TAIL_DIRS"] = d + ";" + os.path.join(d, "sub")
+        dirs = server.tail_allowlist()
+        self.assertEqual(len(dirs), 2)
+        self.assertTrue(server.tail_path_ok(os.path.join(d, "buzon.log")))
+        self.assertTrue(server.tail_path_ok(os.path.join(d, "sub", "x.log")))
+        self.assertTrue(server.tail_path_ok(d))
+        self.assertFalse(server.tail_path_ok(os.path.join(other, "x.log")))
+        # Un prefijo de nombre no es un directorio permitido (d vs d2)
+        self.assertFalse(server.tail_path_ok(d + "2" + os.sep + "x.log"))
+        # Rutas relativas y traversal no salen de la allowlist
+        self.assertFalse(server.tail_path_ok(os.path.join(d, "sub", "..", "..", "x.log")))
+        self.assertFalse(server.tail_path_ok("/etc/passwd"))
+
+    def test_config_expone_follow(self):
+        os.environ.pop("LOGVIEWER_TAIL_DIRS", None)
+        self.assertFalse(server.public_config()["follow"])
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        os.environ["LOGVIEWER_TAIL_DIRS"] = d
+        self.assertTrue(server.public_config()["follow"])
+
+    def _srv(self):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    def _post(self, base, path, body):
+        req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                    method="POST",
+                                    headers={"Content-Type": "application/json",
+                                           "X-CSRF-Token": server.CSRF_TOKEN})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.status, json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode("utf-8", "replace"))
+
+    def test_open_file_sin_allowlist_da_403(self):
+        os.environ.pop("LOGVIEWER_TAIL_DIRS", None)
+        srv = self._srv()
+        try:
+            code, data = self._post("http://127.0.0.1:%d" % srv.server_port,
+                                    "/api/open-file", {"path": "C:\\x\\a.log"})
+            self.assertEqual(code, 403)
+            self.assertIn("LOGVIEWER_TAIL_DIRS", data["error"])
+        finally:
+            srv.shutdown()
+
+    def test_open_file_fuera_de_allowlist_da_403(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        other = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, other, ignore_errors=True)
+        os.environ["LOGVIEWER_TAIL_DIRS"] = d
+        srv = self._srv()
+        try:
+            code, data = self._post("http://127.0.0.1:%d" % srv.server_port,
+                                    "/api/open-file",
+                                    {"path": os.path.join(other, "a.log")})
+            self.assertEqual(code, 403)
+            self.assertIn("allowlist", data["error"])
+        finally:
+            srv.shutdown()
+
+    def test_open_file_dentro_de_allowlist_carga_y_sigue(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "buzon.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("2026-10-30 01:12:33 vigilante: ok buzon\n")
+        os.environ["LOGVIEWER_TAIL_DIRS"] = d
+        old_poll = config.TAIL_POLL
+        config.TAIL_POLL = 0.2
+        srv = self._srv()
+        try:
+            code, data = self._post("http://127.0.0.1:%d" % srv.server_port,
+                                    "/api/open-file", {"path": path})
+            self.assertEqual(code, 200)
+            self.assertEqual(data["total"], 1)
+            self.assertTrue(data["watching"])
+            ds = server.SESSIONS.get("local", {}).get(data["name"])
+            self.assertIsNotNone(ds)
+            self.assertEqual(ds["orig_path"], os.path.abspath(path))
+            self.assertEqual(ds["format"], "piloop")
+            # El watcher apunta al ORIGINAL, no a la copia temporal
+            w = server.WATCHERS.get("local", {}).get(data["name"])
+            self.assertEqual(w.path, os.path.abspath(path))
+            # Linea nueva en el original -> el tail la trae
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("2026-10-30 01:13:00 runner: tarea completada\n")
+            deadline = time.time() + 6
+            rows = []
+            while time.time() < deadline and not rows:
+                with urllib.request.urlopen(
+                        "http://127.0.0.1:%d/api/tail?name=%s&last=50" %
+                        (srv.server_port, data["name"]), timeout=15) as r:
+                    rows = json.loads(r.read().decode("utf-8")).get("rows", [])
+                if not rows:
+                    time.sleep(0.2)
+            self.assertTrue(rows, "el tail del original no trajo la linea nueva")
+            self.assertIn("tarea completada", rows[0]["raw"])
+            ds["store"].close()
+            server.SESSIONS.get("local", {}).pop(data["name"], None)
+        finally:
+            config.TAIL_POLL = old_poll
+            srv.shutdown()
+
+
+class TestUiA11yP32(unittest.TestCase):
+    """P3.2: contrato de accesibilidad y responsive en los ficheros UI."""
+
+    def _read(self, name):
+        path = os.path.join(os.path.dirname(os.path.abspath(server.__file__)),
+                            "static", name)
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def test_index_html_a11y(self):
+        html = self._read("index.html")
+        self.assertIn('id="count" class="muted" aria-live="polite"', html)
+        self.assertIn('<table role="table" aria-label="Lineas del archivo cargado">', html)
+        self.assertIn('id="drawer-kv" role="table"', html)
+        self.assertIn("skip-link", html)
+        self.assertIn('id="btn-sidebar"', html)
+        self.assertIn('aria-expanded="false" aria-controls="sidebar"', html)
+        self.assertIn('id="follow-wrap"', html)
+        self.assertIn("LOGVIEWER_TAIL_DIRS", html)
+
+    def test_app_js_atajos(self):
+        js = self._read("app.js")
+        self.assertIn('k === "j"', js)
+        self.assertIn('k === "k"', js)
+        self.assertIn('e.key === "]"', js)
+        self.assertIn('e.key === "["', js)
+        self.assertIn("function stepPage", js)
+        self.assertIn("function focusFilter", js)
+        self.assertIn("RAW_PREVIEW: 600", js)
+        self.assertIn("copyRaw()", js)
+        self.assertIn("toggleRaw()", js)
+
+    def test_styles_breakpoints_y_foco(self):
+        css = self._read("styles.css")
+        for q in ("@media (min-width: 1200px)", "@media (max-width: 900px)",
+                  "@media (max-width: 600px)"):
+            self.assertIn(q, css)
+        self.assertIn(":focus-visible", css)
+        self.assertIn("body.side-open .sidebar", css)
+        self.assertIn("prefers-reduced-motion", css)
+
+
+
+class TestPersistAndCorrelateP41(unittest.TestCase):
+    """P4.1 (2026-10-30): --persist y correlacion alertas <-> triage."""
+
+    ALERTAS = [
+        '{"ts": "2026-10-28 10:00:01", "fuente": "splunk", '
+        '"firma": "Piloop - Guard blocks", "tenant": "local", "sev": "baja", '
+        '"mensaje": "guard bloqueado", "tarea": "", "dedupe": "nueva"}',
+        '{"ts": "2026-10-28 10:00:02", "fuente": "splunk", '
+        '"firma": "Piloop - Alertas SOC", "tenant": "local", "sev": "alta", '
+        '"mensaje": "alerta SOC", "tarea": "t4ab1d1d0", "dedupe": "encolada"}',
+        '{"ts": "2026-10-28 10:00:03", "fuente": "netwatch", '
+        '"firma": "netwatch:finding:x", "tenant": "local", "sev": "media", '
+        '"mensaje": "hallazgo", "tarea": "", "dedupe": "encolada"}',
+        '{"ts": "2026-10-28 10:00:04", "fuente": "laya", '
+        '"firma": "F-SIN-TRIAGE", "tenant": "local", "sev": "baja", '
+        '"mensaje": "nada", "tarea": "", "dedupe": "nueva"}',
+    ]
+    TRIAGE = [
+        "23:40:01 [splunk] Piloop - Guard blocks -> expected conf 0.95 "
+        "sev 0.5 accion no | sin tarea",
+        "23:40:04 [splunk] Piloop - Alertas SOC -> false_positive conf 0.31 "
+        "sev 1.3 accion yes | ESCALADA t4ab1d1d0",
+        "23:41:00 [laya] F-LAYA -> expected conf 0.9 sev 0.2 accion no "
+        "| sin tarea",
+        "linea suelta que no es una linea de triage",
+    ]
+
+    def _tmp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return d
+
+    def test_startup_cleanup_borra_por_defecto(self):
+        d = self._tmp()
+        f = os.path.join(d, "sessions", "local", "a.log")
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write("hola\n")
+        server.startup_cleanup(False, tmpdir=d)
+        self.assertFalse(os.path.exists(f))
+        self.assertTrue(os.path.isdir(os.path.join(d, "sessions")))
+        self.assertTrue(os.path.isdir(os.path.join(d, "sqlite")))
+
+    def test_startup_cleanup_persist_conserva(self):
+        d = self._tmp()
+        f = os.path.join(d, "sessions", "local", "a.log")
+        db = os.path.join(d, "sqlite", "local", "a.db")
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        os.makedirs(os.path.dirname(db), exist_ok=True)
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write("hola\n")
+        with open(db, "w", encoding="utf-8") as fh:
+            fh.write("sqlite placeholder\n")
+        server.startup_cleanup(True, tmpdir=d)
+        self.assertTrue(os.path.exists(f))
+        self.assertTrue(os.path.exists(db))
+
+    def test_main_acepta_persist(self):
+        src = inspect.getsource(server.main)
+        self.assertIn("--persist", src)
+        self.assertIn("startup_cleanup(args.persist)", src)
+        self.assertIn("restore_sessions_from_disk", src)
+
+    def test_correlacion_por_firma(self):
+        arows, _ = server.parse_json(self.ALERTAS)
+        trows, _ = server.parse_triage(self.TRIAGE, file_date="2026-10-28")
+        res = server.correlate(arows, trows)
+        self.assertEqual(res["alerts_total"], 4)
+        self.assertEqual(res["matched"], 2)
+        self.assertEqual(res["counts"]["escalada"], 1)
+        self.assertEqual(res["counts"]["descartada"], 1)
+        self.assertEqual(res["counts"]["encolada"], 1)
+        self.assertEqual(res["counts"]["sin_triage"], 1)
+        by_firma = {it["firma"]: it for it in res["items"]}
+        self.assertEqual(by_firma["Piloop - Alertas SOC"]["status"], "escalada")
+        self.assertEqual(by_firma["Piloop - Alertas SOC"]["tarea"], "t4ab1d1d0")
+        self.assertEqual(by_firma["Piloop - Guard blocks"]["status"], "descartada")
+        self.assertEqual(by_firma["Piloop - Guard blocks"]["motivo"], "sin tarea")
+        self.assertEqual(by_firma["netwatch:finding:x"]["status"], "encolada")
+        self.assertEqual(by_firma["F-SIN-TRIAGE"]["status"], "sin_triage")
+        self.assertFalse(res["truncated"])
+
+    def test_correlacion_filtra_por_status_y_firma(self):
+        arows, _ = server.parse_json(self.ALERTAS)
+        trows, _ = server.parse_triage(self.TRIAGE, file_date="2026-10-28")
+        res = server.correlate(arows, trows, status_q="escalada")
+        self.assertEqual(len(res["items"]), 1)
+        self.assertEqual(res["items"][0]["firma"], "Piloop - Alertas SOC")
+        res = server.correlate(arows, trows, firma_q="guard")
+        self.assertEqual(len(res["items"]), 1)
+        self.assertEqual(res["items"][0]["status"], "descartada")
+        res = server.correlate(arows, trows, limit=1)
+        self.assertEqual(len(res["items"]), 1)
+        self.assertTrue(res["truncated"])
+
+    def test_correlacion_por_tarea_cuando_no_coincide_la_firma(self):
+        arows, _ = server.parse_json([
+            '{"firma": "FIRMA-NOVA", "tarea": "t999", "dedupe": "nueva", '
+            '"sev": "alta", "mensaje": "x"}',
+        ])
+        trows, _ = server.parse_triage([
+            "01:02:03 [otrafuente] OTRA FIRMA -> real_incident conf 0.9 "
+            "sev 2.0 accion yes | ESCALADA t999",
+        ])
+        res = server.correlate(arows, trows)
+        self.assertEqual(res["matched"], 1)
+        self.assertEqual(res["items"][0]["status"], "escalada")
+        self.assertEqual(res["items"][0]["match_by"], "tarea")
+        self.assertEqual(res["items"][0]["tarea"], "t999")
+
+    def test_triage_index_descarta_lineas_raw(self):
+        trows, _ = server.parse_triage(["no es triage", "otra linea"])
+        by_firma, by_tarea = server.triage_index(trows)
+        self.assertEqual(by_firma, {})
+        self.assertEqual(by_tarea, {})
+
+    def test_api_correlate_end_to_end(self):
+        d = self._tmp()
+        ap = os.path.join(d, "alertas.jsonl")
+        tp = os.path.join(d, "triage.log")
+        with open(ap, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(self.ALERTAS))
+        with open(tp, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(self.TRIAGE))
+        ads = server.load_file(ap, user="local")
+        tds = server.load_file(tp, user="local")
+        self.addCleanup(ads["store"].close)
+        self.addCleanup(tds["store"].close)
+        mine = server._user_state("local", server.SESSIONS)
+        old = dict(mine)
+        mine["alertas.jsonl"] = ads
+        mine["triage.log"] = tds
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/correlate" % srv.server_port,
+                    timeout=15) as r:
+                res = json.loads(r.read().decode("utf-8"))
+            self.assertEqual(res["alerts_name"], "alertas.jsonl")
+            self.assertEqual(res["triage_name"], "triage.log")
+            self.assertEqual(res["matched"], 2)
+            self.assertEqual(res["counts"]["escalada"], 1)
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/correlate?status=escalada"
+                    % srv.server_port, timeout=15) as r:
+                res2 = json.loads(r.read().decode("utf-8"))
+            self.assertEqual(len(res2["items"]), 1)
+            try:
+                urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/correlate?alerts=noexiste"
+                    % srv.server_port, timeout=15)
+                self.fail("sin dataset de alertas no debe responder 200")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 404)
+        finally:
+            srv.shutdown()
+            mine.clear()
+            mine.update(old)
+
+    def test_ui_correlate_button_y_modal(self):
+        base = os.path.join(os.path.dirname(os.path.abspath(server.__file__)),
+                            "static")
+        html = open(os.path.join(base, "index.html"), encoding="utf-8").read()
+        js = open(os.path.join(base, "app.js"), encoding="utf-8").read()
+        css = open(os.path.join(base, "styles.css"), encoding="utf-8").read()
+        self.assertIn('id="act-correlate"', html)
+        self.assertIn('id="corr-modal"', html)
+        self.assertIn('aria-label="Correlacion de alertas y triage"', html)
+        self.assertIn("function runCorrelate", js)
+        self.assertIn("api.correlate", js)
+        self.assertIn(".corr-table", css)
+
+    def test_restore_sessions_from_disk(self):
+        d = self._tmp()
+        sdir = os.path.join(d, "sessions", "local")
+        os.makedirs(sdir, exist_ok=True)
+        p = os.path.join(sdir, "alertas.jsonl")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(self.ALERTAS))
+        n = server.restore_sessions_from_disk(os.path.join(d, "sessions"))
+        self.assertEqual(n, 1)
+        ds = server.SESSIONS.get("local", {}).get("alertas.jsonl")
+        self.addCleanup(lambda: server.SESSIONS.get("local", {}).pop(
+            "alertas.jsonl", None))
+        self.assertIsNotNone(ds)
+        self.assertEqual(ds["total"], 4)
+        self.assertEqual(ds["format"], "json")
+
+
+class TestHealthAndTailCli(unittest.TestCase):
+    """P5.1 (2026-10-30): /api/health y la CLI --tail."""
+
+    def test_health_campos(self):
+        h = api.health_payload("local")
+        self.assertEqual(h["status"], "ok")
+        self.assertEqual(h["version"], config.APP_VERSION)
+        self.assertIn(h["backend"], ("mem", "sqlite"))
+        self.assertGreaterEqual(h["uptime"], 0.0)
+
+    def test_health_backend_sqlite(self):
+        d = tempfile.mkdtemp()
+        sql = api.SqlStore(os.path.join(d, "p51.db"))
+        sql.add_rows([{"ts": "2026-10-30 01:00:00", "level": "ERR",
+                      "msg": "error", "raw": "error"}], {})
+        ds = {"name": "p51", "format": "generic", "store": sql,
+              "total": 1, "size": 5, "encoding": "utf-8"}
+        server.SESSIONS.setdefault("local", {})["p51"] = ds
+        server.ACTIVE["local"] = "p51"
+        self.addCleanup(lambda: server.SESSIONS.get("local", {}).pop(
+            "p51", None))
+        self.addCleanup(sql.close)
+        h = api.health_payload("local")
+        self.assertEqual(h["backend"], "sqlite")
+        self.assertEqual(h["datasets"], 1)
+
+    def test_tail_cli_ultima_lineas(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "tail.log")
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            for i in range(1, 201):
+                fh.write("linea %d\r\n" % i)
+        out = server.tail_lines(path, 5)
+        self.assertEqual(out, ["linea %d" % i for i in range(196, 201)])
+
+    def test_tail_cli_fichero_inexistente(self):
+        missing = os.path.join(tempfile.mkdtemp(), "no-existe.log")
+        self.assertEqual(server.tail_lines(missing, 5), [])
+
+    def test_server_modularizado(self):
+        """P5.1: server.py es solo la entrada; la logica esta repartida."""
+        base = os.path.dirname(os.path.abspath(server.__file__))
+        for mod in ("config.py", "security.py", "parsers.py",
+                    "stores.py", "api.py"):
+            self.assertTrue(os.path.exists(os.path.join(base, mod)), mod)
+        self.assertLess(len(inspect.getsource(server).splitlines()), 300)
+
+
 if __name__ == "__main__":
     unittest.main()
+

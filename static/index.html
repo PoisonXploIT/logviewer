@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Visor de Logs Unificado</title>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
-<link rel="stylesheet" href="/static/styles.css?v=10">
+<link rel="stylesheet" href="/static/styles.css?v=12">
 </head>
 <body>
 
@@ -107,6 +107,11 @@
       <span class="status-dot" aria-hidden="true"></span>
       <span id="status-text">Sin archivo</span>
     </span>
+    <!-- P3.2: en movil la sidebar se convierte en drawer; este boton lo abre -->
+    <button id="btn-sidebar" class="icon-btn" aria-label="Abrir panel de acciones"
+            aria-expanded="false" aria-controls="sidebar">
+      <svg class="icon" aria-hidden="true"><use href="#i-lines"></use></svg>
+    </button>
     <button id="btn-theme" class="icon-btn" title="Cambiar tema" aria-label="Cambiar tema">
       <svg class="icon" id="theme-icon"><use href="#i-moon"></use></svg>
     </button>
@@ -121,8 +126,10 @@
   </div>
 </header>
 
+<div id="side-backdrop" class="side-backdrop hidden" aria-hidden="true"></div>
 <div class="app-body">
-  <aside class="sidebar" aria-label="Acciones">
+  <a class="skip-link" href="#tblwrap">Saltar a la tabla de resultados</a>
+  <aside id="sidebar" class="sidebar" aria-label="Acciones">
     <nav class="side-nav">
       <button id="act-load" class="side-btn">
         <svg class="icon"><use href="#i-upload"></use></svg>
@@ -141,6 +148,16 @@
               title="Resumen con el LLM local de todas las lineas de error">
         <svg class="icon"><use href="#i-alert"></use></svg>
         <span>Diagnostico rapido</span>
+      </button>
+      <button id="act-correlate" class="side-btn hidden"
+              title="Cruza alertas.jsonl con triage.log por firma (SOC)">
+        <svg class="icon"><use href="#i-alert"></use></svg>
+        <span>Correlacion SOC</span>
+      </button>
+      <button id="act-soc" class="side-btn hidden"
+              title="Dashboard SOC: alertas por severidad, fuente y tarea">
+        <svg class="icon"><use href="#i-alert"></use></svg>
+        <span>Dashboard SOC</span>
       </button>
       <button id="act-clear" class="side-btn" disabled>
         <svg class="icon"><use href="#i-trash"></use></svg>
@@ -162,6 +179,22 @@
       <span id="splunk-status" class="muted" role="status"></span>
     </div>
 
+    <!-- P3.2: modo 'seguir archivo' (desactivado por defecto; solo con
+         LOGVIEWER_TAIL_DIRS y una allowlist explicita de directorios) -->
+    <div id="follow-wrap" class="follow-wrap hidden">
+      <div class="side-label">Seguir archivo (por ruta)</div>
+      <div id="follow-note" class="env-note hidden">
+        El modo "seguir archivo" está desactivado. Se activa definiendo la
+        variable de entorno LOGVIEWER_TAIL_DIRS con los directorios
+        permitidos; sin esa allowlist no se abre ningún log por ruta.
+      </div>
+      <input id="follow-path" type="text" spellcheck="false" hidden
+             aria-label="Ruta del archivo de log a seguir"
+             placeholder="C:\logs\buzon.log">
+      <button id="follow-go" class="btn" hidden>Abrir y seguir</button>
+      <span id="follow-status" class="muted" role="status"></span>
+    </div>
+
     <div id="filecard" class="filecard hidden">
       <div class="filecard-label">Archivo activo</div>
       <div id="file-name" class="file-name"></div>
@@ -176,11 +209,11 @@
     </div>
 
     <div class="presets-wrap">
-      <div class="presets-label">Presets de filtros</div>
+      <div class="presets-label">Vistas guardadas</div>
       <div id="presets" class="presets"></div>
       <button id="preset-save" class="btn ghost" disabled>
         <svg class="icon"><use href="#i-check"></use></svg>
-        Guardar preset actual
+        Guardar vista actual
       </button>
     </div>
 
@@ -292,8 +325,17 @@
 
       <div class="table-panel">
         <div class="table-head">
-          <span id="count" class="muted"></span>
+          <span id="count" class="muted" aria-live="polite"></span>
           <span class="table-actions">
+            <button id="cols-toggle" class="btn ghost" aria-expanded="false"
+                    aria-controls="cols-panel">
+              <svg class="icon"><use href="#i-lines"></use></svg>
+              Columnas
+            </button>
+            <button id="btn-copy-link" class="btn ghost" title="Copiar la URL con los filtros">
+              <svg class="icon"><use href="#i-copy"></use></svg>
+              Copiar enlace
+            </button>
             <label class="export-fmt">
               <span class="muted">Formato</span>
               <select id="export-format" aria-label="Formato de export">
@@ -311,8 +353,29 @@
             </button>
           </span>
         </div>
+        <!-- P3.1: selector de columnas (que ver y en que orden) -->
+        <div id="cols-panel" class="cols-panel hidden">
+          <div class="cols-help muted">
+            Pulsa una columna para mostrarla o ocultarla; 'sube' y 'baja'
+            cambian su orden. El orden y la seleccion se guardan en la URL
+            (cols=) y en este navegador.
+          </div>
+          <div id="cols-list" class="cols-list"></div>
+          <div class="cols-actions">
+            <button id="cols-default" class="btn ghost">Columnas del formato</button>
+            <button id="cols-all" class="btn ghost">Todas</button>
+          </div>
+        </div>
+        <!-- P3.1: empty state cuando los filtros no dan ninguna fila -->
+        <div id="no-results" class="no-results hidden">
+          <svg class="icon" aria-hidden="true"><use href="#i-filter"></use></svg>
+          <p class="no-results-msg">0 filas con estos filtros.</p>
+          <p class="muted">Ninguna linea coincide con lo que has filtrado.
+          Limpia los filtros o cambia de archivo.</p>
+          <button id="no-results-clear" class="btn ghost">Limpiar filtros</button>
+        </div>
         <div id="tblwrap">
-          <table>
+          <table role="table" aria-label="Lineas del archivo cargado">
             <thead id="thead"></thead>
             <tbody id="tbody"></tbody>
           </table>
@@ -337,16 +400,22 @@
     </button>
   </div>
   <div class="drawer-body">
-    <table class="kv" id="drawer-kv"></table>
+    <table class="kv" id="drawer-kv" role="table" aria-label="Campos de la linea">
     <div class="drawer-raw">
       <div class="drawer-raw-head">
         <span class="fgroup-label">Línea raw</span>
-        <button id="drawer-copy" class="btn ghost">
-          <svg class="icon"><use href="#i-copy"></use></svg>
-          Copiar
-        </button>
+        <span id="raw-line" class="muted"></span>
+        <span class="raw-actions">
+          <button id="drawer-expand" class="btn ghost hidden"
+                  aria-expanded="false">Mostrar todo</button>
+          <button id="drawer-copy" class="btn ghost">
+            <svg class="icon" aria-hidden="true"><use href="#i-copy"></use></svg>
+            Copiar línea completa
+          </button>
+        </span>
       </div>
       <pre id="drawer-raw"></pre>
+      <p id="raw-len" class="muted" aria-live="polite"></p>
     </div>
     <div class="drawer-ctx">
       <button id="drawer-ctx-btn" class="btn ghost hidden"
@@ -400,10 +469,20 @@
     </div>
     <label>Patrón
       <input id="rbf-pattern" autocomplete="off"></label>
+    <label>Nombre
+      <input id="rbf-nombre" autocomplete="off"></label>
     <label>Tipo
       <select id="rbf-kind">
         <option value="regex">regex</option>
         <option value="glob">glob</option>
+      </select></label>
+    <label>Severidad sugerida
+      <select id="rbf-severidad">
+        <option value="">Sin asignar</option>
+        <option value="CRIT">Critica (CRIT)</option>
+        <option value="ERR">Alta (ERR)</option>
+        <option value="WRN">Media/baja (WRN)</option>
+        <option value="INF">Info (INF)</option>
       </select></label>
     <label>Explicación
       <input id="rbf-explicacion" autocomplete="off"></label>
@@ -411,6 +490,8 @@
       <input id="rbf-causa" autocomplete="off"></label>
     <label>Solución
       <input id="rbf-solucion" autocomplete="off"></label>
+    <label>Accion recomendada
+      <input id="rbf-accion" autocomplete="off"></label>
     <label>Referencia interna
       <input id="rbf-ref" autocomplete="off"></label>
     <div class="modal-actions">
@@ -453,6 +534,80 @@
 </div>
 
 <!-- Diagnostico rapido (Fase 12C) -->
+<!-- P4.1: correlacion alertas <-> triage por firma -->
+<div id="corr-modal" class="modal-backdrop hidden">
+  <div class="modal-panel" role="dialog" aria-label="Correlacion de alertas y triage">
+    <div class="modal-head">
+      <h2>Correlacion SOC: alertas x triage</h2>
+      <button id="corr-close" class="icon-btn" aria-label="Cerrar correlacion">
+        <svg class="icon"><use href="#i-x"></use></svg>
+      </button>
+    </div>
+    <p id="corr-status" role="status" class="muted">&nbsp;</p>
+    <div id="corr-counts" class="corr-counts hidden"></div>
+    <table id="corr-table" class="corr-table hidden">
+      <thead>
+        <tr><th>Firma</th><th>Estado</th><th>Motivo</th><th>Tarea</th><th>Triage</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- P4.2: dashboard SOC (severidad, fuente, tarea). El agregado lo hace
+     el servidor; aqui solo se pinta el JSON de /api/soc/dashboard. -->
+<div id="soc-modal" class="modal-backdrop hidden">
+  <div class="modal-panel" role="dialog" aria-label="Dashboard SOC">
+    <div class="modal-head">
+      <h2>Dashboard SOC</h2>
+      <button id="soc-close" class="icon-btn" aria-label="Cerrar dashboard">
+        <svg class="icon"><use href="#i-x"></use></svg>
+      </button>
+    </div>
+    <p id="soc-status" role="status" class="muted">&nbsp;</p>
+    <div class="soc-filters">
+      <label>Severidad
+        <select id="soc-sev">
+          <option value="">Todas</option>
+          <option value="CRIT">Critica (CRIT)</option>
+          <option value="ERR">Alta (ERR)</option>
+          <option value="WRN">Media/baja (WRN)</option>
+          <option value="INF">Info (INF)</option>
+        </select></label>
+      <label>Fuente
+        <input id="soc-fuente" type="text" autocomplete="off"
+               placeholder="p. ej. splunk"></label>
+      <label>Tarea
+        <select id="soc-tarea">
+          <option value="">Todas</option>
+          <option value="abierta">Abiertas</option>
+          <option value="encolada">Encoladas</option>
+          <option value="descartada">Descartadas</option>
+          <option value="sin_dato">Sin dato</option>
+        </select></label>
+      <button id="soc-go" class="btn tiny">Filtrar</button>
+    </div>
+    <div id="soc-sev-chips" class="soc-chips"></div>
+    <div id="soc-tarea-chips" class="soc-chips"></div>
+    <h3 class="soc-h">Por fuente</h3>
+    <table id="soc-fuente-table" class="soc-table">
+      <thead>
+        <tr><th>Fuente</th><th>Alertas</th><th>CRIT</th><th>ERR</th>
+          <th>WRN</th><th>INF</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <h3 class="soc-h">Alertas</h3>
+    <table id="soc-alert-table" class="soc-table">
+      <thead>
+        <tr><th>ts</th><th>Fuente</th><th>Firma</th><th>Sev</th>
+          <th>Tarea</th><th>Estado</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
 <div id="diag-modal" class="modal-backdrop hidden">
   <div class="modal-panel" role="dialog" aria-label="Diagnostico rapido">
     <div class="modal-head">
@@ -490,7 +645,21 @@
       <h3>Ver contexto de una linea</h3>
       <p>Clic en cualquier fila abre el drawer de detalle; el boton "Ver
         contexto" muestra las lineas anteriores y posteriores del archivo
-        original con la actual resaltada.</p>
+        original con la actual resaltada. El drawer muestra una vista previa
+        de la linea raw (600 caracteres) y el boton "Mostrar todo" despliega
+        la linea completa; "Copiar linea completa" la lleva al portapapeles.</p>
+      <h3>Seguir un archivo (modo 'seguir archivo')</h3>
+      <p>Permite abrir un log por ruta y hacer tail del original sin subirlo.
+        Esta <strong>desactivada por defecto</strong>: solo funciona si el
+        operador define la variable de entorno <code>LOGVIEWER_TAIL_DIRS</code>
+        con los directorios permitidos (separados por coma). Cualquier ruta
+        fuera de esa allowlist se rechaza.</p>
+      <h3>Atajos de teclado</h3>
+      <p><code>j</code> / <code>k</code>: pagina siguiente / anterior.
+        <code>[</code> / <code>]</code>: recorrer los campos de filtro.
+        <code>/</code>: texto libre. <code>t</code>: tail en vivo.
+        <code>e</code>: exportar. <code>p</code>: modo presentacion.
+        <code>Esc</code>: cerrar drawer, panel lateral o presentacion.</p>
       <h3>Tail en vivo</h3>
       <p>El boton "Tail en vivo" (o la tecla t) sigue las lineas nuevas:
         el indicador LIVE parpadea mientras entran datos y la tabla se
@@ -561,6 +730,6 @@
 <input type="file" id="file" hidden>
 
 <script src="/static/vendor/chart.min.js?v=4"></script>
-<script src="/static/app.js?v=14"></script>
+<script src="/static/app.js?v=16"></script>
 </body>
 </html>

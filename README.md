@@ -74,12 +74,15 @@ http://127.0.0.1:8765/
 ```
 
 - Custom port: `python server.py 9000`
+- Tail a file from the terminal without starting the HTTP server:
+  `python server.py --tail path/to/file.log --lines 50`
 - By default the server only listens on `127.0.0.1` (not exposed to the
   network). Use `--host 0.0.0.0` or `PORT=<n>` to bind elsewhere if you
   really want to.
 - On startup the temp folder `%TEMP%\logviewer\` is cleaned.
 - File limits: 500 MB per file, 1 GB per upload batch, 2 GB decompressed.
-- Accepted extensions: `.log .txt .csv .json .gz .bz2 .xz .zip`
+- Accepted extensions: `.log .txt .csv .json .jsonl .gz .bz2 .xz .zip`
+  (`.jsonl` = JSON Lines, one JSON object per line with `ts`/`level`/`msg`; auto-detected as format `json`)
 - Large datasets (over a threshold) automatically use a SQLite backend, so
   logs with millions of lines don't exhaust memory.
 
@@ -101,6 +104,79 @@ http://127.0.0.1:8765/
    to have the local LLM summarize all error templates.
 8. **Presentation mode**: the "Presentacion" button (or `p`) hides the
    sidebar/header/filters and shows the table full-screen. `Esc` closes it.
+
+## Uso con OperVanta (piloop / buzón / SOC)
+
+El visor entiende de serie los logs que genera OperVanta. No hay que
+convertir nada: se cargan los ficheros tal cual y el servidor detecta el
+formato.
+
+### Qué subir
+
+| Fichero OperVanta | Ruta típica | Formato detectado |
+|---|---|---|
+| `buzon.log`, `orquestador.log` | `piloop-proyectos\buzon\` | `piloop` |
+| `soc\triage.log` | `piloop-proyectos\buzon\soc\` | `triage` |
+| `soc\alertas.jsonl`, `soc\eventos.jsonl` | `piloop-proyectos\buzon\soc\` | `json` (JSON Lines) |
+| `soc\dataset.jsonl`, `soc\triage-dataset.jsonl` | `piloop-proyectos\buzon\soc\` | `json` (registro envuelto en `datos`/`alerta`/`data`) |
+
+Se pueden arrastrar varios ficheros a la vez o usar "Cargar archivo". Cada
+fichero queda como una sesión en el panel **Sessions**; el dashboard y los
+filtros actúan sobre la sesión activa.
+
+### Cómo se detecta cada formato
+
+- **`piloop`** — `2026-10-12 20:40:16 logs: rotado buzon.log (>0.0 MB)`.
+  Fecha, hora y componente opcional; la línea no lleva nivel, así que se
+  infiere del texto (`error`, `except`, `traceback`, `denied` -> `ERR`;
+  `warn`, `aviso` -> `WRN`; `ok`, `completado`, `rotado`, `iniciado` ->
+  `INF`; si no hay pistas, `INF`). Las líneas sin timestamp (stack traces,
+  continuaciones) se guardan como `RAW` y se ven igual en la tabla.
+- **`triage`** — `23:36:54 [x] F-LAYA2 -> real_incident conf 0.8 sev 2.0
+  accion yes | ESCALADA t4f87df76`. Se extraen hora, fuente, firma,
+  veredicto, confianza, severidad, acción y tarea. La hora va sin fecha: se
+  completa con la fecha del fichero cuando se conoce. El nivel se deduce:
+  `sev >= 2.0` o `accion yes` -> `ERR`; `sev >= 1.0`, o confianza alta con
+  veredicto de incidente -> `WRN`; el resto -> `INF`.
+- **`json`** — una línea por objeto JSON. El nivel se toma de `level`/`lvl`
+  o, si no viene, de `sev` (`baja` -> `WRN`, `media` -> `INF`, `alta` ->
+  `ERR`, `critica` -> `CRIT`; también se aceptan números 0..3: >=3 CRIT,
+  >=2 ERR, >=1 WRN). La IP se busca en `ip`, `src`, `dst`, `client_ip`...
+
+### Columnas de OperVanta que se conservan
+
+Al parsear JSON Lines del SOC no se pierde ninguna columna: además de
+`ts`, `level`, `ip` y `msg` se guardan `fuente`, `firma`, `tenant`, `tarea`,
+`dedupe`, `evidencia`, `riesgo`, `url`, `sev` (original, sin transformar),
+`src` y `dst`. Aparecen en el drawer de la fila y en la exportación a CSV o
+JSON Lines. En el formato `piloop` se conserva además el `comp` (componente).
+
+### Panel Dashboard SOC (severidad, fuente, tarea)
+
+Con una sesión de alertas cargada, el botón **Dashboard SOC** abre un modal
+con el agregado calculado en el servidor (`GET /api/soc/dashboard`). Se
+filtra por severidad, fuente y tarea, y muestra:
+
+- **Chips de severidad**: `CRIT = n`, `ERR = n`, `WRN = n`, `INF = n`.
+- **Chips de tarea**: `abierta`, `encolada`, `descartada`, `sin_dato`.
+- **Tabla "Por fuente"**: Fuente | Alertas | CRIT | ERR | WRN | INF.
+- **Tabla "Alertas"**: ts | Fuente | Firma | Sev | Tarea | Estado. La
+  columna Sev muestra el nivel normalizado y, entre paréntesis, el valor
+  original del fichero (p. ej. `err (alta)`).
+
+### Correlación alertas x triage
+
+El botón **Correlación SOC** cruza `alertas.jsonl` con `triage.log` por
+firma (`GET /api/correlate`). La tabla resultante tiene las columnas Firma,
+Estado, Motivo, Tarea y Triage (veredicto, confianza y tarea de escalado de
+cada línea de triage).
+
+### Filtros aplicables
+
+Los filtros de nivel (`CRIT`, `ERR`, `WRN`, `INF`), texto libre, rango de
+fecha (`dt_from`/`dt_to`, timestamps normalizados a ISO) e IP funcionan sobre
+estos formatos igual que sobre un Apache o un W3C. Comas = OR, `!` =
+exclusión.
 
 ## Local LLM (Analyze line and Quick diagnosis)
 
@@ -129,8 +205,15 @@ http://127.0.0.1:8765/
   not connect to third-party Splunks.
 - **Setup:** environment variables
   - `SPLUNK_URL` (default `https://localhost:8089`)
-  - `SPLUNK_USER` (default `admin`)
+  - `SPLUNK_USER` (no default; empty if not set - there is no `admin`
+    fallback). Set it together with `SPLUNK_PASS`: with an empty user the
+    basic auth will be rejected by Splunk.
   - `SPLUNK_PASS` (required; if missing, the Splunk section is hidden)
+  - `LOGVIEWER_SPLUNK_VERIFY` (default: verification ON). The TLS certificate
+    is verified by default. Set `LOGVIEWER_SPLUNK_VERIFY=0` only for a local
+    Splunk with a self-signed certificate that cannot be validated; it is
+    never off by default. Better option: `LOGVIEWER_SPLUNK_CAFILE=/path/ca.pem`
+    to trust the Splunk CA without disabling verification.
 - Note: for Azure AD JSON events (sourcetype `ms:aad:signin`) use `| spath`
   to extract the fields (`userPrincipalName`, `ipAddress`, `failureReason`)
   that live inside the `_raw` field.
@@ -185,28 +268,38 @@ http://127.0.0.1:8765/
 | POST | `/api/watch` | Toggle live tail |
 | GET | `/api/tail?name=&last=` | Drain new lines |
 | GET | `/api/audit` | Audit log |
+| GET | `/api/health` | Service status: version, backend (mem/sqlite), uptime |
 | GET | `/api/export?name=&format=csv\|json` | Streamed export |
 
 ## Project structure
 
 ```
-server.py            Single-file server (Python stdlib)
+server.py            Entry point + CLI (imports the modules below)
+config.py            Constants and environment configuration
+security.py          Session cookie, headers, CSRF, rate limiting
+parsers.py           Format detection, parsers and row filters
+stores.py            Global state and dataset backend (MemStore/SqlStore)
+api.py               HTTP handler, routes, LLM, Splunk, tail, audit, server
 static/index.html    UI
 static/app.js        Frontend logic
 static/styles.css    Styles
 static/vendor/       Vendored Chart.js
-test_parsers.py      148 unit tests
+test_parsers.py      331 unit tests (parsers OperVanta incluidos)
 LICENSE
 ```
 
 ## Tests
 
 ```bash
-python test_parsers.py
+python -m unittest test_parsers -q
 ```
 
-148 tests: parsers, ts normalization, templates/clustering, runbooks,
-LLM settings/cache/language, Splunk ingestion, SSRF checks.
+**331 tests, todo verde** (verificado el 2026-10-30 con Python 3.12).
+Cubren: parsers Apache/W3C/syslog/generic/JSON, detección de formato,
+formatos OperVanta (`piloop` y `triage`), normalización de severidad y de
+timestamps, templates/clustering, runbooks, correlación alertas x triage,
+dashboard SOC, ajustes y caché del LLM, ingesta Splunk y comprobaciones
+SSRF.
 
 ## License
 
