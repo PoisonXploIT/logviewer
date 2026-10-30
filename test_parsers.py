@@ -6684,12 +6684,14 @@ class TestOrdenDescU4(unittest.TestCase):
                             "static")
         html = open(os.path.join(base, "index.html"), encoding="utf-8").read()
         js = open(os.path.join(base, "app.js"), encoding="utf-8").read()
-        self.assertIn('id="fdfrom" type="date"', html)
-        self.assertIn('id="fdto" type="date"', html)
-        self.assertIn('aria-label="Desde (fecha)"', html)
-        self.assertIn('aria-label="Hasta (fecha)"', html)
-        # 'Hasta' una fecha sin hora es inclusive hasta el final del dia
+        self.assertIn('id="fdfrom" type="datetime-local"', html)
+        self.assertIn('id="fdto" type="datetime-local"', html)
+        self.assertIn('aria-label="Desde (fecha y hora)"', html)
+        self.assertIn('aria-label="Hasta (fecha y hora)"', html)
+        # 'Hasta' una fecha sin hora es inclusive hasta el final del dia;
+        # con hora, hasta el final del minuto (:59)
         self.assertIn('T23:59:59', js)
+        self.assertIn(':59', js)
 
 
 if __name__ == "__main__":

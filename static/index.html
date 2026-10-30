@@ -283,12 +283,12 @@
             <span class="fgroup-label">Fecha / Texto</span>
             <input id="fdt" placeholder="Fecha/hora (11:07:24, 2026-05-11)" autocomplete="off">
             <!-- U4 (2026-10-30): calendario nativo (type=date) en lugar de
-                escribir la fecha a mano. El valor es YYYY-MM-DD y lo normaliza
-                norm_ts; la semantica del rango no cambia. -->
-            <input id="fdfrom" type="date" aria-label="Desde (fecha)"
-                   title="Desde (fecha, inclusive)">
-            <input id="fdto" type="date" aria-label="Hasta (fecha)"
-                   title="Hasta (fecha, inclusive)">
+                escribir la fecha a mano. U4b: datetime-local anade el selector
+                de HORA (ademas del calendario) para no escribir la hora tampoco. -->
+            <input id="fdfrom" type="datetime-local" step="60" aria-label="Desde (fecha y hora)"
+                   title="Desde (fecha y hora, inclusive)">
+            <input id="fdto" type="datetime-local" step="60" aria-label="Hasta (fecha y hora)"
+                   title="Hasta (fecha y hora, inclusive)">
             <input id="fq" placeholder="Texto libre" autocomplete="off">
             <input id="ftpl" placeholder="Plantilla (exacta, desde Errores agrupados)" autocomplete="off">
           </div>
@@ -736,6 +736,6 @@
 <input type="file" id="file" hidden>
 
 <script src="/static/vendor/chart.min.js?v=4"></script>
-<script src="/static/app.js?v=18"></script>
+<script src="/static/app.js?v=19"></script>
 </body>
 </html>

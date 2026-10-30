@@ -275,8 +275,12 @@ const filters = {
       // U4 (2026-10-30): el calendario entrega YYYY-MM-DD. "Hasta" una fecha
       // es inclusive hasta el final del dia; sin el arrastre a 23:59:59 se
       // perderian todas las filas de esa jornada.
+      // U4b (2026-10-30): el calendario+hora (datetime-local) entrega
+      // YYYY-MM-DDTHH:MM. 'Hasta' es inclusive: si solo hay fecha se arrastra
+      // al final del dia; si hay hora se arrastra al final del minuto (:59).
       p.dt_to = /^\d{4}-\d{2}-\d{2}$/.test(p.dtTo)
-        ? p.dtTo + "T23:59:59" : p.dtTo;
+        ? p.dtTo + "T23:59:59"
+        : (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(p.dtTo) ? p.dtTo + ":59" : p.dtTo);
       delete p.dtTo;
     }
     return p;
