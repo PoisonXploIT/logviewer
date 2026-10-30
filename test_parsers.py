@@ -2324,6 +2324,118 @@ class TestSessionCookieSigned(unittest.TestCase):
             security.REQUIRE_CF = False
 
 
+class TestSessionSecretPersisted(unittest.TestCase):
+    """Residual de P2.1 (2026-10-30): el secreto de sesion se persiste en
+    %TEMP%\logviewer\session_secret, asi que con --persist las cookies
+    firmadas de la sesion anterior siguen validas tras un reinicio."""
+
+    def test_se_genera_y_persiste_y_se_recarga_igual(self):
+        d = tempfile.mkdtemp(prefix="lv_secret_")
+        try:
+            path = os.path.join(d, "session_secret")
+            first, origin = security.load_session_secret(path)
+            self.assertTrue(os.path.isfile(path))
+            self.assertIn("persistido", origin)
+            second, origin2 = security.load_session_secret(path)
+            self.assertEqual(first, second)
+            self.assertIn("persistido", origin2)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_el_entorno_manda_sobre_el_fichero(self):
+        d = tempfile.mkdtemp(prefix="lv_secret_")
+        old = os.environ.get("LOGVIEWER_SESSION_SECRET")
+        try:
+            path = os.path.join(d, "session_secret")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("a" * 64 + "\n")
+            os.environ["LOGVIEWER_SESSION_SECRET"] = "beef" * 16
+            secret, origin = security.load_session_secret(path)
+            self.assertEqual(secret, "beef" * 16)
+            self.assertEqual(origin, "env LOGVIEWER_SESSION_SECRET")
+        finally:
+            if old is None:
+                os.environ.pop("LOGVIEWER_SESSION_SECRET", None)
+            else:
+                os.environ["LOGVIEWER_SESSION_SECRET"] = old
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_fichero_corrupto_se_regenera(self):
+        d = tempfile.mkdtemp(prefix="lv_secret_")
+        try:
+            path = os.path.join(d, "session_secret")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("no-es-un-secreto")
+            secret, origin = security.load_session_secret(path)
+            self.assertEqual(len(secret), 64)
+            self.assertIn("generado", origin)
+            # Vuelta: ya esta bien escrito y se reutiliza.
+            self.assertEqual(security.load_session_secret(path)[0], secret)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    @unittest.skipUnless(os.name == "posix",
+                         "Windows no aplica los bits de permisos del modo")
+    def test_permisos_0600_en_posix(self):
+        d = tempfile.mkdtemp(prefix="lv_secret_")
+        try:
+            path = os.path.join(d, "session_secret")
+            security.load_session_secret(path)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_el_fichero_queda_legible_por_el_proceso(self):
+        # En Windows no se pueden exigir los bits 0600; se comprueba al menos
+        # que el fichero se crea y se puede leer (el chmod es best effort).
+        d = tempfile.mkdtemp(prefix="lv_secret_")
+        try:
+            path = os.path.join(d, "session_secret")
+            secret, origin = security.load_session_secret(path)
+            self.assertTrue(os.path.isfile(path))
+            with open(path, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read().strip(), secret)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_la_identidad_de_la_carpeta_de_sesiones_se_recarga(self):
+        # Residual de P2.1: con --persist la carpeta de sesiones se crea con
+        # el nombre sanitizado, y la cookie firmada usa el correo real. Sin el
+        # sidecar .user, las sesiones recargadas no se ven tras reiniciar.
+        d = tempfile.mkdtemp(prefix="lv_sessions_")
+        user = "sammi@example.com"
+        try:
+            udir = os.path.join(d, "sammi_example.com")
+            os.makedirs(udir)
+            server.save_user_identity(udir, user)
+            with open(os.path.join(udir, ".user"), encoding="utf-8") as f:
+                self.assertEqual(f.read().strip(), user)
+            with open(os.path.join(udir, "prueba_h1.log"), "w",
+                      encoding="utf-8") as f:
+                f.write("2026-10-30 10:00:00 piloop: linea de prueba\n")
+            n = server.restore_sessions_from_disk(d)
+            self.assertEqual(n, 1)
+            with server.LOCK:
+                mine = server._user_state(user, server.SESSIONS)
+                self.assertIn("prueba_h1.log", mine)
+                server.SESSIONS.pop(user, None)
+                server.ACTIVE.pop(user, None)
+                server.PROGRESS.pop(user, None)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_secreto_del_proceso_esta_persistido(self):
+        # Al importar el modulo el secreto ya esta resuelto y, si no hay
+        # variable de entorno, debe haber quedado en el fichero de TEMP.
+        if os.environ.get("LOGVIEWER_SESSION_SECRET"):
+            self.assertEqual(security.SESSION_SECRET_SOURCE,
+                             "env LOGVIEWER_SESSION_SECRET")
+        else:
+            self.assertIn("persistido", security.SESSION_SECRET_SOURCE)
+            self.assertEqual(security.SESSION_SECRET,
+                             security.load_session_secret()[0])
+
+
 class TestRateLimit(unittest.TestCase):
     """P2.1 (2026-10-30): limite de peticiones por IP con deque por ventana."""
 

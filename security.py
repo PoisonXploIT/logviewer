@@ -49,7 +49,11 @@ CSRF_TOKEN = secrets.token_hex(16)
 UPLOAD_SEM = threading.BoundedSemaphore(2)
 
 # Cabecera CSP de la pagina HTML (sin inline: todo el JS esta en app.js).
-CSP_HTML = ("default-src 'self'; script-src 'self'; style-src 'self'; "
+# style-src lleva 'unsafe-inline': app.js genera barras (spark/KPI/progreso)
+# con style="height:...px"/style="width:...%" dinamicos via innerHTML, y sin
+# unsafe-inline el navegador los bloquea (CSP) y no se ven. script-src sigue
+# estricto 'self' (sin inline JS), que es lo que importa para seguridad.
+CSP_HTML = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
             "base-uri 'self'; frame-ancestors 'none'")
 
@@ -68,8 +72,64 @@ REQUIRE_CF = os.environ.get("LOGVIEWER_REQUIRE_CF") == "1"
 # Mientras no se decida, la identidad se firma aqui con HMAC y el header
 # Cf-Access-Authenticated-User-Email se usa solo como valor inicial NO confiable.
 SESSION_COOKIE = "lv_session"
-SESSION_SECRET = os.environ.get("LOGVIEWER_SESSION_SECRET") or secrets.token_hex(32)
+
+# Residual de P2.1 (2026-10-30): antes el secreto se generaba con
+# secrets.token_hex() en cada arranque, y con --persist las cookies firmadas
+# de la sesion anterior quedaban invalidadas al reiniciar. Ahora el secreto
+# se persiste en %TEMP%\logviewer\session_secret (0600) para que la
+# identidad de la cookie sobreviva entre arranques.
+SESSION_SECRET_DIR = os.path.join(tempfile.gettempdir(), "logviewer")
+SESSION_SECRET_PATH = os.path.join(SESSION_SECRET_DIR, "session_secret")
 SESSION_MAX_AGE = 8 * 3600  # 8 h; la sesion es efimera (se limpia al arrancar)
+
+
+def _read_persisted_secret(path):
+    """Lee el secreto persistido. '' si no existe o tiene un formato dudoso."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            value = f.read().strip()
+    except OSError:
+        return ""
+    if len(value) >= 32 and re.fullmatch(r"[0-9a-fA-F]+", value):
+        return value
+    return ""
+
+
+def _write_persisted_secret(path, secret):
+    """Escribe el secreto con permisos 0600. True si se pudo escribir."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(secret + "\n")
+        try:
+            os.chmod(path, 0o600)   # Windows: refuerza el modo (no es estricto)
+        except OSError:
+            pass
+        return True
+    except OSError:
+        return False
+
+
+def load_session_secret(path=None):
+    """Resuelve el secreto de sesion y de donde viene.
+
+    Orden: 1) LOGVIEWER_SESSION_SECRET (manda), 2) el fichero persistido,
+    3) se genera uno nuevo y se persiste. Devuelve (secreto, origen)."""
+    path = path or SESSION_SECRET_PATH
+    env = os.environ.get("LOGVIEWER_SESSION_SECRET")
+    if env:
+        return env, "env LOGVIEWER_SESSION_SECRET"
+    persisted = _read_persisted_secret(path)
+    if persisted:
+        return persisted, "persistido en %s" % path
+    secret = secrets.token_hex(32)
+    if _write_persisted_secret(path, secret):
+        return secret, "generado y persistido en %s" % path
+    return secret, "generado al arrancar (no se pudo persistir)"
+
+
+SESSION_SECRET, SESSION_SECRET_SOURCE = load_session_secret()
 
 # Cabeceras de seguridad que se envian en TODA respuesta.
 SECURITY_HEADERS = (

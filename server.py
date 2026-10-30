@@ -126,9 +126,7 @@ def main():
     print("  http://%s:%d/" % (host, port), flush=True)
     print("  Pool de hilos: max %d conexiones concurrentes" % MAX_CONNECTIONS,
           flush=True)
-    print("  Secreto de sesion: %s" % ("env LOGVIEWER_SESSION_SECRET"
-                                       if os.environ.get("LOGVIEWER_SESSION_SECRET")
-                                       else "generado al arrancar (no persistido)"),
+    print("  Secreto de sesion: %s" % security.SESSION_SECRET_SOURCE,
           flush=True)
     print("  Temp dir: %s" % tmpdir, flush=True)
     print("  Persistencia: %s" % ("activa (--persist)"

@@ -155,13 +155,15 @@ const api = {
 const theme = {
   KEY: "lv-theme",
   get() {
-    const saved = localStorage.getItem(this.KEY);
-    if (saved === "dark" || saved === "light") return saved;
+    try {
+      const saved = localStorage.getItem(this.KEY);
+      if (saved === "dark" || saved === "light") return saved;
+    } catch (e) { /* storage bloqueado (Brave/incognito): usa el del sistema */ }
     return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   },
   apply(t) {
     document.documentElement.setAttribute("data-theme", t);
-    localStorage.setItem(this.KEY, t);
+    try { localStorage.setItem(this.KEY, t); } catch (e) { /* storage bloqueado */ }
     const u = document.querySelector("#theme-icon use");
     if (u) u.setAttribute("href", t === "dark" ? "#i-sun" : "#i-moon");
   },
@@ -856,7 +858,8 @@ function moveCol(col, delta) {
 }
 
 function persistCols() {
-  localStorage.setItem("lv-cols-" + app.fmt, app.cols.join(","));
+  try { localStorage.setItem("lv-cols-" + app.fmt, app.cols.join(",")); }
+  catch (e) { /* storage bloqueado */ }
   syncUrl();
 }
 
@@ -954,7 +957,9 @@ async function renderRows(opts) {
     // P3.1: la seleccion de columnas viene de la URL; si no, de lo guardado
     // por formato; si no, del default del formato.
     if (!app.cols.length) {
-      const saved = localStorage.getItem("lv-cols-" + app.fmt) || "";
+      let saved = "";
+      try { saved = localStorage.getItem("lv-cols-" + app.fmt) || ""; }
+      catch (e) { /* storage bloqueado */ }
       app.cols = normalizeCols(saved.split(",").map((c) => c.trim()),
                               app.availableCols);
     } else {
@@ -2278,7 +2283,9 @@ function wire() {
   // Panel de filtros plegable (persistido)
   const panel = document.getElementById("filters-panel");
   const toggle = document.getElementById("filters-toggle");
-  const collapsed = localStorage.getItem("lv-filters-collapsed") === "1";
+  let collapsed = false;
+  try { collapsed = localStorage.getItem("lv-filters-collapsed") === "1"; }
+  catch (e) { /* storage bloqueado */ }
   if (collapsed) {
     panel.classList.add("collapsed");
     toggle.setAttribute("aria-expanded", "false");
@@ -2286,7 +2293,8 @@ function wire() {
   toggle.addEventListener("click", () => {
     const isCollapsed = panel.classList.toggle("collapsed");
     toggle.setAttribute("aria-expanded", String(!isCollapsed));
-    localStorage.setItem("lv-filters-collapsed", isCollapsed ? "1" : "0");
+    try { localStorage.setItem("lv-filters-collapsed", isCollapsed ? "1" : "0"); }
+    catch (e) { /* storage bloqueado */ }
   });
 
   // Fase 9B: panel 'Errores agrupados' plegable
@@ -2431,7 +2439,11 @@ function wire() {
 
   // Atajos de teclado (Fase 5). No se disparan si el foco esta en un input.
   document.addEventListener("keydown", (e) => {
-    const inField = /^(input|textarea|select)$/.test(e.target.tagName);
+    // tagName va en MAYUSCULAS ('INPUT'): la regex sin 'i' nunca cuadraba y los
+    // atajos (t=tail, e=export...) se disparaban mientras escribias en un campo
+    // (p. ej. 't' de 'http' en la URL del LLM activaba el tail).
+    const inField = /^(input|textarea|select)$/i.test(e.target.tagName)
+      || (e.target && e.target.isContentEditable);
     if (e.key === "Escape") {
       if (!drawer.closed) drawer.close();
       else if (document.body.classList.contains("side-open")) closeSidebar();
@@ -2470,7 +2482,7 @@ function focusFilter(step) {
   if (panel.classList.contains("collapsed")) {
     panel.classList.remove("collapsed");
     document.getElementById("filters-toggle").setAttribute("aria-expanded", "true");
-    localStorage.setItem("lv-filters-collapsed", "0");
+    try { localStorage.setItem("lv-filters-collapsed", "0"); } catch (e) { /* storage bloqueado */ }
   }
   const current = FILTER_FIELDS.indexOf(document.activeElement.id);
   const idx = current < 0 ? (step > 0 ? 0 : FILTER_FIELDS.length - 1) : current;

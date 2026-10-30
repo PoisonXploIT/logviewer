@@ -2610,6 +2610,7 @@ class Handler(BaseHTTPRequestHandler):
                 tmpdir = os.path.join(tempfile.gettempdir(), "logviewer",
                                       "sessions", safe_session_name(user))
                 os.makedirs(tmpdir, exist_ok=True)
+                save_user_identity(tmpdir, user)
                 try:
                     parts, written_paths = stream_multipart_to_disk(
                         self.rfile, m.group(1).encode(), length, tmpdir)
@@ -2926,11 +2927,34 @@ def startup_cleanup(persist, tmpdir=None):
     return tmpdir, sessions_dir, sqlite_dir
 
 
+IDENTITY_FILE = ".user"
+
+
+def save_user_identity(user_dir, user):
+    """Residual de P2.1 (2026-10-30): guarda la identidad REAL del usuario
+    dentro de su carpeta de sesiones.
+
+    El directorio se crea con `safe_session_name(user)` (sin '@' ni puntos),
+    asi que al reconstruir las sesiones con --persist no se puede deducir el
+    usuario de la cookie: sin este sidecar, la sesion recargada quedaria bajo
+    la clave 'sammi_example.com' y la cookie firmada ('sammi@example.com')
+    no la veria. Devuelve True si se pudo escribir."""
+    try:
+        with open(os.path.join(user_dir, IDENTITY_FILE), "w",
+                  encoding="utf-8") as f:
+            f.write(str(user or "").strip())
+        return True
+    except OSError:
+        return False
+
+
 def restore_sessions_from_disk(sessions_dir):
     """P4.1 (--persist): re-carga los archivos de sesion que quedaron en disco.
 
     Las sesiones viven en memoria; sin esta reconstruccion, --persist solo
-    conservaria los archivos sueltos. Devuelve el numero de datasets recargados."""
+    conservaria los archivos sueltos. Devuelve el numero de datasets recargados.
+    La clave de cada sesion es la identidad guardada en `.user` (la cookie),
+    no el nombre sanitizado del directorio."""
     if not os.path.isdir(sessions_dir):
         return 0
     n = 0
@@ -2938,11 +2962,21 @@ def restore_sessions_from_disk(sessions_dir):
         udir = os.path.join(sessions_dir, user_dir)
         if not os.path.isdir(udir):
             continue
+        identity = ""
+        try:
+            with open(os.path.join(udir, IDENTITY_FILE), "r",
+                      encoding="utf-8") as f:
+                identity = f.read().strip()
+        except OSError:
+            identity = ""
+        user = identity or user_dir
         for fname in sorted(os.listdir(udir)):
+            if fname == IDENTITY_FILE:
+                continue
             path = os.path.join(udir, fname)
             if not os.path.isfile(path) or not is_supported_name(fname):
                 continue
-            _load_worker(fname, path, user=user_dir)
+            _load_worker(fname, path, user=user)
             n += 1
     return n
 
