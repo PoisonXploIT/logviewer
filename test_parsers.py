@@ -3181,7 +3181,7 @@ class TestSplunkQuery(unittest.TestCase):
         cap, srv, old = self._mock_splunk(indexes=("botsv3", "_audit"))
         try:
             self.assertEqual(server.splunk_indexes(), ["botsv3"])
-            self.assertEqual(cap["path"], "/services/data/2.0/indexes")
+            self.assertEqual(cap["path"], "/services/data/indexes?output_mode=json&count=0")
         finally:
             srv.shutdown()
             (config.SPLUNK_URL, config.SPLUNK_USER, config.SPLUNK_PASS) = old
