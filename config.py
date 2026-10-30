@@ -47,6 +47,10 @@ PROGRESS_STEP = 10000              # cada N lineas se actualiza el progreso
 TAIL_POLL = 0.5                    # s: intervalo del watcher
 TAIL_BUFFER_MAX = 10000            # lineas nuevas max. en el buffer
 TAIL_MAX = 5000                    # tope de last por peticion a /api/tail
+
+# T1 (2026-10-30): el modo 'seguir archivo' carga solo las ultimas N lineas
+# (tail) en vez del historial completo. Se puede ajustar por entorno.
+TAIL_LINES = max(1, int(os.environ.get("LOGVIEWER_TAIL_LINES", "5000")))
 UPLOAD_CHUNK = 1024 * 1024         # 1 MB: bloque de lectura del upload (Bug B9)
 
 # P5.1 (2026-10-30): identificacion del servicio para /api/health.

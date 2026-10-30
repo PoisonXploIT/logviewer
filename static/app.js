@@ -271,7 +271,14 @@ const filters = {
     for (const [k, v] of Object.entries(this.state)) if (v) p[k] = v;
     // Los rangos viajan con nombre de servidor
     if (p.dtFrom) { p.dt_from = p.dtFrom; delete p.dtFrom; }
-    if (p.dtTo) { p.dt_to = p.dtTo; delete p.dtTo; }
+    if (p.dtTo) {
+      // U4 (2026-10-30): el calendario entrega YYYY-MM-DD. "Hasta" una fecha
+      // es inclusive hasta el final del dia; sin el arrastre a 23:59:59 se
+      // perderian todas las filas de esa jornada.
+      p.dt_to = /^\d{4}-\d{2}-\d{2}$/.test(p.dtTo)
+        ? p.dtTo + "T23:59:59" : p.dtTo;
+      delete p.dtTo;
+    }
     return p;
   },
   activeCount() {

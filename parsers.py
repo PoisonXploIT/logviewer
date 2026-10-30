@@ -269,6 +269,29 @@ RE_PYTHON_LOG = re.compile(
     re.IGNORECASE
 )
 
+# ---------------------------------------------------------------------------
+# J1 (2026-10-30): Java / log4j. Primera linea de una entrada:
+#   'YYYY-MM-DD HH:MM:SS,mmm LEVEL [thread] logger - mensaje'
+# (pattern log4j2 %d{yyyy-MM-dd HH:mm:ss,SSS} %p %t %c - %m). [thread] y
+# logger son opcionales; la coma de milisegundos puede faltar (se admite
+# tambien el punto) y el separador fecha/hora puede ser espacio o 'T'.
+# Los frames del stack trace ('    at ...', 'Caused by:', tabulacion) los
+# agrupa la continuacion multilinea U0.3: aqui solo se detecta la PRIMERA
+# linea, que antes caia a 'piloop'/'auto'/'raw'.
+# ---------------------------------------------------------------------------
+JAVA_LEVELS = ("FATAL", "CRITICAL", "CRIT", "ALERT", "ERROR", "ERR",
+               "WARNING", "WARN", "WRN", "SEVERE", "NOTICE", "INFO",
+               "DEBUG", "DBG", "TRACE")
+RE_JAVA = re.compile(
+    r'^(?P<date>\d{4}-\d{2}-\d{2})[ T]\s*'
+    r'(?P<time>\d{2}:\d{2}:\d{2})(?P<ms>[,.]\d{1,6})?'
+    r'\s+(?P<level>' + "|".join(JAVA_LEVELS) + r')\b'
+    r'(?:\s+\[(?P<thread>[^\]]*)\])?'
+    r'(?:\s+(?P<logger>[A-Za-z][A-Za-z0-9_.$\-]{1,120})\s*[-:])?'
+    r'\s*(?P<msg>.*)$',
+    re.IGNORECASE
+)
+
 # Syslog RFC 3164 (BSD): 'Oct 30 10:00:00 host app[1234]: mensaje'.
 # Sin anio: se pone el anio actual, igual que hace extract_ts con RE_TS_RFC3164.
 # El prefijo de prioridad '<14>' es opcional.
@@ -577,6 +600,57 @@ def iter_lines(binary, encoding):
         buf += tail
         for l in buf.split("\n"):
             yield l.rstrip("\r")
+
+
+def count_file_lines(path, chunk=1 << 20):
+    """Numero de lineas de un fichero de texto sin comprimir.
+
+    Una pasada en bloques binarios (no carga el fichero en memoria). La ultima
+    linea cuenta aunque no termine con salto de linea."""
+    total = 0
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(chunk)
+            if not block:
+                break
+            total += block.count(b"\n")
+        f.seek(os.path.getsize(path) - 1)
+        if f.read(1) not in (b"\n", b"\r", b""):   # ultima linea sin \n
+            total += 1
+    return total
+
+
+def tail_lines_from_file(path, lines=5000, encoding="utf-8", chunk=8192):
+    """Ultimas `lines` lineas de un fichero de texto, leyendo desde el final.
+
+    Version robusta de `tail_lines` (server.py): lee bloques desde el final con
+    seek y NO devuelve una primera linea cortada a mitad (descarta el bloque
+    parcial cuando el seek cae en medio de una linea). Devuelve una tupla
+    (lineas, linea_inicial) donde `linea_inicial` es el numero de linea
+    (0-based) de la primera linea devuelta dentro del fichero original, para
+    que `_line` siga apuntando al archivo real.
+    """
+    want = max(1, int(lines))
+    size = os.path.getsize(path)
+    if size == 0:
+        return [], 0
+    total = count_file_lines(path)
+    want = min(want, total)
+    tail = b""
+    offset = size
+    # Se pide una linea mas de la necesaria: la primera del bloque acumulado
+    # puede empezar a mitad de linea y se descarta al tomar las ultimas 'want'.
+    while offset > 0 and tail.count(b"\n") < want + 1:
+        start = max(0, offset - chunk)
+        with open(path, "rb") as f:
+            f.seek(start)
+            tail = f.read(offset - start) + tail
+        offset = start
+    out = tail.decode(encoding, errors="replace").splitlines()
+    out = out[-want:]
+    # La primera linea devuelta es la numero (total - want) del fichero,
+    # 0-based. Si el fichero tiene menos lineas que 'want', es la 0.
+    return out, max(0, total - want)
 
 
 class PrefixedBinaryStream:
@@ -1215,6 +1289,51 @@ def parse_python_logging(lines, progress=None):
     return rows, {"levels": levels, "ips": ips, "logger": loggers}
 
 
+def parse_java(lines, progress=None):
+    """Java/log4j: 'YYYY-MM-DD HH:MM:SS,mmm LEVEL [thread] logger - mensaje'.
+
+    [thread] y logger son opcionales; la coma de milisegundos puede faltar.
+    Lo que no matchea (frames del stack trace, continuaciones) se queda RAW
+    y se anexa a la fila anterior gracias a la continuacion U0.3.
+    Columnas extra: thread y logger.
+    """
+    rows = []
+    levels, ips, threads, loggers = Counter(), Counter(), Counter(), Counter()
+    n = len(lines)
+    for i, l in enumerate(lines):
+        m = RE_JAVA.match(l)
+        if m:
+            ts = m.group("date") + " " + m.group("time")
+            lv = _norm_level_any(m.group("level"))
+            thread = (m.group("thread") or "").strip()
+            logger = (m.group("logger") or "").strip()
+            msg = (m.group("msg") or "").strip()
+            # Sin logger queda 'ERROR - mensaje': el guion se queda en msg.
+            if msg[:1] in "-:" and (len(msg) == 1 or msg[1] in " \t"):
+                msg = msg[1:].strip()
+            if thread:
+                threads[thread] += 1
+            if logger:
+                loggers[logger] += 1
+        else:
+            lv, ts, thread, logger, msg = "RAW", "", "", "", l
+        levels[lv] += 1
+        mi = RE_IP.search(l)
+        ip = mi.group(1) if mi else ""
+        if ip:
+            ips[ip] += 1
+        rows.append({
+            "ts": ts, "ts_norm": norm_ts(ts), "level": lv, "ip": ip,
+            "method": "", "path": "", "code": "", "bytes": "",
+            "msg": msg, "raw": l, "_line": i,
+            "thread": thread, "logger": logger,
+        })
+        if progress is not None and (i % PROGRESS_STEP == 0 or i == n - 1):
+            progress(i + 1, n)
+    return rows, {"levels": levels, "ips": ips, "thread": threads,
+                  "logger": loggers}
+
+
 def parse_syslog3164(lines, progress=None):
     """Syslog RFC 3164: 'MMM d HH:MM:SS host app[pid]: mensaje' (sin anio).
 
@@ -1666,6 +1785,7 @@ PARSERS = {
     "auto": parse_auto,
     "raw": parse_raw,
     "python": parse_python_logging,
+    "java": parse_java,
     "syslog3164": parse_syslog3164,
     "logfmt": parse_logfmt,
     "trace": parse_trace,
@@ -1698,6 +1818,30 @@ def _looks_csv(sample):
     base = len(head)
     same = sum(1 for l in sample[1:] if len(_csv_fields(l, delim)) == base)
     return same >= (len(sample) - 1) * 0.7
+
+
+def _is_java_line(line):
+    """True si la linea es java/log4j y trae firma propia del formato.
+
+    RE_JAVA es laxo (thread y logger opcionales, sin milisegundos), así que
+    una linea tipo '2026-10-30 10:00:00 INFO arranque' tambien la matchea y
+    es mas honesta como 'generic'. Solo se apunta a 'java' si aparece al menos
+    una marca del pattern log4j: milisegundos, [thread] o logger con separador.
+    """
+    m = RE_JAVA.match(line)
+    if not m:
+        return False
+    return bool(m.group("ms") or m.group("thread") or m.group("logger"))
+
+
+def _is_trace_continuation(line):
+    """True si la linea parece un frame de stack trace (U0.3, sin contexto)."""
+    s = (line or "").rstrip("\r")
+    if not s.strip():
+        return False
+    if s[0] in " \t":
+        return True
+    return s.lstrip().lower().startswith(CONTINUATION_PREFIXES)
 
 
 def _is_json_line(line):
@@ -1753,6 +1897,18 @@ def detect_format(lines):
     #    traceback no llevan el prefijo, por eso el umbral es bajo).
     if share(RE_PYTHON_LOG.match) >= n * 0.4:
         return "python"
+    # 6.5 java/log4j: 'YYYY-MM-DD HH:MM:SS,mmm LEVEL [thread] logger - msg'
+    #     (>40%). Va antes de piloop y generic: la coma de milisegundos rompe
+    #     RE_LEVEL y, sin esta regla, la linea se iba a 'piloop' o 'auto'.
+    java_hits = share(_is_java_line)
+    if java_hits >= n * 0.4:
+        return "java"
+    # Muestra corta (una linea de error + los frames del stack): si todo lo
+    # demas es continuacion de trace, el formato es java aunque el umbral
+    # no se cumpla sobre 3 lineas.
+    if java_hits and all(_is_java_line(l) or _is_trace_continuation(l)
+                         for l in sample):
+        return "java"
     # 7. apache/nginx access (>40%).
     if share(match_apache) >= n * 0.4:
         return "apache"

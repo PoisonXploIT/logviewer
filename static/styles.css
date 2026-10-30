@@ -54,6 +54,13 @@
 
 * { box-sizing: border-box; }
 
+/* Scrollbars finos (en vez del default del navegador) */
+* { scrollbar-width: thin; scrollbar-color: var(--line-2) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 6px; }
+*::-webkit-scrollbar-thumb:hover { background: var(--mut); }
+*::-webkit-scrollbar-track { background: transparent; }
+
 html, body { height: 100%; }
 
 body {
@@ -201,6 +208,7 @@ body {
   flex: 1;
   display: grid;
   grid-template-columns: 220px 1fr;
+  grid-template-rows: minmax(0, 1fr);
   gap: 0;
   min-height: 0;
 }

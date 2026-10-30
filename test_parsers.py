@@ -20,6 +20,7 @@ from collections import Counter, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import api
@@ -206,10 +207,13 @@ class TestParseJSONOperVanta(unittest.TestCase):
             self.skipTest("alertas.jsonl no esta en disco")
         ds = server.load_file(path)
         self.assertEqual(ds["format"], "json")
-        rows = ds["store"].page_filtered({}, 0, 200)
+        rows = ds["store"].page_filtered({}, 0, 10000)
         self.assertTrue(rows)
         with open(path, encoding="utf-8") as f:
-            src = [json.loads(l) for l in f if l.strip()][:200]
+            src = [json.loads(l) for l in f if l.strip()]
+        # U4 (2026-10-30): el visor devuelve las filas de MAS NUEVO a MAS VIEJO,
+        # asi que se compara con el mismo orden invertido
+        src = src[-200:][::-1]
         sev_to_level = {"baja": "WRN", "media": "INF", "alta": "ERR",
                         "critica": "CRIT"}
         for r, o in zip(rows, src):
@@ -239,7 +243,9 @@ class TestParseJSONOperVanta(unittest.TestCase):
         if not os.path.exists(path):
             self.skipTest("dataset.jsonl no esta en disco")
         ds = server.load_file(path)
-        rows = ds["store"].page_filtered({}, 0, 100)
+        # U4 (2026-10-30): se miran TODAS las filas (el visor empieza por las
+        # mas recientes, ya no por las mas antiguas)
+        rows = ds["store"].page_filtered({}, 0, 5000)
         self.assertTrue(rows)
         self.assertTrue(any(r["msg"] and not r["msg"].startswith("{\"ts\"")
                             for r in rows))
@@ -463,7 +469,9 @@ class TestParseTriage(unittest.TestCase):
             self.skipTest("triage.log no esta en disco")
         ds = server.load_file(path)
         self.assertEqual(ds["format"], "triage")
-        rows = ds["store"].page_filtered({}, 0, 100)
+        # U4 (2026-10-30): la pagina 1 ya no son las 100 mas antiguas; se
+        # comprueba el dataset completo
+        rows = ds["store"].page_filtered({}, 0, 5000)
         self.assertTrue(rows)
         self.assertTrue(all(r["fuente"] for r in rows))
         self.assertTrue(all(r["firma"] for r in rows))
@@ -1416,7 +1424,7 @@ class TestFts(unittest.TestCase):
         for qval in ("alpha", "!beta", "alpha,beta", "!epsilon",
                     "alpha,!beta", "noexiste"):
             q = {"q": [qval]}
-            got = [r["msg"] for r in server.apply_filters(mem.rows, q)]
+            got = list(reversed([r["msg"] for r in server.apply_filters(mem.rows, q)]))
             want = [r["msg"] for r in sql.page_filtered(q, 0, 100)]
             self.assertEqual(got, want, qval)
 
@@ -1472,9 +1480,12 @@ class TestFilterTerms(unittest.TestCase):
         ]
 
     def _parity(self, q):
-        """MemStore y SQLite deben dar el mismo resultado."""
+        """MemStore y SQLite deben dar el mismo resultado.
+
+        U4 (2026-10-30): ambos backendos devuelven de MAS NUEVO a MAS VIEJO,
+        asi que la lista de MemStore se invierte para comparar en el mismo orden."""
         mem = server.MemStore(rows=[dict(r) for r in self._rows()])
-        got = [r["msg"] for r in server.apply_filters(mem.rows, q)]
+        got = list(reversed([r["msg"] for r in server.apply_filters(mem.rows, q)]))
         import shutil
         tmpdir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
@@ -1491,17 +1502,17 @@ class TestFilterTerms(unittest.TestCase):
 
     def test_multivalue_code(self):
         got = self._parity({"code": "200,301"})
-        self.assertEqual(got, ["uno", "dos"])
+        self.assertEqual(got, ["dos", "uno"])   # DESC: mas reciente primero
 
     def test_exclusion_ip_substring(self):
         got = self._parity({"ip": "!10.0.0.5"})
-        self.assertEqual(got, ["uno", "tres"])
+        self.assertEqual(got, ["tres", "uno"])
 
     def test_multivalue_path_and_q(self):
         got = self._parity({"path": "/a,/c"})
-        self.assertEqual(got, ["uno", "tres"])
+        self.assertEqual(got, ["tres", "uno"])
         got = self._parity({"q": "!s2"})
-        self.assertEqual(got, ["uno", "tres"])
+        self.assertEqual(got, ["tres", "uno"])
 
     def test_combined_terms(self):
         got = self._parity({"code": "200,!404"})
@@ -1647,39 +1658,40 @@ class TestFilterContract(unittest.TestCase):
 
     def test_subcadena_dentro_de_token(self):
         # FTS5 tokeniza: 'alph' no matcheaba en SQLite pero si en MemStore
-        self.assertEqual(self._compare({"q": ["alph"]}), [0, 1, 4])
-        self.assertEqual(self._compare({"q": ["lpha"]}), [0, 1, 4])
+        # U4 (2026-10-30): el orden es DESC, de mas nuevo a mas viejo
+        self.assertEqual(self._compare({"q": ["alph"]}), [4, 1, 0])
+        self.assertEqual(self._compare({"q": ["lpha"]}), [4, 1, 0])
 
     def test_frase_de_varios_tokens(self):
         # 'alpha beta' aparece literal en la fila 0; en la 4 hay 'ALPHA-BETA'
         # (con guion), que NO es la misma subcadena
         self.assertEqual(self._compare({"q": ["alpha beta"]}), [0])
-        self.assertEqual(self._compare({"q": ["alpha"]}), [0, 1, 4])
+        self.assertEqual(self._compare({"q": ["alpha"]}), [4, 1, 0])
 
     def test_case_insensitive(self):
-        self.assertEqual(self._compare({"q": ["ALPHA"]}), [0, 1, 4])
+        self.assertEqual(self._compare({"q": ["ALPHA"]}), [4, 1, 0])
         self.assertEqual(self._compare({"q": ["alpha-beta"]}), [4])
 
     def test_negaciones(self):
-        self.assertEqual(self._compare({"q": ["!beta"]}), [1, 3])
+        self.assertEqual(self._compare({"q": ["!beta"]}), [3, 1])
         self.assertEqual(self._compare({"q": ["alpha,!beta"]}), [1])
-        self.assertEqual(self._compare({"q": ["alpha,beta"]}), [0, 1, 2, 4])
+        self.assertEqual(self._compare({"q": ["alpha,beta"]}), [4, 2, 1, 0])
         self.assertEqual(self._compare({"q": ["noexiste"]}), [])
 
     def test_puntuacion_y_valores(self):
         self.assertEqual(self._compare({"q": ["pid:23160"]}), [4])
-        self.assertEqual(self._compare({"q": ["10.0.0.1"]}), [0, 4])
+        self.assertEqual(self._compare({"q": ["10.0.0.1"]}), [4, 0])
         self.assertEqual(self._compare({"q": ["/a/b"]}), [2])
 
     def test_combinado_con_level_y_code(self):
         self.assertEqual(self._compare({"q": ["alpha"], "level": ["ERR"]}), [1])
         self.assertEqual(self._compare({"q": ["alpha"], "code": ["404,500"]}), [1])
-        self.assertEqual(self._compare({"level": ["!ERR"]}), [0, 3, 4])
+        self.assertEqual(self._compare({"level": ["!ERR"]}), [4, 3, 0])
 
     def test_rango_de_fechas(self):
         self.assertEqual(self._compare(
             {"dt_from": ["2026-10-30T01:00:03"], "dt_to": ["2026-10-30T01:00:04"]}),
-            [2, 3])
+            [3, 2])
         self.assertEqual(self._compare({"dt": ["01:00:02"]}), [1])
 
     def test_q_no_usa_fts_match(self):
@@ -1732,14 +1744,17 @@ class TestLineOffsets(unittest.TestCase):
                 for i in range(3)]
         store = server.MemStore(rows=[dict(r) for r in rows])
         page = store.page_filtered({}, 0, 10)
-        self.assertEqual([r["rowid"] for r in page], [0, 1, 2])
+        # U4 (2026-10-30): el visor ordena de MAS NUEVO a MAS VIEJO, de modo
+        # que la primera fila de la pagina es la de rowid mas alto.
+        self.assertEqual([r["rowid"] for r in page], [2, 1, 0])
         # add_rows (tail) reindexa sin romper los rowids
         store.add_rows([{"ts": "", "level": "INF", "ip": "", "method": "",
                          "path": "", "code": "", "bytes": "", "msg": "b",
                          "raw": "b", "_line": 9}], {})
         page = store.page_filtered({}, 0, 10)
         self.assertEqual(len(page), 4)
-        self.assertEqual(page[3]["rowid"], 3)
+        self.assertEqual(page[0]["rowid"], 3)   # la nueva, arriba
+        self.assertEqual(page[3]["rowid"], 0)
 
     def test_sql_line_of_and_rowid(self):
         import shutil
@@ -1759,7 +1774,7 @@ class TestLineOffsets(unittest.TestCase):
         self.assertEqual(store.line_of(2), 7)
         self.assertIsNone(store.line_of(99))
         page = store.page_filtered({}, 0, 10)
-        self.assertEqual([r["rowid"] for r in page], [1, 2])
+        self.assertEqual([r["rowid"] for r in page], [2, 1])  # DESC (U4)
 
     def test_read_context_lines(self):
         fd, path = tempfile.mkstemp()
@@ -2434,6 +2449,231 @@ class TestSessionSecretPersisted(unittest.TestCase):
             self.assertIn("persistido", security.SESSION_SECRET_SOURCE)
             self.assertEqual(security.SESSION_SECRET,
                              security.load_session_secret()[0])
+
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey, Ed25519PublicKey)
+    _CF_CRYPTO = True
+except ImportError:      # sin la libreria, la suite sigue verde: se saltan
+    Ed25519PrivateKey = Ed25519PublicKey = None
+    _CF_CRYPTO = False
+
+
+def _b64url_no_pad(data):
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _cf_jwt(private_key, kid, aud, exp, email, alg="Ed25519"):
+    """Monta un JWT firmado con Ed25519, como hace Cloudflare Access."""
+    header = _b64url_no_pad(json.dumps({"alg": alg, "kid": kid}).encode("utf-8"))
+    payload = _b64url_no_pad(json.dumps({"aud": aud, "exp": exp, "email": email,
+                                         "sub": "cf-user"}).encode("utf-8"))
+    sig = _b64url_no_pad(private_key.sign((header + "." + payload).encode("utf-8")))
+    return header + "." + payload + "." + sig
+
+
+class TestCloudflareAccessJwt(unittest.TestCase):
+    """S1 (2026-10-30): validacion REAL del JWT de Cloudflare Access (Ed25519).
+
+    Las claves se inyectan en el cache (security.load_cf_certs(certs=...)) para
+    no depender de la red: la URL real de los certs no se toca en los tests."""
+
+    def setUp(self):
+        self._saved = (security.CF_ACCESS_TEAM, security.CF_ACCESS_AUD,
+                       dict(security.CF_CERTS), security.CF_CERTS_FETCHED_AT,
+                       security.CF_ACCESS_WARNED)
+        self.priv = Ed25519PrivateKey.generate()
+        self.other = Ed25519PrivateKey.generate()
+        self.kid = "kid-test-1"
+        security.CF_ACCESS_TEAM = "sammideblas"
+        security.CF_ACCESS_AUD = "AUD-LOGVIEWER"
+        security.load_cf_certs(certs={self.kid: self.priv.public_key()})
+
+    def tearDown(self):
+        (security.CF_ACCESS_TEAM, security.CF_ACCESS_AUD, security.CF_CERTS,
+         security.CF_CERTS_FETCHED_AT, security.CF_ACCESS_WARNED) = self._saved
+
+    def _handler(self, headers):
+        h = object.__new__(server.Handler)
+        h.headers = headers
+        h.client_address = ("1.2.3.4", 12345)
+        return h
+
+    def test_enabled_con_team_y_aud(self):
+        self.assertTrue(security.cf_access_enabled())
+        security.CF_ACCESS_AUD = ""
+        self.assertFalse(security.cf_access_enabled())
+        self.assertFalse(security.verify_cf_access_jwt("x.y.z")["ok"])
+
+    def test_url_de_certs_normalizada(self):
+        self.assertEqual(security.cf_certs_url("sammideblas"),
+                         "https://sammideblas.cloudflareaccess.com/cdn-cgi/access/certs")
+        self.assertEqual(security.cf_certs_url("sammideblas.cloudflareaccess.com"),
+                         "https://sammideblas.cloudflareaccess.com/cdn-cgi/access/certs")
+        self.assertEqual(security.cf_certs_url(""), "")
+
+    def test_jwt_valido_la_identidad_es_el_email(self):
+        token = _cf_jwt(self.priv, self.kid, [security.CF_ACCESS_AUD],
+                        int(time.time()) + 600, "sammi@example.com")
+        result = security.verify_cf_access_jwt(token)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["user"], "sammi@example.com")
+        h = self._handler({"Cf-Access-Jwt-Assertion": token,
+                           "Cf-Access-Authenticated-User-Email": "suplantado@evil.com"})
+        self.assertEqual(h._user(), "sammi@example.com")
+        # la cookie emitida lleva la identidad real, no el header
+        self.assertEqual(server.verify_session_cookie(h._pending_session_cookie),
+                         "sammi@example.com")
+
+    def test_aud_como_cadena_tambien_vale(self):
+        token = _cf_jwt(self.priv, self.kid, security.CF_ACCESS_AUD,
+                        int(time.time()) + 600, "a@b.com")
+        self.assertTrue(security.verify_cf_access_jwt(token)["ok"])
+
+    def test_firma_mala_rechazado(self):
+        token = _cf_jwt(self.other, self.kid, [security.CF_ACCESS_AUD],
+                        int(time.time()) + 600, "evil@evil.com")
+        result = security.verify_cf_access_jwt(token)
+        self.assertFalse(result["ok"])
+        self.assertIn("firma", result["reason"])
+        h = self._handler({"Cf-Access-Jwt-Assertion": token,
+                           "Cf-Access-Authenticated-User-Email": "evil@evil.com"})
+        self.assertEqual(h._user(), "local")   # NO se usa el header
+        self.assertIsNone(getattr(h, "_pending_session_cookie", None))
+        self.assertTrue(any(e.get("action") == "cf_jwt_invalid"
+                            for e in api.audit_list()))
+
+    def test_exp_vencido_rechazado(self):
+        token = _cf_jwt(self.priv, self.kid, [security.CF_ACCESS_AUD],
+                        int(time.time()) - 60, "sammi@example.com")
+        result = security.verify_cf_access_jwt(token)
+        self.assertFalse(result["ok"])
+        self.assertIn("caducado", result["reason"])
+        self.assertEqual(self._handler({"Cf-Access-Jwt-Assertion": token})._user(),
+                         "local")
+
+    def test_aud_incorrecto_rechazado(self):
+        token = _cf_jwt(self.priv, self.kid, ["AUD-OTRO-POLITICA"],
+                        int(time.time()) + 600, "sammi@example.com")
+        result = security.verify_cf_access_jwt(token)
+        self.assertFalse(result["ok"])
+        self.assertIn("aud", result["reason"])
+        self.assertEqual(self._handler({"Cf-Access-Jwt-Assertion": token})._user(),
+                         "local")
+
+    def test_kid_desconocido_rechazado(self):
+        token = _cf_jwt(self.priv, "kid-que-no-existe", [security.CF_ACCESS_AUD],
+                        int(time.time()) + 600, "sammi@example.com")
+        result = security.verify_cf_access_jwt(token)
+        self.assertFalse(result["ok"])
+        self.assertIn("kid", result["reason"])
+        # el cache de claves no se vacia aunque la descarga de certs falle
+        self.assertIn(self.kid, security.CF_CERTS)
+
+    def test_jwt_malformado_rechazado(self):
+        for bad in ("no-es-un-jwt", "a.b", "", None, "xxx.yyy.zzz"):
+            self.assertFalse(security.verify_cf_access_jwt(bad)["ok"])
+
+    def test_jwt_sin_email_rechazado(self):
+        header = _b64url_no_pad(json.dumps({"alg": "Ed25519",
+                                           "kid": self.kid}).encode("utf-8"))
+        payload = _b64url_no_pad(json.dumps({"aud": [security.CF_ACCESS_AUD],
+                                            "exp": int(time.time()) + 600}).encode("utf-8"))
+        sig = _b64url_no_pad(self.priv.sign((header + "." + payload).encode("utf-8")))
+        result = security.verify_cf_access_jwt(header + "." + payload + "." + sig)
+        self.assertFalse(result["ok"])
+        self.assertIn("email", result["reason"])
+
+    def test_cookie_firmada_sigue_valiendo_con_jwt_invalido(self):
+        cookie = server.make_session_cookie("real@corp.com")
+        token = _cf_jwt(self.other, self.kid, [security.CF_ACCESS_AUD],
+                        int(time.time()) + 600, "evil@evil.com")
+        h = self._handler({"Cf-Access-Jwt-Assertion": token,
+                           "Cookie": "lv_session=" + cookie,
+                           "Cf-Access-Authenticated-User-Email": "suplantado@evil.com"})
+        self.assertEqual(h._user(), "real@corp.com")
+
+    def test_require_cf_exige_jwt_valido(self):
+        security.REQUIRE_CF = True
+        try:
+            token = _cf_jwt(self.priv, self.kid, [security.CF_ACCESS_AUD],
+                            int(time.time()) + 600, "sammi@example.com")
+            self.assertTrue(self._handler({"Cf-Access-Jwt-Assertion": token})._cf_ok())
+            bad = _cf_jwt(self.other, self.kid, [security.CF_ACCESS_AUD],
+                          int(time.time()) + 600, "evil@evil.com")
+            self.assertFalse(self._handler({"Cf-Access-Jwt-Assertion": bad})._cf_ok())
+            self.assertFalse(self._handler(
+                {"Cf-Access-Authenticated-User-Email": "a@b.com"})._cf_ok())
+        finally:
+            security.REQUIRE_CF = False
+
+    def test_sin_cf_access_team_mantiene_el_fallback_hmac(self):
+        security.CF_ACCESS_TEAM = ""
+        security.CF_ACCESS_AUD = ""
+        cookie = server.make_session_cookie("cookie@corp.com")
+        h = self._handler({"Cookie": "lv_session=" + cookie,
+                           "Cf-Access-Authenticated-User-Email": "a@b.com"})
+        self.assertEqual(h._user(), "cookie@corp.com")
+        h2 = self._handler({"Cf-Access-Authenticated-User-Email": "a@b.com"})
+        self.assertEqual(h2._user(), "a@b.com")          # valor no confiable
+        self.assertEqual(server.verify_session_cookie(h2._pending_session_cookie),
+                         "a@b.com")
+        self.assertFalse(security.verify_cf_access_jwt("x.y.z")["ok"])
+
+    def test_avisa_una_sola_vez_si_no_se_puede_validar(self):
+        security.CF_ACCESS_TEAM = ""
+        security.CF_ACCESS_AUD = ""
+        before = sum(1 for e in api.audit_list()
+                     if e.get("action") == "cf_jwt_not_verified")
+        for _ in range(3):
+            self._handler({"Cf-Access-Jwt-Assertion": "x.y.z",
+                           "Cf-Access-Authenticated-User-Email": "a@b.com"})._user()
+        after = sum(1 for e in api.audit_list()
+                    if e.get("action") == "cf_jwt_not_verified")
+        self.assertEqual(after - before, 1)
+
+    def test_status_y_fallo_de_red_no_rompen_el_arranque(self):
+        status = security.cf_access_status()
+        self.assertTrue(status["enabled"])
+        self.assertIn("JWT de Access validado", status["message"])
+        # una URL inalcanzable no lanza: devuelve {} y el JWT se rechaza
+        self.assertEqual(security._fetch_cf_certs("http://127.0.0.1:9/x"), {})
+        self.assertFalse(security.verify_cf_access_jwt("a.b.c")["ok"])
+
+    def test_certs_reales_se_parsean_del_json_de_access(self):
+        # Simula el JSON que publica /cdn-cgi/access/certs: kid + cert hex.
+        raw = self.priv.public_key().public_bytes_raw()
+        payload = json.dumps({"keys": [{"kid": "kid-hex", "cert": raw.hex()}],
+                              "max_age": 86400}).encode("utf-8")
+        class FakeResp:
+            def read(self):
+                return payload
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+        real_urlopen = security.urllib.request.urlopen
+        security.urllib.request.urlopen = lambda *a, **k: FakeResp()
+        try:
+            certs = security._fetch_cf_certs("https://fake.cloudflareaccess.com/cdn-cgi/access/certs")
+        finally:
+            security.urllib.request.urlopen = real_urlopen
+        self.assertIn("kid-hex", certs)
+        self.assertIsInstance(certs["kid-hex"], Ed25519PublicKey)
+        # se cargan en el cache (como haria load_cf_certs tras la descarga real)
+        security.load_cf_certs(certs=certs)
+        token = _cf_jwt(self.priv, "kid-hex", [security.CF_ACCESS_AUD],
+                        int(time.time()) + 600, "sammi@example.com")
+        self.assertTrue(security.verify_cf_access_jwt(token)["ok"])
+
+    def test_rotacion_de_claves_se_refresca_el_cache(self):
+        security.load_cf_certs(certs={})
+        token = _cf_jwt(self.priv, self.kid, [security.CF_ACCESS_AUD],
+                        int(time.time()) + 600, "sammi@example.com")
+        self.assertFalse(security.verify_cf_access_jwt(token)["ok"])
+        security.load_cf_certs(certs={self.kid: self.priv.public_key()})
+        self.assertTrue(security.verify_cf_access_jwt(token)["ok"])
 
 
 class TestRateLimit(unittest.TestCase):
@@ -3610,7 +3850,10 @@ class TestKeysetPagination(unittest.TestCase):
             if not b:
                 break
             out.extend(b)
-            last = max(last, b[-1]["rowid"])
+            # U4 (2026-10-30): el lote va en DESC, asi que el borde del
+            # siguiente es el rowid de la ULTIMA fila devuelta (la mas antigua
+            # del lote). Con max() el bound no avanzaba y el export no terminaba.
+            last = b[-1]["rowid"]
         return out
 
     def test_mem_keyset_igual_a_offset(self):
@@ -3714,7 +3957,10 @@ class TestKeysetPagination(unittest.TestCase):
             server.SESSIONS.get("local", {}).pop(ds["name"], None)
         rows = [l for l in body.splitlines() if l]
         self.assertEqual(len(rows), n + 1, "cabecera + %d filas" % n)
-        self.assertIn("fila %d" % (n - 1), rows[-1])
+        # U4 (2026-10-30): el export sale de MAS NUEVO a MAS VIEJO: la primera
+        # fila de datos es la ultima del archivo y la ultima es la primera.
+        self.assertIn("fila %d" % (n - 1), rows[1])
+        self.assertIn("fila 0", rows[-1])
 
     def test_tail_escribe_dentro_del_lock(self):
         """P1.2 (bug B6): la escritura al store va en el mismo LOCK que ds['total']."""
@@ -4080,6 +4326,136 @@ class TestFollowFileAllowlist(unittest.TestCase):
         finally:
             config.TAIL_POLL = old_poll
             srv.shutdown()
+
+    # --- S2 (2026-10-30): 'seguir archivo' SOLO desde loopback -------------
+    # El gate de loopback se comprueba de dos formas: el helper unitario y una
+    # peticion real cuyo client_address se fuerza a una IP no-loopback.
+    class _FakeHandler:
+        def __init__(self, addr):
+            self.client_address = addr
+
+    class _RemoteServer(ThreadingHTTPServer):
+        """Servidor que atiende la peticion como si viniera de una IP remota.
+
+        finish_request es el punto donde socketserver pasa el client_address
+        real al handler; aqui se sustituye por una IP publica de ejemplo
+        (203.0.113.7, rango documentation de RFC 5737) para simular el
+        cliente remoto de Railway/Cloudflare sin salir de la maquina."""
+        def finish_request(self, request, client_address):
+            # BaseHandler.__init__(request, client_address, server): el segundo
+            # argumento es el client_address, no la direccion del servidor.
+            self.RequestHandlerClass(request, ("203.0.113.7", 44444), self)
+
+    def _remote_srv(self):
+        srv = self._RemoteServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    def _get(self, base, path):
+        try:
+            with urllib.request.urlopen(base + path, timeout=20) as r:
+                return r.status, json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode("utf-8", "replace"))
+
+    def test_helper_client_is_loopback(self):
+        F = TestFollowFileAllowlist._FakeHandler
+        for addr in (("127.0.0.1", 80), ("::1", 80), ("localhost", 80),
+                     ("127.0.0.42", 80)):
+            self.assertTrue(server._client_is_loopback(F(addr)),
+                            "%s debe considerarse loopback" % (addr,))
+        for addr in (("203.0.113.7", 80), ("10.0.0.5", 80), ("81.203.1.9", 80),
+                     (None, 80)):
+            self.assertFalse(server._client_is_loopback(F(addr)),
+                             "%s no es loopback" % (addr,))
+
+    def test_config_follow_por_cliente(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        os.environ["LOGVIEWER_TAIL_DIRS"] = d
+        self.assertTrue(server.public_config(client_host="127.0.0.1")["follow"])
+        self.assertTrue(server.public_config(client_host="::1")["follow"])
+        self.assertTrue(server.public_config()["follow"],
+                        "sin cliente (uso interno) se considera local")
+        self.assertFalse(server.public_config(client_host="203.0.113.7")["follow"])
+        self.assertFalse(server.public_config(client_host="10.0.0.5")["follow"])
+        os.environ.pop("LOGVIEWER_TAIL_DIRS", None)
+        self.assertFalse(server.public_config(client_host="127.0.0.1")["follow"],
+                         "sin allowlist sigue siendo False aunque sea local")
+
+    def test_open_file_desde_ip_remota_da_403(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "a.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("2026-10-30 01:12:33 vigilante: ok buzon\n")
+        # Allowlist definida: el 403 viene del gate de loopback, no de la
+        # allowlist (que es la segunda capa).
+        os.environ["LOGVIEWER_TAIL_DIRS"] = d
+        srv = self._remote_srv()
+        try:
+            code, data = self._post("http://127.0.0.1:%d" % srv.server_port,
+                                    "/api/open-file", {"path": path})
+            self.assertEqual(code, 403)
+            self.assertIn("loopback", data["error"])
+        finally:
+            srv.shutdown()
+
+    def test_config_desde_ip_remota_reporta_follow_false(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        os.environ["LOGVIEWER_TAIL_DIRS"] = d
+        srv = self._remote_srv()
+        try:
+            code, data = self._get("http://127.0.0.1:%d" % srv.server_port,
+                                   "/api/config")
+            self.assertEqual(code, 200)
+            self.assertFalse(data["follow"])
+        finally:
+            srv.shutdown()
+
+    def test_watch_de_follow_desde_ip_remota_da_403(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        os.environ["LOGVIEWER_TAIL_DIRS"] = d
+        name = "remoto-follow.log"
+        with server.LOCK:
+            server.SESSIONS.setdefault("local", {})[name] = {
+                "follow": True, "orig_path": os.path.join(d, "a.log"),
+                "total": 0, "format": "piloop", "encoding": "utf-8"}
+        srv = self._remote_srv()
+        try:
+            code, data = self._post("http://127.0.0.1:%d" % srv.server_port,
+                                    "/api/watch", {"name": name,
+                                                   "enabled": True})
+            self.assertEqual(code, 403)
+            self.assertIn("loopback", data["error"])
+        finally:
+            srv.shutdown()
+            with server.LOCK:
+                server.SESSIONS.get("local", {}).pop(name, None)
+
+    def test_watch_de_follow_desde_loopback_sigue_permitido(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        os.environ["LOGVIEWER_TAIL_DIRS"] = d
+        name = "local-follow.log"
+        with server.LOCK:
+            server.SESSIONS.setdefault("local", {})[name] = {
+                "follow": True, "orig_path": os.path.join(d, "a.log"),
+                "total": 0, "format": "piloop", "encoding": "utf-8"}
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            code, data = self._post("http://127.0.0.1:%d" % srv.server_port,
+                                    "/api/watch", {"name": name,
+                                                   "enabled": True})
+            self.assertEqual(code, 200)
+            self.assertTrue(data["enabled"])
+        finally:
+            srv.shutdown()
+            with server.LOCK:
+                server.SESSIONS.get("local", {}).pop(name, None)
 
 
 class TestUiA11yP32(unittest.TestCase):
@@ -4737,7 +5113,9 @@ class TestDetectFormatU11(unittest.TestCase):
             "    at com.example.Main.main(Main.java:17)",
             "2026-10-30 09:12:02.456 INFO com.example.Main - reintentando",
         ]
-        self.assertEqual(server.detect_format(sample), "generic")
+        # J1 (2026-10-30): el milisegundo y el logger delatan el pattern
+        # log4j, asi que ahora se detecta como 'java' (antes 'generic').
+        self.assertEqual(server.detect_format(sample), "java")
 
     def test_xml_no_cae_a_raw(self):
         sample = [
@@ -5494,8 +5872,10 @@ class TestJavaTraceU31(unittest.TestCase):
         "2026-10-30 09:12:07 DEBUG com.example.Main - contexto: 42 filas",
     ]
 
-    def test_detect_generic_del_trace_java(self):
-        self.assertEqual(server.detect_format(self.TRACE), "generic")
+    def test_detect_java_del_trace_java(self):
+        # J1 (2026-10-30): con el parser java, estas lineas ya no son
+        # 'generic': llevan logger y separador '-', firma del pattern log4j.
+        self.assertEqual(server.detect_format(self.TRACE), "java")
 
     def test_trace_en_una_sola_fila(self):
         rows, counters = server.parse_generic(self.TRACE)
@@ -5536,7 +5916,7 @@ class TestJavaTraceU31(unittest.TestCase):
             f.write("\n".join(self.TRACE) + "\n")
         ds = server.load_file(path, user="local")
         self.addCleanup(lambda: server.SESSIONS.get("local", {}).pop(ds["name"], None))
-        self.assertEqual(ds["format"], "generic")
+        self.assertEqual(ds["format"], "java")
         rows = ds["store"].rows
         self.assertEqual(len(rows), 4)
         self.assertIn("at com.example.Main.main", rows[0]["raw"])
@@ -5904,6 +6284,412 @@ class TestSmokeU32(unittest.TestCase):
         mem = server.MemStore(rows=[dict(r) for r in rows])
         got = mem.histogram({})
         self.assertEqual(got, [{"t": "2026-10-30T10:00", "count": 1}])
+
+
+class TestJavaLog4jJ1(unittest.TestCase):
+    """J1 (2026-10-30): parser java/log4j.
+
+    Primera linea de una entrada: 'YYYY-MM-DD HH:MM:SS,mmm LEVEL [thread]
+    logger - mensaje'. [thread] y logger son opcionales, la coma de
+    milisegundos puede faltar. Los frames del stack los agrupa U0.3.
+    """
+
+    LOG4J = [
+        "2026-10-30 09:12:01,482 ERROR [main] com.example.Main - fallo en el parseo",
+        "    at com.example.LogParser.parse(LogParser.java:42)",
+        "    at com.example.Main.main(Main.java:17)",
+        "Caused by: java.io.IOException: stream cerrado",
+        "    at java.io.InputStream.read(InputStream.java:101)",
+        "2026-10-30 09:12:05,001 INFO [pool-1] com.example.Main - reintentando",
+        "2026-10-30 09:12:06,330 WARN com.example.Main - reintento 1 de 3",
+        "2026-10-30 09:12:07 TRACE - contexto: 42 filas",
+        "2026-10-30 09:12:08,900 FATAL [http-1] - el servicio no responde",
+    ]
+
+    def test_java_en_parsers(self):
+        self.assertIn("java", server.PARSERS)
+        self.assertIs(server.PARSERS["java"], server.parse_java)
+
+    def test_detect_java_con_coma_y_thread(self):
+        self.assertEqual(server.detect_format(self.LOG4J), "java")
+
+    def test_detect_java_sin_coma(self):
+        sample = ["2026-10-30 10:00:00 ERROR com.acme.App - algo falla"] * 5
+        self.assertEqual(server.detect_format(sample), "java")
+
+    def test_detect_java_sin_logger_ni_thread(self):
+        sample = ["2026-10-30 10:00:00,500 WARN - disco casi lleno"] * 5
+        self.assertEqual(server.detect_format(sample), "java")
+
+    def test_muestra_corta_no_cae_a_raw(self):
+        # Una linea de error + dos frames: el umbral del 40% no se cumple
+        # sobre 3 lineas, pero todo lo demas es continuacion del trace.
+        sample = [
+            "2026-10-30 09:12:01,482 ERROR [main] com.example.Main - boom",
+            "    at com.example.Main.main(Main.java:17)",
+            "Caused by: java.io.IOException: stream cerrado",
+        ]
+        self.assertEqual(server.detect_format(sample), "java")
+
+    def test_sin_firma_java_sigue_generic(self):
+        # 'fecha hora NIVEL mensaje' sin milisegundos, thread ni logger es
+        # indistinguible del formato generic: se queda en generic.
+        self.assertEqual(server.detect_format(["2026-10-30 10:00:00 INFO arranque"] * 5),
+                         "generic")
+
+    def test_ts_y_level_de_la_primera_linea(self):
+        rows, counters = server.parse_java(self.LOG4J)
+        r = rows[0]
+        self.assertEqual(r["ts"], "2026-10-30 09:12:01")
+        self.assertEqual(r["ts_norm"], "2026-10-30T09:12:01")
+        self.assertEqual(r["level"], "ERR")
+        self.assertEqual(r["thread"], "main")
+        self.assertEqual(r["logger"], "com.example.Main")
+        self.assertEqual(r["msg"], "fallo en el parseo")
+        self.assertEqual(counters["levels"]["ERR"], 1)
+        self.assertEqual(counters["thread"]["main"], 1)
+
+    def test_niveles_normalizados(self):
+        rows, _ = server.parse_java(self.LOG4J)
+        got = [r["level"] for r in rows if r["level"] != "RAW"]
+        self.assertEqual(got, ["ERR", "INF", "WRN", "DBG", "CRIT"])
+
+    def test_frames_del_stack_quedan_raw(self):
+        rows, _ = server.parse_java(self.LOG4J)
+        self.assertEqual(rows[1]["level"], "RAW")
+        self.assertEqual(rows[1]["ts"], "")
+        self.assertIn("at com.example.LogParser.parse", rows[1]["msg"])
+
+    def test_continuaciones_se_anexan_a_la_linea_java(self):
+        rows, counters = server.parse_java(self.LOG4J)
+        merged = server.attach_continuations(rows, counters)
+        self.assertEqual(len(merged), 5)
+        first = merged[0]
+        self.assertEqual(first["level"], "ERR")
+        for frame in ("at com.example.LogParser.parse", "Caused by: java.io.IOException"):
+            self.assertIn(frame, first["raw"], frame)
+            self.assertIn(frame, first["msg"], frame)
+        self.assertEqual(sum(counters["levels"].values()), 5)
+
+    def test_separador_T_y_punto_de_milisegundos(self):
+        rows, _ = server.parse_java(["2026-10-30T10:11:50.123 ERROR [t1] - x"])
+        self.assertEqual(rows[0]["ts"], "2026-10-30 10:11:50")
+        self.assertEqual(rows[0]["level"], "ERR")
+        self.assertEqual(rows[0]["thread"], "t1")
+        self.assertEqual(rows[0]["msg"], "x")
+
+    def test_ip_en_el_mensaje_java(self):
+        rows, counters = server.parse_java(
+            ["2026-10-30 10:00:00,100 ERROR [main] com.acme.Net - timeout de 192.168.1.7"])
+        self.assertEqual(rows[0]["ip"], "192.168.1.7")
+        self.assertEqual(counters["ips"]["192.168.1.7"], 1)
+
+    def test_filtros_por_nivel_y_fecha(self):
+        rows, _ = server.parse_java(self.LOG4J)
+        self.assertEqual(len(server.apply_filters(rows, {"level": ["ERR"]})), 1)
+        self.assertEqual(len(server.apply_filters(rows, {"dt_from": "2026-10-30",
+                                                         "dt_to": "2026-10-31"})), 5)
+        got = server.apply_filters(rows, {"level": "WRN,CRIT"})
+        self.assertEqual(len(got), 2)
+        self.assertEqual([r["level"] for r in got], ["WRN", "CRIT"])
+
+    def test_load_file_end_to_end_java(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "app.log4j.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.LOG4J) + "\n")
+        ds = server.load_file(path, user="local")
+        self.addCleanup(lambda: server.SESSIONS.get("local", {}).pop(ds["name"], None))
+        self.assertEqual(ds["format"], "java")
+        # 'total' son las lineas del fichero; las 4 de trace se anexan a la
+        # primera fila, de modo que quedan 5 filas en el store.
+        self.assertEqual(ds["total"], 9)
+        self.assertEqual(ds["store"].total_rows(), 5)
+
+
+class TestTailLoadT1(unittest.TestCase):
+    """T1 (2026-10-30): 'seguir archivo' carga solo las ultimas N lineas."""
+
+    def _write(self, name, text):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, name)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        return path
+
+    def test_tail_lines_from_file_ultima_n(self):
+        path = self._write("a.log", "\n".join("linea %d" % i for i in range(100)) + "\n")
+        tail, start = server.tail_lines_from_file(path, 10)
+        self.assertEqual(len(tail), 10)
+        self.assertEqual(tail[0], "linea 90")
+        self.assertEqual(tail[-1], "linea 99")
+        self.assertEqual(start, 90)   # linea 0-based en el fichero real
+
+    def test_tail_lines_from_file_no_corta_la_primera(self):
+        # Con un bloque pequeno el seek cae a mitad de linea: la primera
+        # devuelta tiene que ser una linea completa, no un trozo.
+        path = self._write("b.log", "\n".join("x" * 40 + str(i) for i in range(50)) + "\n")
+        tail, start = server.tail_lines_from_file(path, 3, chunk=17)
+        self.assertEqual(len(tail), 3)
+        self.assertEqual(tail[0], "x" * 40 + "47")
+        self.assertEqual(start, 47)
+
+    def test_tail_lines_from_file_mas_lineas_de_las_que_hay(self):
+        path = self._write("c.log", "una\ndos\ntres\n")
+        tail, start = server.tail_lines_from_file(path, 5000)
+        self.assertEqual(tail, ["una", "dos", "tres"])
+        self.assertEqual(start, 0)
+
+    def test_tail_lines_from_file_sin_salto_final(self):
+        path = self._write("d.log", "uno\ndos\ntres")
+        tail, start = server.tail_lines_from_file(path, 2)
+        self.assertEqual(tail, ["dos", "tres"])
+        self.assertEqual(start, 1)
+        self.assertEqual(server.count_file_lines(path), 3)
+
+    def test_tail_lines_from_file_vacio(self):
+        path = self._write("e.log", "")
+        self.assertEqual(server.tail_lines_from_file(path, 10), ([], 0))
+
+    def test_tail_load_carga_solo_lo_reciente(self):
+        old = "\n".join("2026-10-12 09:00:00 INFO vieja %d" % i for i in range(2000))
+        new = "\n".join("2026-10-30 10:00:00 INFO nueva %d" % i for i in range(1000))
+        path = self._write("mix.log", old + "\n" + new + "\n")
+        ds = api.tail_load_file(path, 1000, user="local")
+        self.addCleanup(lambda: api.SESSIONS.get("local", {}).pop(ds["name"], None))
+        self.assertTrue(ds["tail"])          # flag: carga por tail
+        self.assertEqual(ds["total"], 1000)  # solo el tail, no las 3000
+        self.assertEqual(ds["file_total_lines"], 3000)
+        self.assertEqual(ds["tail_start_line"], 2000)
+        rows = ds["store"].all_rows() if hasattr(ds["store"], "all_rows") else ds["store"].rows
+        self.assertEqual(len(rows), 1000)
+        self.assertEqual(rows[0]["ts_norm"][:10], "2026-10-30")
+        # _line sigue siendo la linea ABSOLUTA del fichero original
+        self.assertEqual(rows[0]["_line"], 2000)
+        self.assertEqual(rows[-1]["_line"], 2999)
+        for key in ("_search", "template", "ts_norm", "level", "msg"):
+            self.assertIn(key, rows[0])
+
+    def test_tail_load_anade_filas_nuevas_con_numeracion_absoluta(self):
+        path = self._write("seg.log", "\n".join(
+            "2026-10-30 10:00:%02d INFO base %d" % (i, i) for i in range(10)) + "\n")
+        ds = api.tail_load_file(path, 5, user="local")
+        self.addCleanup(lambda: api.SESSIONS.get("local", {}).pop(ds["name"], None))
+        self.assertEqual(ds["total"], 5)
+        self.assertEqual(ds["tail_start_line"], 5)   # fichero de 10 lineas
+        self.assertEqual(ds["line_base"], 10)        # linea absoluta siguiente
+        w = server.Watcher(ds["name"], path, ds["encoding"])
+        w.reset(seek_end=True)
+        with open(path, "a", encoding="utf-8", newline="") as f:
+            f.write("2026-10-30 10:00:99 INFO nueva 1\n2026-10-30 10:01:00 INFO nueva 2\n")
+        w._poll_once()
+        lines = list(w.buffer)
+        rows, counters = api.tail_parse(ds, lines)
+        base = ds["line_base"]
+        for r in rows:
+            r["_line"] = base + r.pop("_line", 0)
+        ds["store"].add_rows(rows, counters)
+        ds["total"] += len(lines)
+        ds["line_base"] = base + len(lines)
+        self.assertEqual(ds["total"], 7)
+        self.assertEqual(rows[0]["_line"], 10)   # lineas absolutas 10 y 11
+        self.assertEqual(rows[-1]["_line"], 11)
+        self.assertEqual(ds["line_base"], 12)
+
+    def test_tail_load_comprimido(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "hist.gz")
+        body = "\n".join("2026-10-%02d 08:00:00 INFO linea %d" % (12 + i // 500, i)
+                         for i in range(2000)) + "\n"
+        with gzip.open(path, "wb") as f:
+            f.write(body.encode("utf-8"))
+        ds = api.tail_load_file(path, 300, user="local")
+        self.addCleanup(lambda: api.SESSIONS.get("local", {}).pop(ds["name"], None))
+        self.assertEqual(ds["compressed"], "gzip")
+        self.assertEqual(ds["total"], 300)
+        self.assertEqual(ds["tail_start_line"], 1700)
+        self.assertEqual(ds["format"], "generic")
+
+    def test_open_file_usa_tail(self):
+        src = inspect.getsource(api.Handler._open_file)
+        # U4 (2026-10-30): se revierte el tail de T1. 'Seguir archivo' carga el
+        # archivo COMPLETO (todo el historial) y el watcher solo recoge lo nuevo.
+        self.assertIn("ds = load_file(ap", src)
+        self.assertNotIn("ds = tail_load_file(", src)
+
+    def test_tail_load_respeta_el_umbral_de_formato(self):
+        # Un W3C tiene la cabecera #Fields al principio: el tail no la ve,
+        # pero las columnas se recuperan del principio del fichero.
+        head = "#Version: 1.0\n#Fields: date time c-ip cs-method cs-uri sc-status\n"
+        old = "\n".join("2026-10-12 01:02:03 1.2.3.4 GET /vieja 200" for _ in range(500))
+        new = "\n".join("2026-10-30 01:02:03 1.2.3.4 GET /nueva 200" for _ in range(50))
+        path = self._write("w3c.log", head + old + "\n" + new + "\n")
+        ds = api.tail_load_file(path, 50, user="local")
+        self.addCleanup(lambda: api.SESSIONS.get("local", {}).pop(ds["name"], None))
+        self.assertEqual(ds["format"], "w3c")
+        self.assertEqual(ds["w3c_fields"], ["date", "time", "c-ip", "cs-method",
+                                           "cs-uri", "sc-status"])
+        self.assertEqual(ds["total"], 50)
+        self.assertEqual(ds["tail_start_line"], 502)   # 2 de cabecera + 500 viejas
+        rows = ds["store"].rows
+        self.assertEqual(rows[0]["path"], "/nueva")
+        self.assertEqual(rows[0]["_line"], 502)
+
+
+class TestOrdenDescU4(unittest.TestCase):
+    """U4 (2026-10-30): el visor ordena de MAS NUEVO a MAS VIEJO.
+
+    La fila mas reciente va arriba y el historial completo sigue accesible
+    pagando hacia abajo. Aplica a la tabla, al export (keyset) y al tail."""
+
+    def _rows(self, n=20):
+        return [{"ts": "2026-10-%02d 10:00:00" % (i % 30 + 1),
+                 "level": "INF" if i % 2 else "ERR",
+                 "ip": "1.1.1.%d" % (i % 250), "msg": "fila %d" % i,
+                 "raw": "raw %d" % i, "_line": i} for i in range(n)]
+
+    def test_mem_page_filtered_desc(self):
+        store = server.MemStore([dict(r) for r in self._rows()])
+        page = store.page_filtered({}, 0, 5)
+        self.assertEqual([r["msg"] for r in page],
+                         ["fila 19", "fila 18", "fila 17", "fila 16", "fila 15"])
+        self.assertEqual([r["rowid"] for r in page], [19, 18, 17, 16, 15])
+        # El historial NO se recorta: pagando se llega a la mas antigua
+        out, start = [], 0
+        while True:
+            chunk = store.page_filtered({}, start, 5)
+            if not chunk:
+                break
+            out.extend(chunk)
+            start += 5
+        self.assertEqual(len(out), 20)
+        self.assertEqual(out[-1]["msg"], "fila 0")
+        self.assertEqual(store.count_filtered({}), 20)
+
+    def test_sql_page_filtered_desc(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        store = server.SqlStore(os.path.join(d, "desc.db"))
+        self.addCleanup(store.close)
+        store.add_rows([dict(r) for r in self._rows()], {})
+        page = store.page_filtered({}, 0, 5)
+        self.assertEqual([r["msg"] for r in page],
+                         ["fila 19", "fila 18", "fila 17", "fila 16", "fila 15"])
+        self.assertEqual([r["rowid"] for r in page], [20, 19, 18, 17, 16])
+        # Segunda pagina: continua donde acaba la primera
+        self.assertEqual([r["msg"] for r in store.page_filtered({}, 5, 5)],
+                         ["fila 14", "fila 13", "fila 12", "fila 11", "fila 10"])
+        self.assertEqual(store.count_filtered({}), 20)
+
+    def test_mem_sql_parity_desc(self):
+        mem = server.MemStore([dict(r) for r in self._rows()])
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        sql = server.SqlStore(os.path.join(d, "parity.db"))
+        self.addCleanup(sql.close)
+        sql.add_rows([dict(r) for r in self._rows()], {})
+        for q in ({}, {"level": ["ERR"]}, {"q": ["fila 1"]}):
+            self.assertEqual([r["msg"] for r in mem.page_filtered(q, 0, 100)],
+                             [r["msg"] for r in sql.page_filtered(q, 0, 100)],
+                             "q=%s" % q)
+
+    def test_keyset_export_desc_sin_bucle(self):
+        """El export (keyset) recorre las filas en el mismo orden que la tabla."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        store = server.SqlStore(os.path.join(d, "key.db"))
+        self.addCleanup(store.close)
+        store.add_rows([dict(r) for r in self._rows()], {})
+        for batch in (1, 3, 20, 100):
+            out, last = [], -1
+            for _ in range(200):          # tope duro: si no termina, es un bucle
+                b = store.page_filtered_keyset({}, last, batch)
+                if not b:
+                    break
+                out.extend(b)
+                last = b[-1]["rowid"]    # borde DESC del siguiente lote
+            self.assertEqual([r["msg"] for r in out],
+                             [r["msg"] for r in store.page_filtered({}, 0, 100)],
+                             "batch=%d" % batch)
+            self.assertEqual(len(out), 20)
+
+    def test_mem_keyset_desc(self):
+        store = server.MemStore([dict(r) for r in self._rows()])
+        out, last = [], -1
+        for _ in range(200):
+            b = store.page_filtered_keyset({}, last, 7)
+            if not b:
+                break
+            out.extend(b)
+            last = b[-1]["rowid"]
+        self.assertEqual([r["msg"] for r in out],
+                         [r["msg"] for r in store.page_filtered({}, 0, 100)])
+        self.assertEqual(out[0]["msg"], "fila 19")
+        self.assertEqual(out[-1]["msg"], "fila 0")
+
+    def test_tail_devuelve_lo_nuevo_arriba(self):
+        src = inspect.getsource(api.Handler._tail)
+        self.assertIn("reversed(rows)", src)
+
+    def test_open_file_carga_el_historial_completo(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "hist.log")
+        old = "\n".join("2026-10-01 09:00:%02d INFO vieja %d" % (i % 60, i)
+                        for i in range(2000))
+        new = "\n".join("2026-10-30 23:59:%02d INFO nueva %d" % (i % 60, i)
+                        for i in range(500))
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(old + "\n" + new + "\n")
+        os.environ["LOGVIEWER_TAIL_DIRS"] = d
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/api/open-file" % srv.server_port,
+                data=json.dumps({"path": path}).encode(), method="POST",
+                headers={"Content-Type": "application/json",
+                         "X-CSRF-Token": server.CSRF_TOKEN})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            self.assertEqual(data["total"], 2500)   # historial entero, no 5000
+            with urllib.request.urlopen(
+                "http://127.0.0.1:%d/api/rows?name=%s&size=5"
+                % (srv.server_port, urllib.parse.quote(data["name"])),
+                timeout=30) as r:
+                rows = json.loads(r.read().decode("utf-8"))
+            self.assertEqual(rows["total"], 2500)
+            self.assertEqual(rows["rows"][0]["ts"][:10], "2026-10-30")
+            # La ULTIMA pagina es la mas antigua: el historial no se recorta
+            with urllib.request.urlopen(
+                "http://127.0.0.1:%d/api/rows?name=%s&size=500&page=5"
+                % (srv.server_port, urllib.parse.quote(data["name"])),
+                timeout=30) as r:
+                last = json.loads(r.read().decode("utf-8"))
+            self.assertEqual(len(last["rows"]), 500)
+            self.assertEqual(last["rows"][-1]["ts"][:10], "2026-10-01")
+        finally:
+            srv.shutdown()
+            ds = server.SESSIONS.get("local", {}).pop(
+                server.safe_session_name(os.path.basename(path)), None)
+            if ds:
+                ds["store"].close()
+            os.environ.pop("LOGVIEWER_TAIL_DIRS", None)
+
+    def test_ui_calendario_en_el_filtro_de_fecha(self):
+        base = os.path.join(os.path.dirname(os.path.abspath(server.__file__)),
+                            "static")
+        html = open(os.path.join(base, "index.html"), encoding="utf-8").read()
+        js = open(os.path.join(base, "app.js"), encoding="utf-8").read()
+        self.assertIn('id="fdfrom" type="date"', html)
+        self.assertIn('id="fdto" type="date"', html)
+        self.assertIn('aria-label="Desde (fecha)"', html)
+        self.assertIn('aria-label="Hasta (fecha)"', html)
+        # 'Hasta' una fecha sin hora es inclusive hasta el final del dia
+        self.assertIn('T23:59:59', js)
 
 
 if __name__ == "__main__":

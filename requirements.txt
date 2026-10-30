@@ -1,0 +1,6 @@
+# Requisitos del visor (S1, 2026-10-30).
+# El proyecto era solo stdlib; se autoriza 'cryptography' para validar el
+# JWT de Cloudflare Access (firma Ed25519). Si no esta instalado, el visor
+# arranca igualmente y mantiene el fallback de cookie HMAC (security.py
+# importa la libreria en try/except).
+cryptography>=41.0

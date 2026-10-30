@@ -42,7 +42,7 @@ from config import _valid_sqlite_threshold          # noqa: F401
 from parsers import _json_scalar, _make_search, _norm_sev, _ui_columns  # noqa: F401
 from security import _session_sign                  # noqa: F401
 from stores import _user_state                      # noqa: F401
-from api import _CONTEXT_INDEX, _splunk_ssl         # noqa: F401
+from api import _CONTEXT_INDEX, _splunk_ssl, _client_is_loopback  # noqa: F401
 
 
 def tail_lines(path, lines=20, encoding="utf-8"):
@@ -127,6 +127,8 @@ def main():
     print("  Pool de hilos: max %d conexiones concurrentes" % MAX_CONNECTIONS,
           flush=True)
     print("  Secreto de sesion: %s" % security.SESSION_SECRET_SOURCE,
+          flush=True)
+    print("  Cloudflare Access: %s" % security.cf_access_status()["message"],
           flush=True)
     print("  Temp dir: %s" % tmpdir, flush=True)
     print("  Persistencia: %s" % ("activa (--persist)"

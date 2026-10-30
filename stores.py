@@ -594,13 +594,22 @@ class MemStore:
         return out
 
     def page_filtered(self, q, start, size):
+        """U4 (2026-10-30): orden DESC, la fila MAS NUEVA arriba.
+
+        El historial completo sigue accesible: la pagina 1 trae las filas mas
+        recientes (rowid/_idx mas alto) y las mas antiguas caen al final. Los
+        filtros y el tamano de pagina no cambian.
+        """
         rows = apply_filters(self.rows, q)
+        n = len(rows)
         out = []
-        for r in rows[start:start + size]:
-            r = dict(r)
+        # En DESC la pagina [start, start+size) son las filas n-1-start hacia
+        # atras: la mas reciente (indice mas alto) va delante.
+        for i in range(n - 1 - start, max(n - 1 - start - size, -1), -1):
+            r = dict(rows[i])
             r.pop("_search", None)
             # Fase 7B: rowid = indice en la lista de filas del dataset
-            r["rowid"] = r.get("_idx", -1)
+            r["rowid"] = r.get("_idx", i)
             out.append(r)
         return out
 
@@ -610,24 +619,28 @@ class MemStore:
     def page_filtered_keyset(self, q, after_rowid, size):
         """P1.2 (bug B8): paginacion por clave, no por OFFSET.
 
-        En MemStore el rowid es la posicion en la lista (_idx), de modo que
-        'despues de after_rowid' es un recorrido que empieza donde termino el
-        lote anterior: cada fila se mira una sola vez en todo el export, O(N)
-        en total (con OFFSET era O(N^2)). El orden es el mismo que
-        page_filtered, asi que el resultado es identico."""
+        En MemStore el rowid es la posicion en la lista (_idx). U4 (2026-10-30):
+        el recorrido va HACIA ABAJO (rowid descendente), igual que
+        page_filtered: 'despues de after_rowid' es la fila inmediatamente
+        anterior en el tiempo. Cada fila se mira una sola vez en todo el export,
+        O(N) en total (con OFFSET era O(N^2)). after_rowid < 0 (o None) significa
+        'empieza por la mas reciente'."""
         plan = filter_plan(q)
         rows = self.rows
         out = []
-        i = max(0, after_rowid + 1)
         n = len(rows)
-        while i < n and len(out) < size:
+        if after_rowid is None or after_rowid < 0:
+            i = n - 1
+        else:
+            i = min(after_rowid - 1, n - 1)
+        while i >= 0 and len(out) < size:
             r = rows[i]
             if _row_match(r, plan):
                 r = dict(r)
                 r.pop("_search", None)
                 r["rowid"] = r.get("_idx", i)
                 out.append(r)
-            i += 1
+            i -= 1
         return out
 
     def top(self, field, limit):
@@ -855,9 +868,11 @@ class SqlStore:
     def page_filtered(self, q, start, size):
         where, params = self._where(q)
         with self.lock:
+            # U4 (2026-10-30): ORDER BY rowid DESC = mas nuevo primero.
+            # El rowid es la PK: el recorrido inverso usa el indice, no un sort.
             cur = self.conn.execute(
-                "SELECT rowid, %s FROM rows %s LIMIT ? OFFSET ?" % (
-                    ", ".join(self.COLUMNS), where),
+                "SELECT rowid, %s FROM rows %s ORDER BY rowid DESC "
+                "LIMIT ? OFFSET ?" % (", ".join(self.COLUMNS), where),
                 params + [size, start])
             cols = self.COLUMNS
             out = []
@@ -873,17 +888,22 @@ class SqlStore:
 
         page_filtered usa LIMIT/OFFSET: para el lote k, SQLite recorre y
         descarta 'start' filas, de modo que un export de N filas en lotes de
-        B cuesta O(N^2/B). Con 'rowid > ultimo_rowid' el lote siguiente arranca
+        B cuesta O(N^2/B). Con el bound de clave el lote siguiente arranca
         donde termino el anterior: O(N) en total (el rowid es la PK, hay indice).
-        El orden (rowid ascendente) es el mismo que page_filtered, por eso el
-        resultado es identico.
+        U4 (2026-10-30): el orden es DESC (rowid < ultimo_rowid), el mismo que
+        page_filtered, por eso el export sale igual que la tabla.
         """
         where, params = self._where(q)
-        where = (where + " AND rowid > ?") if where else "WHERE rowid > ?"
-        params = params + [after_rowid]
+        if after_rowid is None or after_rowid < 0:
+            bound = ""
+        else:
+            bound = " AND rowid < ?" if where else " WHERE rowid < ?"
+        where = where + bound
+        params = params + ([] if after_rowid is None or after_rowid < 0
+                           else [after_rowid])
         with self.lock:
             cur = self.conn.execute(
-                "SELECT rowid, %s FROM rows %s ORDER BY rowid LIMIT ?" % (
+                "SELECT rowid, %s FROM rows %s ORDER BY rowid DESC LIMIT ?" % (
                     ", ".join(self.COLUMNS), where),
                 params + [size])
             cols = self.COLUMNS

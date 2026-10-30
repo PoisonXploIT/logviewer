@@ -58,7 +58,22 @@ def llm_config():
     }
 
 
-def public_config():
+def _client_is_loopback(handler):
+    """True si la peticion llega desde la propia maquina (loopback).
+
+    S2 (2026-10-30): el modo 'seguir archivo' (abrir un log POR RUTA del
+    servidor) solo funciona en local. En el desplegado (Railway, detras de
+    Cloudflare Access) la peticion viene de una IP remota, aunque
+    LOGVIEWER_TAIL_DIRS este definida: el gate de loopback la rechaza con 403
+    antes de tocar la allowlist. No resuelve DNS: compara el literal."""
+    try:
+        host = handler.client_address[0]
+    except Exception:
+        return False
+    return _is_loopback(str(host))
+
+
+def public_config(client_host=None):
     """Config de solo lectura para la UI (GET /api/config).
 
     Fase 12A: "llm" decide si aparece el boton Analizar; Fase 13:
@@ -71,7 +86,10 @@ def public_config():
             "splunk": splunk_enabled(), "repo_url": config.REPO_URL,
             # P3.2: 'follow' = modo 'seguir archivo' disponible. Solo si
             # LOGVIEWER_TAIL_DIRS esta definido; la UI oculta el panel si no.
-            "follow": bool(tail_allowlist())}
+            # S2 (2026-10-30): ademas exige loopback. client_host=None (uso
+            # interno y tests) se considera local para no romper la suite.
+            "follow": bool(tail_allowlist()) and (client_host is None or
+                                                  _is_loopback(str(client_host)))}
 
 
 def health_payload(user="local"):
@@ -593,6 +611,167 @@ def load_file(path, progress=None, user="local"):
         "load_seconds": round(time.time() - t0, 3),
         "w3c_fields": w3c_f,
         "file_date": file_date,
+    }
+
+
+def _decompress_to_temp(binary, path):
+    """Descomprime a un temporal para poder hacer seek desde el final.
+
+    Un gzip/bz2/xz/zip no admite seek: para hacer tail hay que materializarlo.
+    Se limita a MAX_DECOMP_SIZE igual que la carga normal."""
+    tmp_dir = os.path.join(tempfile.gettempdir(), "logviewer", "tail")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_path = os.path.join(tmp_dir,
+                            safe_session_name(os.path.basename(path)) + ".tail")
+    limited = SizeLimitedStream(binary, MAX_DECOMP_SIZE)
+    with open(tmp_path, "wb") as out:
+        while True:
+            block = limited.read(1 << 20)
+            if not block:
+                break
+            out.write(block)
+    return tmp_path
+
+
+def tail_load_file(path, lines=None, progress=None, user="local"):
+    """T1 (2026-10-30): carga SOLO las ultimas N lineas del archivo (tail).
+
+    Mismo contrato que load_file (store, format, name, size, total, meta,
+    encoding, compressed, inner, load_seconds, w3c_fields, file_date) y ademas
+    'tail', 'tail_lines', 'tail_start_line' y 'file_total_lines'. El numerado
+    de `_line` es ABSOLUTO sobre el fichero original: el watcher sigue
+    añadiendo filas a partir de `line_base` (ds['line_base']).
+    """
+    n = int(lines) if lines is not None else config.TAIL_LINES
+    if n < 1:
+        n = 1
+    t0 = time.time()
+
+    def _report(phase, pct, msg=""):
+        if progress:
+            progress(phase, pct, msg)
+
+    binary, compressed, inner = open_log_stream(path)
+    try:
+        if compressed:
+            # En un comprimido no hay seek: se materializa a un temporal
+            # y el tail se hace sobre ese temporal.
+            tail_path = _decompress_to_temp(binary, path)
+        else:
+            tail_path = path
+    finally:
+        binary.close()
+
+    with open(tail_path, "rb") as f:
+        first = f.read(ENC_PEEK)
+    encoding = detect_encoding(first)
+    _report("reading", 20, "leyendo el final del archivo")
+
+    tail, start_line = tail_lines_from_file(tail_path, n, encoding)
+    if not any(l.strip() for l in tail):
+        raise ValueError("el archivo esta vacio o solo tiene lineas vacias")
+    file_total = start_line + len(tail) if start_line else count_file_lines(tail_path)
+    _report("reading", 40, "tail de %d lineas (de %d)" % (len(tail), file_total))
+
+    name = os.path.basename(path)
+    db_dir = os.path.join(tempfile.gettempdir(), "logviewer", "sqlite",
+                          safe_session_name(user))
+    _old_db = os.path.join(db_dir, safe_session_name(name) + ".db")
+    for _suf in ("", "-wal", "-shm"):
+        try:
+            os.remove(_old_db + _suf)
+        except OSError:
+            pass
+
+    # Cabecera del fichero (unas pocas lineas del principio): hace falta para
+    # formatos cuya meta esta al inicio, p. ej. el '#Fields' de W3C o la
+    # cabecera de columnas de un CSV, que el tail no ve.
+    head_lines = []
+    with open(tail_path, "r", encoding=encoding, errors="replace") as f:
+        for i, l in enumerate(f):
+            if i >= 20:
+                break
+            head_lines.append(l.rstrip("\r\n"))
+
+    head = head_lines + tail[:200]
+    fmt = detect_format(head)
+    w3c_f = None
+    if fmt == "w3c":
+        w3c_f = w3c_fields(head_lines + tail[:200])
+        meta = [l for l in head_lines if l.startswith("#")][:20]
+    else:
+        meta = [l for l in head if l.startswith("#")][:20]
+
+    parser = PARSERS[fmt]
+    file_date = ""
+    if fmt == "triage":
+        try:
+            file_date = datetime.fromtimestamp(
+                os.path.getmtime(path)).strftime("%Y-%m-%d")
+        except OSError:
+            file_date = ""
+
+    store = MemStore()
+    chunk = []
+    processed = 0
+
+    def _flush(chunk):
+        nonlocal store, processed
+        base_line = start_line + processed
+        if fmt == "w3c":
+            rows, counters = parse_w3c(chunk, fields=w3c_f)
+        elif fmt == "triage":
+            rows, counters = parse_triage(chunk, file_date=file_date)
+        else:
+            rows, counters = parser(chunk)
+        rows = attach_continuations(rows, counters)
+        for r in rows:
+            r["_search"] = _make_search(r)
+            r["template"] = make_template(r.get("raw", ""))
+            r["ts_norm"] = norm_ts(r.get("ts", ""))
+            r["_line"] = base_line + r.pop("_line", 0)
+        store.add_rows(rows, counters)
+        processed += len(chunk)
+        if isinstance(store, MemStore) and store.total_rows() > config.SQLITE_THRESHOLD:
+            os.makedirs(db_dir, exist_ok=True)
+            store = migrate_to_sqlite(store, db_dir, name)
+
+    cont_run = 0
+    for line in tail:
+        chunk.append(line)
+        prev_line = chunk[-2] if len(chunk) > 1 else None
+        if is_continuation_line(line, prev_line, cont_run > 0):
+            cont_run += 1
+        else:
+            cont_run = 0
+        if len(chunk) >= PARSE_CHUNK and cont_run < MAX_CONTINUATION_LINES:
+            _flush(chunk)
+            chunk = []
+            cont_run = 0
+    if chunk:
+        _flush(chunk)
+    _report("parsing", 95, "parseando (%d lineas)" % processed)
+
+    return {
+        "store": store,
+        "format": fmt,
+        "name": name,
+        "size": os.path.getsize(path),
+        "total": len(tail),
+        "meta": meta,
+        "encoding": encoding,
+        "compressed": compressed,
+        "inner": inner,
+        "load_seconds": round(time.time() - t0, 3),
+        "w3c_fields": w3c_f,
+        "file_date": file_date,
+        # T1: marcas del tail. line_base es la linea ABSOLUTA del fichero real
+        # donde empieza a numerar el watcher (se actualiza en /api/tail).
+        "tail": True,
+        "tail_lines": n,
+        "tail_start_line": start_line,
+        "file_total_lines": file_total,
+        "line_base": start_line + len(tail),
     }
 
 
@@ -1431,9 +1610,11 @@ AUDIT_LOCK = threading.Lock()
 def audit(action, user="local", ip=None, **details):
     """Registra una accion en la auditoria (memoria + archivo JSON Lines).
 
-    user: quien la hizo. Detras de Cloudflare Access llega en el header
-    Cf-Access-Authenticated-User-Email (spoofeable: solo atribucion, no autenticacion);
-    en local (o sin ese header) es "local".
+    user: quien la hizo. Desde S1 (2026-10-30), con CF_ACCESS_TEAM/CF_ACCESS_AUD
+    la identidad sale del JWT de Cloudflare Access (Cf-Access-Jwt-Assertion),
+    verificado con firma Ed25519, aud y exp. Sin esa configuracion se sigue
+    usando el header Cf-Access-Authenticated-User-Email, que es spoofeable
+    (solo atribucion, no autenticacion); en local es "local".
     ip: direccion remota de la peticion (forensica: si el header esta
     falseado, la IP ayuda a rastrear de donde sale)."""
     entry = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "action": action,
@@ -1468,7 +1649,8 @@ def audit_for_user(user):
     """Solo las entradas de auditoria del usuario indicado.
 
     Aislamiento por usuario (Fase 6): detras de Cloudflare Access cada
-    peticion lleva el header Cf-Access-Authenticated-User-Email, que se guarda en el
+    peticion lleva la identidad (JWT validado desde S1, o el header
+    Cf-Access-Authenticated-User-Email si Access no esta configurado), que se guarda en el
     campo "user" de cada entrada. Este filtro hace que cada usuario vea
     solo sus propias acciones y no las de los demas."""
     return [e for e in audit_list() if e.get("user") == user]
@@ -1591,22 +1773,41 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def _user(self):
-        """Identidad de la peticion (P2.1: cookie de sesion firmada con HMAC).
+        """Identidad de la peticion.
 
-        1. Si la peticion trae la cookie 'lv_session' y la firma HMAC cuadra,
-           esa es la identidad: el cliente no puede cambiar el usuario sin
-           el secreto del proceso.
-        2. Si la cookie esta manipulada, se ignora (se audita) y se vuelve a
-           la atribucion del header.
-        3. Si no hay cookie, el header Cf-Access-Authenticated-User-Email de
-           Cloudflare Access (o el antiguo Cf-Access-Login-User) se usa solo
-           como VALOR INICIAL NO CONFIABLE: sirve para dar una identidad de
-           arranque y para emitir la cookie firmada en la respuesta.
+        Orden (S1, 2026-10-30): si estan definidas CF_ACCESS_TEAM y CF_ACCESS_AUD
+        y 'cryptography' esta instalado, la identidad sale del JWT de Cloudflare
+        Access (cabecera Cf-Access-Jwt-Assertion), verificado aqui: firma
+        Ed25519 contra los certs del equipo, aud == CF_ACCESS_AUD y exp no vencido.
+        Si el JWT no cuadra, SE AUDITA y NO se usa el header
+        Cf-Access-Authenticated-User-Email (es spoofeable): se cae a la cookie
+        firmada por este proceso o a "local".
 
-        PENDIENTE (decision humana): validar el JWT de Access (Ed25519) exigir
-        'cryptography' y rompe la regla de solo stdlib. Mientras no se decida,
-        el header sigue siendo spoofeable en el primer contacto; la cookie
-        firmada evita que ese valor se mantenga indefinidamente."""
+        Sin esa configuracion (o sin la libreria) se mantiene el comportamiento
+        de P2.1: cookie 'lv_session' firmada con HMAC y, si no hay cookie, el
+        header de Access como valor inicial NO confiable."""
+        jwt = self.headers.get(security.CF_JWT_HEADER)
+        if security.cf_access_enabled():
+            result = security.verify_cf_access_jwt(jwt)
+            if result["ok"]:
+                self._pending_session_cookie = make_session_cookie(result["user"])
+                return result["user"]
+            audit("cf_jwt_invalid", user="local", ip=self.client_address[0],
+                  reason=result["reason"])
+            # header no confiable: solo vale la cookie firmada por este proceso
+            raw = cookie_value(self.headers.get("Cookie", ""), SESSION_COOKIE)
+            if raw:
+                user = verify_session_cookie(raw)
+                if user:
+                    return user
+            return "local"
+        if jwt and not security.cf_access_enabled():
+            # Hay JWT pero no se puede validar: se avisa una sola vez.
+            if not security.CF_ACCESS_WARNED:
+                security.CF_ACCESS_WARNED = True
+                audit("cf_jwt_not_verified", user="local",
+                     ip=self.client_address[0],
+                     reason=security.cf_access_status()["message"])
         raw = cookie_value(self.headers.get("Cookie", ""), SESSION_COOKIE)
         if raw:
             user = verify_session_cookie(raw)
@@ -1645,6 +1846,13 @@ class Handler(BaseHTTPRequestHandler):
         if verify_session_cookie(cookie_value(self.headers.get("Cookie", ""),
                                              SESSION_COOKIE)):
             return True
+        # S1: con Access configurado, el header ya no basta: hay que traer un
+        # JWT de Access validado (firma Ed25519 + aud + exp).
+        if security.cf_access_enabled():
+            # Con Access configurado el header spoofeable ya no vale: hay que
+            # traer un JWT validado (firma Ed25519 + aud + exp).
+            return security.verify_cf_access_jwt(
+                self.headers.get(security.CF_JWT_HEADER))["ok"]
         return bool(self.headers.get("Cf-Access-Authenticated-User-Email")
                     or self.headers.get("Cf-Access-Login-User"))
 
@@ -1745,7 +1953,7 @@ class Handler(BaseHTTPRequestHandler):
             # aparece el boton Analizar en el drawer; Fase 13: si hay
             # Splunk configurado, aparece la seccion "Importar de Splunk";
             # repo_url: enlace de descarga de la version local)
-            self._json(public_config())
+            self._json(public_config(client_host=self.client_address[0]))
         elif u.path == "/api/splunk/sources":
             self._splunk_sources()
         elif u.path == "/api/settings":
@@ -2256,7 +2464,9 @@ class Handler(BaseHTTPRequestHandler):
         # (/rows, /search, export) podia ver las filas ya insertadas con un
         # ds['total'] viejo (o al reves), dando conteos incoherentes.
         with LOCK:
-            base_line = ds["total"]
+            # T1: en un dataset cargado por tail, ds['total'] es solo el tail;
+            # la numeracion absoluta sigue en ds['line_base'].
+            base_line = ds.get("line_base", ds["total"])
             for r in rows:
                 r["_search"] = _make_search(r)
                 # Fase 9A: plantilla calculada en el parseo
@@ -2265,10 +2475,15 @@ class Handler(BaseHTTPRequestHandler):
                 r["_line"] = base_line + r.pop("_line", 0)
             ds["store"].add_rows(rows, counters)
             ds["total"] += len(lines)
+            ds["line_base"] = base_line + len(lines)
             total = ds["total"]
+        # U4 (2026-10-30): las lineas nuevas del tail se devuelven de MAS NUEVA
+        # a MAS VIEJA, coherente con la tabla (page_filtered ahora es DESC).
+        # En el store entran en orden cronologico: el rowid sigue creciendo con
+        # el tiempo y el historial no se recorta.
         self._json({
             "watching": True,
-            "rows": [ui_row(r) for r in rows],
+            "rows": [ui_row(r) for r in reversed(rows)],
             "total_new": len(rows),
             "total": total,
             "truncated": truncated,
@@ -2311,7 +2526,9 @@ class Handler(BaseHTTPRequestHandler):
             if line is None or line < 0:
                 self._error("la fila no tiene linea de origen", 404)
                 return
-        path = os.path.join(
+        # T1: un dataset abierto por ruta ('seguir archivo') no tiene copia
+        # temporal: el contexto se lee del original.
+        path = ds.get("orig_path") or os.path.join(
             tempfile.gettempdir(), "logviewer", "sessions",
             safe_session_name(user), name)
         try:
@@ -2500,9 +2717,10 @@ class Handler(BaseHTTPRequestHandler):
                                lineterminator="\n")
             w.writeheader()
         n = 0
-        # P1.2 (bug B8): keyset pagination. 'last_rowid' es el rowid de la ultima
-        # fila emitida; el siguiente lote empieza WHERE rowid > last_rowid.
-        # Con OFFSET creciente el export era O(N^2) en un dataset SQLite grande.
+        # P1.2 (bug B8): keyset pagination. 'last_rowid' es el rowid de la ULTIMA
+        # fila emitida; con el orden DESC (U4, 2026-10-30) el siguiente lote
+        # empieza WHERE rowid < last_rowid. Con OFFSET creciente el export era
+        # O(N^2) en un dataset SQLite grande.
         last_rowid = -1
         try:
             while True:
@@ -2519,7 +2737,10 @@ class Handler(BaseHTTPRequestHandler):
                         w.writerow({k: self._csv_cell(v)
                                     for k, v in clean(r).items()})
                     n += 1
-                last_rowid = max(last_rowid, batch[-1].get("rowid", last_rowid))
+                # batch[-1] es la fila MAS ANTIGUA del lote (orden DESC): es el
+                # borde del siguiente lote. Usar max() aqui recargaba siempre el
+                # mismo lote y colgaba el export.
+                last_rowid = batch[-1].get("rowid", last_rowid)
                 if out.tell() > 65536:
                     flush()
             flush()
@@ -2701,6 +2922,12 @@ class Handler(BaseHTTPRequestHandler):
             if ds is None:
                 self._error("dataset no encontrado: %s" % name, 404)
                 return
+            # S2 (2026-10-30): el tail en vivo de un archivo abierto por ruta
+            # (follow) tampoco se activa desde un cliente remoto.
+            if ds.get("follow") and not _client_is_loopback(self):
+                self._error("el modo 'seguir archivo' solo esta disponible "
+                            "desde la propia maquina (loopback)", 403)
+                return
             path = ds.get("orig_path") or os.path.join(
                 tempfile.gettempdir(), "logviewer", "sessions",
                 safe_session_name(user), name)
@@ -2727,6 +2954,15 @@ class Handler(BaseHTTPRequestHandler):
         temporal), de modo que el tail en vivo ve las lineas nuevas del
         archivo real.
         """
+        # S2 (2026-10-30): gate de loopback. 'Seguir archivo' abre un log POR
+        # RUTA del servidor: solo tiene sentido en la propia maquina. Un
+        # cliente remoto (Railway/Cloudflare) recibe 403 aunque exista
+        # LOGVIEWER_TAIL_DIRS; la allowlist sigue siendo la segunda capa.
+        if not _client_is_loopback(self):
+            self._error("el modo 'seguir archivo' solo esta disponible desde "
+                        "la propia maquina (loopback); en el despliegue remoto "
+                        "esta desactivado", 403)
+            return
         body = self._read_json_body()
         if body is None:
             self._error("cuerpo JSON invalido", 400)
@@ -2768,7 +3004,12 @@ class Handler(BaseHTTPRequestHandler):
                     safe_session_name(os.path.basename(ap)))
             if old is not None:
                 old["store"].close()
-            ds = load_file(ap, None, user=user)
+            # U4 (2026-10-30): se REVIERTE el tail de T1. 'Seguir archivo' carga
+            # el archivo COMPLETO: el historial entero tiene que seguir visible
+            # (debajo de lo mas reciente, porque el visor ordena de nuevo a viejo).
+            # El watcher sigue recogiendo solo lo nuevo: hace seek al final.
+            ds = load_file(ap, user=user)
+            ds["line_base"] = ds["total"]
         except Exception as e:
             self.log_message("open-file error: %r" % (e,))
             self._error("no se pudo leer el archivo", 500)

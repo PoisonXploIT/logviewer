@@ -1,12 +1,16 @@
 """security.py - cookie de sesion firmada, cabeceras, CSRF y rate limit.
 
 P5.1 (2026-10-30): separado de server.py. Solo stdlib.
+S1 (2026-10-30): se autoriza 'cryptography' para validar el JWT de
+Cloudflare Access (Ed25519). El import va en try/except: si la libreria no
+esta, el visor arranca igual y se mantiene el comportamiento anterior.
 """
 import argparse
 import base64
 import bz2
 import fnmatch
 import hashlib
+import binascii
 import codecs
 import csv
 import gzip
@@ -62,6 +66,180 @@ CSP_HTML = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inl
 # origen Railway es alcanzable sin pasar por Access"; no valida el JWT
 # (eso lo hace Access en el borde).
 REQUIRE_CF = os.environ.get("LOGVIEWER_REQUIRE_CF") == "1"
+
+# ---------------------------------------------------------------------------
+# S1 (2026-10-30): validacion REAL del JWT de Cloudflare Access (Ed25519).
+# ---------------------------------------------------------------------------
+# Cloudflare Access firma la cabecera Cf-Access-Jwt-Assertion con Ed25519 y
+# publica las claves publicas en https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
+# (JSON: {"keys": [{"kid": "...", "cert": "<hex 32 bytes>"}], "max_age": 86400}).
+# Con esto la identidad deja de depender del header spoofeable
+# Cf-Access-Authenticated-User-Email.
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    HAS_CRYPTOGRAPHY = True
+except ImportError:      # la libreria no esta: se mantiene el fallback HMAC
+    Ed25519PublicKey = None
+    HAS_CRYPTOGRAPHY = False
+
+# CF_ACCESS_TEAM puede venir como "sammideblas" o "sammideblas.cloudflareaccess.com".
+CF_ACCESS_TEAM = os.environ.get("CF_ACCESS_TEAM", "").strip()
+CF_ACCESS_AUD = os.environ.get("CF_ACCESS_AUD", "").strip()
+CF_JWT_HEADER = "Cf-Access-Jwt-Assertion"
+CF_ACCESS_TIMEOUT = max(1, int(os.environ.get("CF_ACCESS_TIMEOUT", "10")))
+CF_CERTS_TTL = max(60, int(os.environ.get("CF_ACCESS_CERTS_TTL", "3600")))
+
+# Cache de claves Ed25519: kid -> Ed25519PublicKey. Se re-fetch si falta el kid.
+CF_CERTS = {}
+CF_CERTS_FETCHED_AT = 0.0
+CF_CERTS_LOCK = threading.Lock()
+CF_ACCESS_WARNED = False
+
+
+def cf_access_enabled():
+    """True si la validacion del JWT de Access esta operativa (team + AUD + lib)."""
+    return bool(HAS_CRYPTOGRAPHY and CF_ACCESS_TEAM and CF_ACCESS_AUD)
+
+
+def cf_certs_url(team=None):
+    """URL publica de los certs del equipo de Access. '' si no hay team."""
+    team = (team if team is not None else CF_ACCESS_TEAM).strip()
+    if not team:
+        return ""
+    if not team.endswith(".cloudflareaccess.com"):
+        team = team + ".cloudflareaccess.com"
+    if not team.startswith("http://") and not team.startswith("https://"):
+        team = "https://" + team
+    return team + "/cdn-cgi/access/certs"
+
+
+def _fetch_cf_certs(url=None):
+    """Descarga los certs Ed25519 del equipo. Devuelve {} si la red falla.
+    La red esta cerrada en este entorno: la funcion debe ser tolerante."""
+    url = url or cf_certs_url()
+    if not url or not HAS_CRYPTOGRAPHY:
+        return {}
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "logviewer/1.0"})
+        with urllib.request.urlopen(req, timeout=CF_ACCESS_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (HTTPError, URLError, OSError, ValueError, TimeoutError):
+        return {}
+    out = {}
+    for item in (data.get("keys") or []):
+        if not isinstance(item, dict):
+            continue
+        kid = str(item.get("kid") or "").strip()
+        cert = str(item.get("cert") or "").strip()
+        if not kid or not cert:
+            continue
+        try:
+            out[kid] = Ed25519PublicKey.from_public_bytes(bytes.fromhex(cert))
+        except (ValueError, TypeError, OSError):
+            continue
+    return out
+
+
+def load_cf_certs(force=False, certs=None, url=None):
+    """Devuelve el cache de claves kid -> Ed25519PublicKey.
+
+    `certs` permite inyectar claves (los tests) sin tocar la red. Si el cache
+    esta vacío o caducado, descarga los certs del equipo."""
+    global CF_CERTS, CF_CERTS_FETCHED_AT
+    if certs is not None:
+        with CF_CERTS_LOCK:
+            CF_CERTS = dict(certs)
+            CF_CERTS_FETCHED_AT = time.time()
+            return CF_CERTS
+    with CF_CERTS_LOCK:
+        if CF_CERTS and not force and (time.time() - CF_CERTS_FETCHED_AT) < CF_CERTS_TTL:
+            return CF_CERTS
+    fetched = _fetch_cf_certs(url)
+    with CF_CERTS_LOCK:
+        if fetched:
+            CF_CERTS.update(fetched)
+            CF_CERTS_FETCHED_AT = time.time()
+        return CF_CERTS
+
+
+def _b64url_decode(part):
+    """Decodifica un segmento base64url de un JWT (sin relleno)."""
+    return base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+
+
+def verify_cf_access_jwt(token, now=None):
+    """Verifica el JWT de Cloudflare Access: firma Ed25519, aud y exp.
+
+    Devuelve {"ok": bool, "user": str|None, "reason": str}. Nunca lanza: un
+    JWT raro (mal formado, kid desconocido, red caída) es un rechazo."""
+    if not HAS_CRYPTOGRAPHY:
+        return {"ok": False, "user": None,
+                "reason": "cryptography no instalado: no se puede validar el JWT"}
+    if not CF_ACCESS_TEAM or not CF_ACCESS_AUD:
+        return {"ok": False, "user": None,
+                "reason": "CF_ACCESS_TEAM o CF_ACCESS_AUD no definidos"}
+    token = (token or "").strip()
+    if not token:
+        return {"ok": False, "user": None, "reason": "sin cabecera Cf-Access-Jwt-Assertion"}
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {"ok": False, "user": None, "reason": "JWT sin 3 partes"}
+    try:
+        header = json.loads(_b64url_decode(parts[0]).decode("utf-8"))
+        claims = json.loads(_b64url_decode(parts[1]).decode("utf-8"))
+        signature = _b64url_decode(parts[2])
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return {"ok": False, "user": None, "reason": "JWT mal formado"}
+    if not isinstance(header, dict) or not isinstance(claims, dict):
+        return {"ok": False, "user": None, "reason": "JWT mal formado"}
+    kid = str(header.get("kid") or "").strip()
+    certs = load_cf_certs()
+    key = certs.get(kid)
+    if key is None:
+        # el kid puede ser de una rotacion de claves: re-fetch una vez
+        certs = load_cf_certs(force=True)
+        key = certs.get(kid)
+    if key is None:
+        return {"ok": False, "user": None,
+                "reason": "kid %s no esta entre los certs del equipo" % (kid or "(sin kid)")}
+    try:
+        key.verify(signature, (parts[0] + "." + parts[1]).encode("utf-8"))
+    except Exception:
+        return {"ok": False, "user": None, "reason": "firma Ed25519 invalida"}
+    aud = claims.get("aud")
+    aud_list = aud if isinstance(aud, list) else [aud]
+    if CF_ACCESS_AUD not in aud_list:
+        return {"ok": False, "user": None,
+                "reason": "aud no coincide con CF_ACCESS_AUD"}
+    try:
+        exp = int(claims.get("exp", 0))
+    except (TypeError, ValueError):
+        return {"ok": False, "user": None, "reason": "claim exp invalido"}
+    if exp <= (time.time() if now is None else now):
+        return {"ok": False, "user": None, "reason": "JWT caducado (exp)"}
+    email = str(claims.get("email") or "").strip()
+    if not email:
+        return {"ok": False, "user": None, "reason": "JWT sin claim email"}
+    return {"ok": True, "user": email, "reason": "ok"}
+
+
+def cf_access_status():
+    """Estado de la validacion de Access, para el arranque y la auditoria."""
+    if HAS_CRYPTOGRAPHY and CF_ACCESS_TEAM and CF_ACCESS_AUD:
+        msg = "JWT de Access validado (team %s, %d claves en cache)" % (
+            cf_certs_url(), len(CF_CERTS))
+    elif HAS_CRYPTOGRAPHY and (CF_ACCESS_TEAM or CF_ACCESS_AUD):
+        msg = "cryptography instalado pero faltan CF_ACCESS_TEAM/CF_ACCESS_AUD: " \
+             "se usa la cookie HMAC y el header NO es confiable"
+    elif CF_ACCESS_TEAM or CF_ACCESS_AUD:
+        msg = "CF_ACCESS_TEAM/CF_ACCESS_AUD definidos pero 'cryptography' no " \
+             "instalado: no se puede validar el JWT"
+    else:
+        msg = "sin Cloudflare Access: cookie HMAC y header como valor no confiable"
+    return {"enabled": cf_access_enabled(), "team": CF_ACCESS_TEAM,
+            "aud": CF_ACCESS_AUD, "cryptography": HAS_CRYPTOGRAPHY,
+            "certs": len(CF_CERTS), "message": msg}
+
 
 # ---------------------------------------------------------------------------
 # P2.1 (2026-10-30): identidad por cookie firmada con HMAC, rate limit,
