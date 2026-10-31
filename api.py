@@ -1734,6 +1734,10 @@ class Handler(BaseHTTPRequestHandler):
         }.get(os.path.splitext(fp)[1].lower(), "application/octet-stream")
         with open(fp, "rb") as f:
             body = f.read()
+        # Inyecta la version real en el HTML ({{APP_VERSION}}), para que la UI
+        # nunca muestre una version desfasada respecto a config.APP_VERSION.
+        if fp.endswith(".html"):
+            body = body.replace(b"{{APP_VERSION}}", APP_VERSION.encode("utf-8"))
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("X-Content-Type-Options", "nosniff")
